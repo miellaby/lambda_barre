@@ -1,6 +1,7 @@
 """Pygame renderer for λ̄. Physics is y-up (ground at y=0); screen is y-down."""
 from __future__ import annotations
 
+import colorsys
 import math
 
 import pygame
@@ -34,11 +35,16 @@ def w2s(x: float, y: float) -> tuple[int, int]:
     return int(ORIGIN_X + x), int(GROUND_SCREEN_Y - y)
 
 
+def s2w(sx: float, sy: float) -> tuple[float, float]:
+    """Screen -> world."""
+    return sx - ORIGIN_X, GROUND_SCREEN_Y - sy
+
+
 def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True) -> None:
     screen.fill(BG)
     # ground line
     pygame.draw.line(screen, GROUND_C, w2s(-WIDTH, 0), w2s(WIDTH, 0), 4)
-    # static platforms (skip ground, already drawn)
+    # platforms (static segments, skip ground which is at y≈0)
     for shape in skel.space.shapes:
         body = getattr(shape, "body", None)
         if body is None or body.body_type != B.pymunk.Body.STATIC:
@@ -49,7 +55,15 @@ def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True) -> None:
         b = body.local_to_world(shape.b)
         if abs(a.y) < 1e-6 and abs(b.y) < 1e-6:
             continue  # ground
-        pygame.draw.line(screen, (70, 74, 88), w2s(a.x, a.y), w2s(b.x, b.y), 4)
+        r = int(shape.radius)
+        sa, sb = w2s(a.x, a.y), w2s(b.x, b.y)
+        # capsule = rect (straight part) + 2 discs (caps), pixel-aligned
+        x0, x1 = min(sa[0], sb[0]), max(sa[0], sb[0])
+        cy = sa[1]
+        rect = pygame.Rect(x0, cy - r, x1 - x0, r * 2)
+        pygame.draw.rect(screen, (70, 74, 88), rect)
+        pygame.draw.circle(screen, (70, 74, 88), (x0, cy), r)
+        pygame.draw.circle(screen, (70, 74, 88), (x1, cy), r)
 
     torso = skel.torso
     # torso triangle — mirror x when facing left so the asymmetric apex
@@ -145,11 +159,9 @@ _PROPRIO_SPECS = [
     ("AA", "membre_angle_avant",       math.pi,          "angle patte avant (+ = pied vers avant)"),
     ("DA", "membre_distance_avant",    32.0,             "distance patte avant (longueur de patte)"),
     ("FA", "force_actuateur_avant",    2000.0,           "force actuateur patte avant (effort musculaire)"),
-    ("CA", "force_contact_sol_avant",  1500.0,           "force contact sol patte avant"),
     ("AR", "membre_angle_arriere",     math.pi,          "angle patte arriere (+ = pied vers avant)"),
     ("DR", "membre_distance_arriere",  32.0,             "distance patte arriere (longueur de patte)"),
     ("FR", "force_actuateur_arriere",  2000.0,           "force actuateur patte arriere (effort musculaire)"),
-    ("CR", "force_contact_sol_arriere",1500.0,           "force contact sol patte arriere"),
     ("QA", "queue_angle",              math.pi,          "angle queue (+ = vers avant, rel. neutrale)"),
     ("CQ", "couple_queue",             200000.0,         "couple queue (+ = vers avant)"),
     ("XA", "accel_tete_avant",         2000.0,           "acceleration tete avant (+ = projete en avant)"),
@@ -177,10 +189,9 @@ def proprio_block_rect(index: int) -> pygame.Rect:
 
 
 def draw_proprio(screen, font, signals: dict,
-                 mouse_pos: tuple[int, int] | None = None) -> None:
-    """Draw the 13 proprioceptive signals as a row of coloured blocks with
-    2-letter labels overlaid. When the mouse hovers a block, a descriptive
-    label is shown below the grid."""
+                 mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw the proprioceptive signals as a row of coloured blocks.
+    Returns the hover description text if a block is hovered, else None."""
     n = len(_PROPRIO_SPECS)
     total_w = n * PROPRIO_BLOCK + (n - 1) * PROPRIO_GAP
     x0 = (WIDTH - total_w) // 2
@@ -209,14 +220,226 @@ def draw_proprio(screen, font, signals: dict,
         screen.blit(s, (bx + (PROPRIO_BLOCK - s.get_width()) // 2,
                         y + (PROPRIO_BLOCK - s.get_height()) // 2))
 
-    # description label below the grid
-    label_y = y + PROPRIO_BLOCK + 8
     if hover >= 0:
         code, key, scale, desc = _PROPRIO_SPECS[hover]
         val = signals.get(key, 0.0)
-        text = f"{desc}  =  {val:+.1f}"
-    else:
-        text = ""
-    if text:
-        s = font.render(text, True, PROPRIO_LABEL_C)
-        screen.blit(s, ((WIDTH - s.get_width()) // 2, label_y))
+        return f"{key}  =  {val:+.1f}"
+    return None
+
+
+# --- extéroception: curseur ---------------------------------------------------
+
+# (2-letter code, dict key, scale, description) — scale maps value to [-1, +1]
+_CURSOR_SPECS = [
+    ("CD", "curseur_dir",  math.pi, "curseur direction (devant = 0)"),
+    ("CP", "curseur_prox", 1.0,    "curseur proximite (proche = 1)"),
+    ("CV", "curseur_vx",  1500.0, "curseur vx (mouvement vers devant = +)"),
+    ("CW", "curseur_vy",  1500.0, "curseur vy (mouvement vers le haut = +)"),
+    ("S0", "son_0",       1.0,    "son cellule 0 (clic souris / espace)"),
+    ("S1", "son_1",       1.0,    "son cellule 1"),
+    ("S2", "son_2",       1.0,    "son cellule 2"),
+    ("S3", "son_3",       1.0,    "son cellule 3"),
+    ("S4", "son_4",       1.0,    "son cellule 4"),
+]
+
+CURSOR_BLOCK = 56
+CURSOR_GAP = 4
+CURSOR_TOP = 160
+
+
+def draw_cursor(screen, font, signals: dict,
+                mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw the cursor extéroceptive signals as a row of coloured blocks.
+    Returns the hover description text if a block is hovered, else None."""
+    n = len(_CURSOR_SPECS)
+    total_w = n * CURSOR_BLOCK + (n - 1) * CURSOR_GAP
+    x0 = (WIDTH - total_w) // 2
+    y = CURSOR_TOP
+    bg = PROPRIO_BAR_BG
+    pos_c = PROPRIO_BAR_POS
+    neg_c = PROPRIO_BAR_NEG
+
+    hover = -1
+    for i, (code, key, scale, desc) in enumerate(_CURSOR_SPECS):
+        bx = x0 + i * (CURSOR_BLOCK + CURSOR_GAP)
+        rect = pygame.Rect(bx, y, CURSOR_BLOCK, CURSOR_BLOCK)
+        if mouse_pos and rect.collidepoint(mouse_pos):
+            hover = i
+        val = signals.get(key, 0.0)
+        t = max(-1.0, min(1.0, val / scale))
+        if t >= 0:
+            fill = _lerp_color(bg, pos_c, t)
+        else:
+            fill = _lerp_color(bg, neg_c, -t)
+        pygame.draw.rect(screen, fill, rect, border_radius=4)
+        border_c = (140, 150, 170) if hover == i else (60, 66, 82)
+        pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
+        s = font.render(code, True, PROPRIO_LABEL_C)
+        screen.blit(s, (bx + (CURSOR_BLOCK - s.get_width()) // 2,
+                        y + (CURSOR_BLOCK - s.get_height()) // 2))
+
+    if hover >= 0:
+        code, key, scale, desc = _CURSOR_SPECS[hover]
+        val = signals.get(key, 0.0)
+        return f"{key}  =  {val:+.1f}"
+    return None
+
+
+# --- extéroception: vision cone -----------------------------------------------
+
+VISION_C = (90, 100, 120)
+VISION_CELL_BORDER = (60, 66, 82)
+
+
+def _hsv_to_rgb255(h: float, s: float, v: float) -> tuple[int, int, int]:
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def draw_vision(screen, font, vision, skel: "B.Skeleton") -> None:
+    """Draw the 4×4 retina cone overlaid on the scene. Each cell is a
+    semi-transparent quadrilateral filled with its perceived HSV color."""
+    from . import extero as E
+
+    head = B.head_world(skel)
+    forward_angle = 0.0 if skel.facing > 0 else math.pi
+    # apex pushed forward past the head (same offset as the sensor)
+    apex_x = head.x + E.VISION_APEX_OFFSET * math.cos(forward_angle)
+    apex_y = head.y + E.VISION_APEX_OFFSET * math.sin(forward_angle)
+    half_fov = E.VISION_FOV / 2
+    ang_step = E.VISION_FOV / E.VISION_COLS
+    depth_step = E.VISION_RANGE / E.VISION_ROWS
+
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+
+    for row in range(E.VISION_ROWS):
+        inner = row * depth_step
+        outer = (row + 1) * depth_step
+        for col in range(E.VISION_COLS):
+            a_lo = forward_angle - half_fov + col * ang_step
+            a_hi = forward_angle - half_fov + (col + 1) * ang_step
+
+            # 4 corners of the cell (world coords)
+            il = (apex_x + inner * math.cos(a_lo),
+                  apex_y + inner * math.sin(a_lo))
+            ih = (apex_x + inner * math.cos(a_hi),
+                  apex_y + inner * math.sin(a_hi))
+            ol = (apex_x + outer * math.cos(a_lo),
+                  apex_y + outer * math.sin(a_lo))
+            oh = (apex_x + outer * math.cos(a_hi),
+                  apex_y + outer * math.sin(a_hi))
+
+            pts = [w2s(*il), w2s(*ih), w2s(*oh), w2s(*ol)]
+
+            idx = row * E.VISION_COLS + col
+            h, s, v = vision.cells[idx]
+            rgb = _hsv_to_rgb255(h, s, v)
+            pygame.draw.polygon(overlay, (*rgb, 90), pts)
+            pygame.draw.polygon(overlay, (*VISION_CELL_BORDER, 140), pts, 1)
+
+    screen.blit(overlay, (0, 0))
+
+
+# --- extéroception: touch (contact forces) ------------------------------------
+
+_TOUCH_SPECS = [
+    ("SA", "contact_sol_avant",   1500.0, "contact sol patte avant"),
+    ("SR", "contact_sol_arriere", 1500.0, "contact sol patte arriere"),
+    ("TX", "collision_tronc_x", 1500.0, "collision tronc"),
+    ("TY", "collision_tronc_y", 1500.0, "collision tronc"),
+    ("TC", "collision_tronc_cx", 200.0, "collision tronc"),
+    ("TD", "collision_tronc_cy", 200.0, "collision tronc"),
+]
+
+TOUCH_BLOCK = 56
+TOUCH_GAP = 4
+TOUCH_TOP = 220
+
+
+def draw_touch(screen, font, signals: dict,
+               mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw the touch (contact force) signals as coloured blocks.
+    Returns the hover description text if a block is hovered, else None."""
+    n = len(_TOUCH_SPECS)
+    total_w = n * TOUCH_BLOCK + (n - 1) * TOUCH_GAP
+    x0 = (WIDTH - total_w) // 2
+    y = TOUCH_TOP
+    bg = PROPRIO_BAR_BG
+    pos_c = PROPRIO_BAR_POS
+    neg_c = PROPRIO_BAR_NEG
+
+    hover = -1
+    for i, (code, key, scale, desc) in enumerate(_TOUCH_SPECS):
+        bx = x0 + i * (TOUCH_BLOCK + TOUCH_GAP)
+        rect = pygame.Rect(bx, y, TOUCH_BLOCK, TOUCH_BLOCK)
+        if mouse_pos and rect.collidepoint(mouse_pos):
+            hover = i
+        val = signals.get(key, 0.0)
+        t = max(-1.0, min(1.0, val / scale))
+        if t >= 0:
+            fill = _lerp_color(bg, pos_c, t)
+        else:
+            fill = _lerp_color(bg, neg_c, -t)
+        pygame.draw.rect(screen, fill, rect, border_radius=4)
+        border_c = (140, 150, 170) if hover == i else (60, 66, 82)
+        pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
+        s = font.render(code, True, PROPRIO_LABEL_C)
+        screen.blit(s, (bx + (TOUCH_BLOCK - s.get_width()) // 2,
+                        y + (TOUCH_BLOCK - s.get_height()) // 2))
+
+    if hover >= 0:
+        code, key, scale, desc = _TOUCH_SPECS[hover]
+        val = signals.get(key, 0.0)
+        return f"{key}  =  {val:+.1f}"
+    return None
+
+
+# --- extéroception: optical flow ----------------------------------------------
+
+_FLUX_SPECS = [
+    ("FS", "flux_surface", 5000.0, "flux surface (aire totale en mouvement)"),
+    ("FX", "flux_x",       150.0,  "flux x (deplacement devant = +)"),
+    ("FY", "flux_y",       150.0,  "flux y (deplacement vers le haut = +)"),
+]
+
+FLUX_BLOCK = 56
+FLUX_GAP = 4
+FLUX_TOP = 290
+
+
+def draw_flux(screen, font, signals: dict,
+              mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw the 3 optical flow signals as coloured blocks.
+    Returns the hover description text if a block is hovered, else None."""
+    n = len(_FLUX_SPECS)
+    total_w = n * FLUX_BLOCK + (n - 1) * FLUX_GAP
+    x0 = (WIDTH - total_w) // 2
+    y = FLUX_TOP
+    bg = PROPRIO_BAR_BG
+    pos_c = PROPRIO_BAR_POS
+    neg_c = PROPRIO_BAR_NEG
+
+    hover = -1
+    for i, (code, key, scale, desc) in enumerate(_FLUX_SPECS):
+        bx = x0 + i * (FLUX_BLOCK + FLUX_GAP)
+        rect = pygame.Rect(bx, y, FLUX_BLOCK, FLUX_BLOCK)
+        if mouse_pos and rect.collidepoint(mouse_pos):
+            hover = i
+        val = signals.get(key, 0.0)
+        t = max(-1.0, min(1.0, val / scale))
+        if t >= 0:
+            fill = _lerp_color(bg, pos_c, t)
+        else:
+            fill = _lerp_color(bg, neg_c, -t)
+        pygame.draw.rect(screen, fill, rect, border_radius=4)
+        border_c = (140, 150, 170) if hover == i else (60, 66, 82)
+        pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
+        s = font.render(code, True, PROPRIO_LABEL_C)
+        screen.blit(s, (bx + (FLUX_BLOCK - s.get_width()) // 2,
+                        y + (FLUX_BLOCK - s.get_height()) // 2))
+
+    if hover >= 0:
+        code, key, scale, desc = _FLUX_SPECS[hover]
+        val = signals.get(key, 0.0)
+        return f"{key}  =  {val:+.1f}"
+    return None

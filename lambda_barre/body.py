@@ -73,8 +73,15 @@ FRONT_PIVOT = (0, 0)         # center of torso
 HIP_L = (-7, -20)
 HIP_R = (7, -20)
 TAIL_ATTACH = (0, -16)
-# head anchor (drawn only)
+# head anchor (drawn only) — offset to the right of torso center; mirrored
+# by facing at every call site so the head follows the orientation.
 HEAD_ANCHOR = (7, 24)
+
+
+def head_world(skel: "Skeleton") -> pymunk.Vec2d:
+    """World-space head position, correctly mirrored by facing direction."""
+    return skel.torso.local_to_world(
+        (HEAD_ANCHOR[0] * skel.facing, HEAD_ANCHOR[1]))
 
 # --- actuator gains (PD) ------------------------------------------------------
 # Hind limb: positional spring toward target foot point.
@@ -89,9 +96,10 @@ TAIL_DAMPING = 12000.0         # ~ c_theta — ~0.8 critical damping for crisp r
 # shapes fight their own joints and the body explodes apart.
 ANIMAT_GROUP = 1
 
-# collision types for contact sensing (pieds vs sol / plateforme)
+# collision types for contact sensing
 FOOT_TYPE = 1
 GROUND_TYPE = 2
+TORSO_TYPE = 3
 
 # facing direction hysteresis (thermostat): the animat only "turns around" when
 # its torso tilt exceeds ±15°, so small oscillations near upright don't flip
@@ -250,6 +258,7 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     torso_shape = pymunk.Poly(torso, TORSO_VERTS)
     torso_shape.friction = 0.8
     torso_shape.filter = _animat_filter()
+    torso_shape.collision_type = TORSO_TYPE
     space.add(torso, torso_shape)
 
     foot_l, spring_l, shape_l = _add_limb(space, torso, HIP_L, LIMB_MASS, LIMB_RADIUS,

@@ -1,11 +1,10 @@
-"""Proprioception: measure the 13 egocentric body signals from the physics.
+"""Proprioception: measure the 11 egocentric body signals from the physics.
 
 See proprioception.md for the full spec. The facing sign is an internal mirror
 variable — never perceived. "Forward" = toward the head, always positive.
 
 Usage:
     proprio = Proprio(space, skel)
-    proprio.reset_contacts()        # before the physics substeps
     for _ in range(3):
         W.step(space, skel, dt)
     signals = proprio.update(skel, frame_dt)
@@ -30,11 +29,10 @@ def _limb_measure(torso, foot, hip_local):
 
 
 class Proprio:
-    """Accumulates contact impulses and computes the 13 proprioceptive signals.
+    """Computes the 11 proprioceptive signals.
 
-    The collision handler is attached once at construction. Call
-    ``reset_contacts`` before the physics substeps, then ``update`` after them
-    to get the snapshot for this frame.
+    Call ``update`` after the physics substeps to get the snapshot for this
+    frame.
     """
 
     def __init__(self, space: pymunk.Space, skel: "B.Skeleton",
@@ -42,36 +40,19 @@ class Proprio:
         self.space = space
         self.skel = skel
         self._substep_dt = substep_dt
-        # accumulated normal impulse per foot body over the frame's substeps
-        self._impulse: dict = {skel.foot_l: 0.0, skel.foot_r: 0.0}
         # head position history for finite-difference acceleration
-        head = skel.torso.local_to_world(B.HEAD_ANCHOR)
+        head = B.head_world(skel)
         self._head_prev = (head.x, head.y)
         self._has_prev = False
-
-        space.on_collision(B.FOOT_TYPE, B.GROUND_TYPE,
-                           post_solve=self._on_post_solve)
-
-    def _on_post_solve(self, arb: pymunk.Arbiter, space, data):
-        ny = arb.total_impulse.y
-        for shape in arb.shapes:
-            body = shape.body
-            if body in self._impulse:
-                self._impulse[body] += ny
-
-    def reset_contacts(self) -> None:
-        self._impulse[self.skel.foot_l] = 0.0
-        self._impulse[self.skel.foot_r] = 0.0
 
     def reset(self) -> None:
         """Call after B.reset(skel) to re-sync the head history."""
-        head = self.skel.torso.local_to_world(B.HEAD_ANCHOR)
+        head = B.head_world(self.skel)
         self._head_prev = (head.x, head.y)
         self._has_prev = False
-        self.reset_contacts()
 
     def update(self, skel: "B.Skeleton", dt: float) -> dict:
-        """Compute the 13 egocentric signals. Call after the physics substeps."""
+        """Compute the 11 egocentric signals. Call after the physics substeps."""
         facing = -skel.facing
         torso = skel.torso
 
@@ -96,7 +77,7 @@ class Proprio:
         queue_angle = tail_rel - tail_neutral
 
         # --- head acceleration (finite difference, world frame) ---
-        head = torso.local_to_world(B.HEAD_ANCHOR)
+        head = B.head_world(skel)
         if self._has_prev and dt > 0:
             ax = (head.x - self._head_prev[0]) / dt
             ay = (head.y - self._head_prev[1]) / dt
@@ -111,20 +92,14 @@ class Proprio:
         f_spring_b = spring_back.impulse / sdt if sdt > 0 else 0.0
         torque_tail = skel.tail_spring.impulse / sdt if sdt > 0 else 0.0
 
-        # --- contact force (impulse / dt) ---
-        f_contact_f = self._impulse[foot_front] / dt if dt > 0 else 0.0
-        f_contact_b = self._impulse[foot_back] / dt if dt > 0 else 0.0
-
         return {
             "tronc_angle": facing * torso.angle,
             "membre_angle_avant": facing * th_f,
             "membre_distance_avant": d_f,
             "force_actuateur_avant": f_spring_f,
-            "force_contact_sol_avant": f_contact_f,
             "membre_angle_arriere": facing * th_b,
             "membre_distance_arriere": d_b,
             "force_actuateur_arriere": f_spring_b,
-            "force_contact_sol_arriere": f_contact_b,
             "queue_angle": queue_angle,
             "couple_queue": facing * torque_tail,
             "accel_tete_avant": facing * ax,

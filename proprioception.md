@@ -59,14 +59,10 @@ Scalaires sans direction:
    (scalaire radial).
 * `force_actuateur_avant` — `spring.impulse / substep_dt` de la patte avant.
    Effort musculaire. Sans miroir (scalaire de tension).
-* `force_contact_sol_avant` — impulsion normale / dt, patte avant. Sans miroir
-   (scalaire normal).
 * `membre_distance_arriere` — distance mesurée de la patte arrière. Sans
    miroir.
 * `force_actuateur_arriere` — `spring.impulse / substep_dt` de la patte arrière.
    Sans miroir.
-* `force_contact_sol_arriere` — impulsion normale / dt, patte arrière. Sans
-   miroir.
 
 Scalaires horizontaux:
 * `accel_tete_avant` — `facing * ax_monde`. Accélération de la tête (point
@@ -123,23 +119,11 @@ force/couple moyenne sur le sous-pas.
 
 ### Force de contact avec le sol
 
-pymunk n'expose pas directement la force de contact hors d'un `Arbiter`. On
-ajoute un `CollisionHandler` `post_solve` entre les pieds et le sol, qui
-accumule l'impulsion normale reçue par chaque pied sur le pas de simulation.
-La force = `impulsion / dt`. Le signal binaire `foot_contacts` (heuristique
-positionnelle existante) est conservé pour la transition mais la force continue
-est la valeur à apprendre.
-
-```python
-space.on_collision(FOOT_TYPE, GROUND_TYPE, post_solve=callback)
-def post_solve(arb, space, data):
-    ny = arb.total_impulse.y
-    for shape in arb.shapes:
-        if shape.body is foot: contact_impulse[foot] += ny
-```
-
-Pas de miroir : la force normale est un scalaire (composante y), pas une
-direction dans le plan.
+La force de contact avec le sol n'est plus un signal proprioceptif : c'est
+une mesure de l'environnement externe (« que touche-je ? »), pas de l'état
+du corps. Elle est désormais rangée en extéroception, modalité toucher, sous
+les noms `contact_sol_avant` / `contact_sol_arriere` (voir `exteroception.md`
+§ Toucher).
 
 ### Accélération de la tête
 
@@ -172,14 +156,12 @@ délimités par tokens PROPRIO, VISION, …) viendra plus tard. Pour l'instant l
 ## Cadencement
 
 On expose une classe `Proprio` qui produit un snapshot plat. Le cycle par
-frame est : `proprio.reset_contacts()` avant les sous-pas physiques, puis
-`proprio.update(skel, dt)` après pour obtenir le `dict`. La quantification en
-tokens et le cadencement viendront avec l'encodeur du transformer (Stage
-ultérieur).
+frame est : les sous-pas physiques, puis `proprio.update(skel, dt)` pour
+obtenir le `dict`. La quantification en tokens et le cadencement viendront
+avec l'encodeur du transformer (Stage ultérieur).
 
 Les **mesures instantanées** (angles, forces ressort, couple) sont lues à
 chaque frame de rendu (60 Hz) à partir du dernier état physique.
 
-L'**accélération** et la **force de contact** nécessitent un pas précédent :
-calculées à chaque pas physique (180 Hz, 3 sous-pas) ou mémorisées frame
-à frame (60 Hz).
+L'**accélération** nécessite un pas précédent : mémorisée frame à frame
+(60 Hz).
