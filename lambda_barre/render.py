@@ -1,7 +1,6 @@
 """Pygame renderer for λ̄. Physics is y-up (ground at y=0); screen is y-down."""
 from __future__ import annotations
 
-import colorsys
 import math
 
 import pygame
@@ -291,14 +290,9 @@ VISION_C = (90, 100, 120)
 VISION_CELL_BORDER = (60, 66, 82)
 
 
-def _hsv_to_rgb255(h: float, s: float, v: float) -> tuple[int, int, int]:
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    return int(r * 255), int(g * 255), int(b * 255)
-
-
 def draw_vision(screen, font, vision, skel: "B.Skeleton") -> None:
     """Draw the 4×4 retina cone overlaid on the scene. Each cell is a
-    semi-transparent quadrilateral filled with its perceived HSV color."""
+    semi-transparent quadrilateral filled with its perceived brightness."""
     from . import extero as E
 
     head = B.head_world(skel)
@@ -332,9 +326,9 @@ def draw_vision(screen, font, vision, skel: "B.Skeleton") -> None:
             pts = [w2s(*il), w2s(*ih), w2s(*oh), w2s(*ol)]
 
             idx = row * E.VISION_COLS + col
-            h, s, v = vision.cells[idx]
-            rgb = _hsv_to_rgb255(h, s, v)
-            pygame.draw.polygon(overlay, (*rgb, 90), pts)
+            g = vision.cells[idx]
+            gray = int(g * 255)
+            pygame.draw.polygon(overlay, (gray, gray, gray, 90), pts)
             pygame.draw.polygon(overlay, (*VISION_CELL_BORDER, 140), pts, 1)
 
     screen.blit(overlay, (0, 0))
@@ -443,3 +437,155 @@ def draw_flux(screen, font, signals: dict,
         val = signals.get(key, 0.0)
         return f"{key}  =  {val:+.1f}"
     return None
+
+
+# --- reward + intéroception ---------------------------------------------------
+
+REWARD_BLOCK = 56
+REWARD_GAP = 4
+REWARD_TOP = 360
+
+REWARD_POS_C = (110, 200, 140)   # green = comfort (reward)
+REWARD_NEG_C = (200, 110, 110)   # red = costs (penalty)
+INTERO_C = (180, 160, 100)      # amber = internal states
+
+_INTERO_SPECS = [
+    ("FT", "fatigue",     "fatigue"),
+    ("SF", "souffrance",  "souffrance"),
+]
+
+
+def draw_reward(screen, font, signals: dict, intero_signals: dict,
+                mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw 4 boxes in one row: + (comfort), - (costs), FT, SF.
+    On hover of the negative box, detail the 5 cost components (e,d,c,i,v).
+    Returns the hover description text, else None."""
+    bg = PROPRIO_BAR_BG
+    n = 2 + len(_INTERO_SPECS)
+    total_w = n * REWARD_BLOCK + (n - 1) * REWARD_GAP
+    x0 = (WIDTH - total_w) // 2
+    y = REWARD_TOP
+
+    # positive box (confort)
+    r_pos = pygame.Rect(x0, y, REWARD_BLOCK, REWARD_BLOCK)
+    hover_pos = bool(mouse_pos and r_pos.collidepoint(mouse_pos))
+    pos_val = signals.get("reward_pos", 0.0)
+    pos_t = max(0.0, min(1.0, -pos_val))
+    fill_pos = _lerp_color(bg, REWARD_POS_C, pos_t)
+    pygame.draw.rect(screen, fill_pos, r_pos, border_radius=4)
+    pygame.draw.rect(screen, (140, 150, 170) if hover_pos else (60, 66, 82),
+                     r_pos, 2, border_radius=4)
+    s = font.render("+", True, PROPRIO_LABEL_C)
+    screen.blit(s, (r_pos.x + (REWARD_BLOCK - s.get_width()) // 2,
+                    r_pos.y + (REWARD_BLOCK - s.get_height()) // 2))
+
+    # negative box (costs)
+    r_neg = pygame.Rect(x0 + REWARD_BLOCK + REWARD_GAP, y,
+                        REWARD_BLOCK, REWARD_BLOCK)
+    hover_neg = bool(mouse_pos and r_neg.collidepoint(mouse_pos))
+    neg_val = signals.get("reward_neg", 0.0)
+    neg_t = max(0.0, min(1.0, neg_val))
+    fill_neg = _lerp_color(bg, REWARD_NEG_C, neg_t)
+    pygame.draw.rect(screen, fill_neg, r_neg, border_radius=4)
+    pygame.draw.rect(screen, (140, 150, 170) if hover_neg else (60, 66, 82),
+                     r_neg, 2, border_radius=4)
+    s = font.render("-", True, PROPRIO_LABEL_C)
+    screen.blit(s, (r_neg.x + (REWARD_BLOCK - s.get_width()) // 2,
+                    r_neg.y + (REWARD_BLOCK - s.get_height()) // 2))
+
+    # intero boxes
+    hover_intero = -1
+    for i, (code, key, desc) in enumerate(_INTERO_SPECS):
+        bx = x0 + (2 + i) * (REWARD_BLOCK + REWARD_GAP)
+        rect = pygame.Rect(bx, y, REWARD_BLOCK, REWARD_BLOCK)
+        if mouse_pos and rect.collidepoint(mouse_pos):
+            hover_intero = i
+        val = intero_signals.get(key, 0.0)
+        t = max(0.0, min(1.0, val))
+        fill = _lerp_color(bg, INTERO_C, t)
+        pygame.draw.rect(screen, fill, rect, border_radius=4)
+        pygame.draw.rect(screen, (140, 150, 170) if hover_intero == i
+                        else (60, 66, 82), rect, 2, border_radius=4)
+        s = font.render(code, True, PROPRIO_LABEL_C)
+        screen.blit(s, (bx + (REWARD_BLOCK - s.get_width()) // 2,
+                        y + (REWARD_BLOCK - s.get_height()) // 2))
+
+    if hover_pos:
+        return f"confort = {pos_val:+.2f}"
+    if hover_neg:
+        e = signals.get("effort", 0.0)
+        d = signals.get("douleur", 0.0)
+        c = signals.get("courbature", 0.0)
+        i = signals.get("instabilite", 0.0)
+        v = signals.get("vertige", 0.0)
+        return (f"couts: e={e:.2f} d={d:.2f} c={c:.2f} "
+                f"i={i:.2f} v={v:.2f}  |  total={neg_val:.2f}")
+    if hover_intero >= 0:
+        code, key, desc = _INTERO_SPECS[hover_intero]
+        val = intero_signals.get(key, 0.0)
+        return f"{desc}  =  {val:.2f}"
+    return None
+
+
+# --- token stream display -----------------------------------------------------
+
+TOKEN_PANEL_X = WIDTH - 190
+TOKEN_PANEL_W = 180
+TOKEN_PANEL_Y = 10
+TOKEN_PANEL_H = HEIGHT - 20
+TOKEN_COL_W = TOKEN_PANEL_W // 2 - 4
+TOKEN_LINE_H = 11
+TOKEN_SEP_C = (90, 100, 120)
+TOKEN_TEXT_C = (140, 140, 150)
+TOKEN_SALVE_SEP_C = (50, 54, 66)
+
+
+def draw_tokens(screen, font_small, salves: list,
+                 encoder) -> None:
+    """Draw the last N salves as decoded text in 2 columns on the right.
+    Most recent salves at the bottom. Auto-scrolls to show the latest."""
+    from .tokenize import _SEP_NAMES, _BY_ID
+
+    # flatten all salves into lines, skipping vision tokens (too many)
+    all_lines: list[tuple[str, int]] = []
+    in_vision = False
+    for si, salve in enumerate(salves):
+        if si > 0:
+            all_lines.append(("---", 2))
+        in_vision = False
+        for tid, val in salve:
+            if tid in _SEP_NAMES:
+                name = _SEP_NAMES[tid]
+                in_vision = (name == "VISION")
+                all_lines.append((f"[{name}]", 1))
+            elif in_vision:
+                continue
+            else:
+                spec = _BY_ID.get(tid)
+                if spec:
+                    all_lines.append((f"{spec.code}={val:3d}", 0))
+                else:
+                    all_lines.append((f"?{tid}={val:3d}", 0))
+
+    # how many lines fit per column?
+    max_per_col = TOKEN_PANEL_H // TOKEN_LINE_H
+    total_visible = 2 * max_per_col
+    n = len(all_lines)
+    start = max(0, n - total_visible)
+    visible = all_lines[start:]
+
+    # fill column 0 top-to-bottom, then column 1
+    col_n = min(len(visible), max_per_col)
+
+    for idx, (text, ltype) in enumerate(visible):
+        col = 0 if idx < col_n else 1
+        row = idx if col == 0 else idx - col_n
+        x = TOKEN_PANEL_X + col * (TOKEN_COL_W + 4)
+        y = TOKEN_PANEL_Y + row * TOKEN_LINE_H
+        if ltype == 2:
+            s = font_small.render(text, True, TOKEN_SALVE_SEP_C)
+        elif ltype == 1:
+            s = font_small.render(text, True, TOKEN_SEP_C)
+        else:
+            s = font_small.render(text, True, TOKEN_TEXT_C)
+        screen.blit(s, (x, y))

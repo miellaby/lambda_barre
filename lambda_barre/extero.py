@@ -195,23 +195,22 @@ VISION_HZ = 6.0
 VISION_QUERY_RADIUS = 3.0        # max_distance for point_query_nearest
 VISION_APEX_OFFSET = 20.0         # px forward from head — cone clears the body
 
-# Shape → HSV color mapping (H, S, V all in [0, 1])
-BG_HSV = (0.0, 0.0, 0.05)                 # background: near-black
-GROUND_HSV = (0.10, 0.35, 0.35)          # ground: dark brown
-PLATFORM_HSV = (0.58, 0.25, 0.55)        # platform: muted blue-gray
-DYNAMIC_HSV = (0.12, 0.75, 0.90)         # dynamic object: gold
+# Shape → grayscale brightness mapping ([0, 1])
+BG_GRAY = 0.05                 # background: near-black
+GROUND_GRAY = 0.35             # ground: dark
+PLATFORM_GRAY = 0.55           # platform: mid-gray
+DYNAMIC_GRAY = 0.90            # dynamic object: bright
 
 
-def _shape_to_hsv(shape: pymunk.Shape) -> tuple[float, float, float]:
-    """Map a pymunk shape to an HSV color the animat would 'see'."""
+def _shape_to_gray(shape: pymunk.Shape) -> float:
+    """Map a pymunk shape to a grayscale brightness the animat would 'see'."""
     body = shape.body
     if body.body_type == pymunk.Body.STATIC:
-        # ground vs platform: ground is at y≈0, platforms are elevated/sunken
         a = body.local_to_world(shape.a)
         if abs(a.y) < 1.0:
-            return GROUND_HSV
-        return PLATFORM_HSV
-    return DYNAMIC_HSV
+            return GROUND_GRAY
+        return PLATFORM_GRAY
+    return DYNAMIC_GRAY
 
 
 class Vision:
@@ -222,8 +221,7 @@ class Vision:
     a quadrilateral; we sample a VISION_GRID × VISION_GRID grid of points
     inside it via ``space.point_query_nearest`` and compute:
 
-        - mean HSV (3 values)
-        - heterogeneity (std of V across samples)
+        - mean brightness (grayscale, 1 value in [0, 1])
 
     Cadenced at 6 Hz: the main loop runs at 60 Hz, so the cone is resampled
     every 10 frames. Between samples, the last values are returned.
@@ -235,8 +233,8 @@ class Vision:
         - flux_x: facing * dx of the movement barycentre, egocentered
         - flux_y: dy of the movement barycentre, egocentered
 
-    Signals produced (64 + 3 values, flat dict):
-        vis_c{i}_h, vis_c{i}_s, vis_c{i}_v, vis_c{i}_het  for i in 1..16
+    Signals produced (16 + 3 values, flat dict):
+        vis_c{i}  for i in 1..16  — mean brightness [0, 1]
         flux_surface, flux_x, flux_y
     Cell order is row-major: row 0 (nearest) cols 0-3, then row 1, etc.
     Col 0 = lowest angle (downward-most), col 3 = highest (upward-most).
@@ -251,21 +249,18 @@ class Vision:
         self._sample_dt = 1.0 / self.SAMPLE_HZ
         self._signals: dict[str, float] = {}
         for i in range(1, 17):
-            self._signals[f"vis_c{i}_h"] = 0.0
-            self._signals[f"vis_c{i}_s"] = 0.0
-            self._signals[f"vis_c{i}_v"] = 0.0
-            self._signals[f"vis_c{i}_het"] = 0.0
+            self._signals[f"vis_c{i}"] = 0.0
         self._signals["flux_surface"] = 0.0
         self._signals["flux_x"] = 0.0
         self._signals["flux_y"] = 0.0
-        # raw per-cell HSV (mean) for debug rendering
-        self.cells: list[tuple[float, float, float]] = [BG_HSV] * 16
+        # raw per-cell brightness for debug rendering
+        self.cells: list[float] = [BG_GRAY] * 16
         # previous platform rects: id(body) -> (x0, y0, x1, y1)
         self._prev_plat_rect: dict[int, tuple[float, float, float, float]] = {}
 
     def reset(self) -> None:
         self._accum = 0.0
-        self.cells = [BG_HSV] * 16
+        self.cells = [BG_GRAY] * 16
         self._prev_plat_rect = {}
         self._signals = {k: 0.0 for k in self._signals}
 
@@ -297,7 +292,7 @@ class Vision:
                 a_hi = forward_angle - half_fov + (col + 1) * ang_step
 
                 # 2D sample grid: GRID depths × GRID angles within the cell
-                colors: list[tuple[float, float, float]] = []
+                grays: list[float] = []
                 for ga in range(VISION_GRID):
                     ta = (ga + 0.5) / VISION_GRID
                     a = a_lo + ta * (a_hi - a_lo)
@@ -311,25 +306,17 @@ class Vision:
                         info = self._space.point_query_nearest(
                             (px, py), VISION_QUERY_RADIUS, self._filter)
                         if info is not None:
-                            colors.append(_shape_to_hsv(info.shape))
+                            grays.append(_shape_to_gray(info.shape))
                         else:
-                            colors.append(BG_HSV)
+                            grays.append(BG_GRAY)
 
-                # mean HSV
-                n = len(colors)
-                mh = sum(c[0] for c in colors) / n
-                ms = sum(c[1] for c in colors) / n
-                mv = sum(c[2] for c in colors) / n
-                # heterogeneity: std of V across samples
-                var = sum((c[2] - mv) ** 2 for c in colors) / n
-                het = math.sqrt(var)
+                # mean brightness
+                n = len(grays)
+                mv = sum(grays) / n
 
                 idx = row * VISION_COLS + col
-                self._signals[f"vis_c{idx + 1}_h"] = mh
-                self._signals[f"vis_c{idx + 1}_s"] = ms
-                self._signals[f"vis_c{idx + 1}_v"] = mv
-                self._signals[f"vis_c{idx + 1}_het"] = het
-                self.cells[idx] = (mh, ms, mv)
+                self._signals[f"vis_c{idx + 1}"] = mv
+                self.cells[idx] = mv
 
         # --- optical flow: intersection of platform rectangles t-1 vs t ---
         # surface that changed = symmetric difference of old and new rects.
