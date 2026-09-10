@@ -38,30 +38,28 @@ selon l'axe gauche/droite (facing). Le miroir facing suffit à égocentrer.
 
 ## Vision
 
-La vision est rétinienne, très basse résolution, à courte portée.
+La vision est rétinienne, très basse résolution, à courte portée. Elle est en
+niveaux de gris (N&B).
 
-### Couleurs
+### Brightness
 
 Le cône de vision est un triangle dans le prolongement de la tête, pointant
 vers l'avant (côté facing). Il est découpé en 16 cellules disposées en 4×4.
 
-Pour chaque cellule, on calcule :
-- une couleur moyenne HSV (3 composantes : teinte, saturation, valeur)
-- une mesure d'hétérogénéité (1 scalaire : variance ou écart-type des couleurs
-  dans la cellule)
+Pour chaque cellule, on calcule la brightness moyenne (1 scalaire [0, 1]).
 
-Soit 16 × 4 = 64 valeurs.
+Soit 16 valeurs.
 
 ```python
 [VISION]
-  cellule_1   # (H, S, V, hétérogénéité)
+  cellule_1   # brightness [0, 1]
   cellule_2
   ...
   cellule_16
 ```
 
 Ces informations rudimentaires permettent de distinguer une surface uniforme,
-un bord de fenêtre, un objet coloré, du mouvement.
+un bord, un objet, du mouvement.
 
 ### Flux optique
 
@@ -258,7 +256,7 @@ Implémentées :
   cartésienne, et 5 cellules fréquentielles IIR pour le son (clic souris +
   clavier). Le son est émis depuis la position du curseur — `extero.py` classe
   `Cursor`. Cadencée à 30 Hz.
-- **Vision** : cône rétinien 4×4, 16 cellules × (HSV + hétérogénéité) = 64
+- **Vision** : cône rétinien 4×4, 16 cellules × 1 brightness (N&B) = 16
   valeurs, échantillonnage par `space.point_query_nearest` — `extero.py`
   classe `Vision`. Cadencée à 6 Hz. Pas de masquage (chaque cellule est
   indépendante).

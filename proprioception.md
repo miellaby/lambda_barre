@@ -73,6 +73,86 @@ Scalaires verticaux:
 * `accel_tete_haut` — `ay_monde`. Composante y en repère monde, différence
     finie. + = vers le haut. Sans miroir (gravité).
 
+## Circuit de renforcement de la proprioception
+
+### L'effort
+
+L'effort est un coût instantané des actuateurs du corps (membres + queue)
+déduit de l'activité des ressorts contrôlés:
+
+```python
+effort = abs(force_av) + abs(force_ar) + abs(couple_queue)
+```
+
+### Douleur
+
+La douleur est un coût instantané quand:
+
+- la collision du tronc dépasse un seuil (`collision_tronc_x` / `_y`), ou
+- l'accélération de la tête dépasse un seuil (`accel_tete_avant`, `accel_tete_haut`).
+
+```python
+douleur = max(0, |collision_tronc| - seuil) + max(0, |accel_tete| - seuil)
+```
+
+### Courbature
+
+La courbature augmente quand la proprioception ne varie
+pas suffisament (immobilité prolongée). Elle décroit
+rapidement par le mouvement.
+
+On suit la variance des signaux proprio sur une fenêtre glissante.
+L'inconfort croît si elle est faible.
+
+Dès qu'un mouvement suffisamment ample revient, il décroît rapidement.
+
+```python
+variance_proprio = variance_fenetre(signaux_proprio, fenetre=1.0 s)
+inconfort_immobilite += k_immob * max(0, seuil_var - variance_proprio) * dt
+inconfort_immobilite *= decay_immob   # décroît dès que variance_proprio > seuil
+```
+
+### Instabilité
+
+Un signal qui encourage l'écartement des pattes.
+Coût pénalisant quand la projection du centre de masse sort du polygone d'appui.
+
+```python
+# pieds en repère monde
+left = min(fx_front, fx_back)
+right = max(fx_front, fx_back)
+
+# marge : distance du COM projeté au bord le plus proche du support
+marge = min(com_x - left, right - com_x)   # > 0 = stable, < 0 = en chute
+
+instabilite = max(0, -marge)   # coût seulement si le COM sort du support
+```
+
+•  pieds rapprochés + tronc lourd au-dessus → marge faible → instable
+•  pieds écartés → marge grande → stable
+•  λ̄ allongé au sol → le tronc est bas mais le COM est toujours dans le support → pas de coût
+•  λ̄ penché avec pieds serrés → le COM sort du support → coût
+
+Donc ça pousse à écarter les pattes sans pénaliser la position couchée.
+
+### Confort de la posture
+
+Un renforcement postural. Léger plaisir près d'une des quelques poses instinctives: Debout, couché, ...
+
+`confort_postural` est négatif (récompense) près de la verticale.
+
+Exemple: verticalité du tronc.
+
+```python
+confort_postural = k_post * tronc_angle**2
+```
+
+... a préciser.
+
+### Vertige
+
+Coût proportionnel à l'accéleration de la tête.
+
 ## Calculs concrets
 
 ### Angle et distance réels d'un membre (mesure, pas consigne)
