@@ -27,14 +27,25 @@ from . import render as R
 from . import ui as UI
 from . import sensors as S
 from . import extero as E
+from . import intero as I
+from .tokenize import TokenEncoder
+from .brain import Brain
 
 
-def hud(font, skel, fps):
+def hud(font, skel, fps, brain=None, auto=False, status=None):
     lines = [
-        f"fps {fps:4.0f}   facing {'R' if skel.facing == 1 else 'L'}",
-        "drag joysticks (legs) / slider (tail) · RIGHT-DRAG platforms · "
-        "BACK reset · G targets · ESC quit",
+        f"fps {fps:2.0f} facing {'R' if skel.facing == 1 else 'L'} "
+        f"{'[BRAIN]' if auto else '[manual]'}",
+        "BACKSPACE reset · G targets · B brain · S sleep · R reward · T punish",
     ]
+    if brain is not None:
+        wm = brain.last_wm_loss
+        pol = brain.last_pol_loss
+        lines.append(
+            f"buf {len(brain.buffer)} wm {wm:.2f} pol {pol:.2f} "
+            f"ret {brain.last_return:.2f}")
+    if status:
+        lines.append(status)
     return [font.render(t, True, R.HUD_C) for t in lines]
 
 
@@ -60,6 +71,7 @@ def run(headless: bool = False, steps: int = 0) -> None:
     flags = pygame.SCALED
     screen = pygame.display.set_mode((R.WIDTH, R.HEIGHT), flags) if not headless else None
     font = pygame.font.SysFont("monospace", 16) if screen else None
+    font_small = pygame.font.SysFont("monospace", 10) if screen else None
     clock = pygame.time.Clock()
     pygame.display.set_caption("lambda barre — Stage 1")
 
@@ -69,9 +81,21 @@ def run(headless: bool = False, steps: int = 0) -> None:
     controls.push(skel)
     B.apply_consignes(skel)
     proprio = S.Proprio(space, skel)
+    reward = S.Reward(skel)
     cursor = E.Cursor(skel)
     vision = E.Vision(skel, space)
     touch = E.Touch(space, skel)
+    intero = I.Intero()
+    encoder = TokenEncoder()
+    brain = Brain()
+    auto = False                 # brain drives the consignes when True
+    user_reward = 0.0           # decaying positive-valence impulse (R)
+    user_punish = 0.0           # decaying negative-valence impulse (T)
+    prev_salve = None           # last salve, for (s_t, a_t, s_{t+1}) logging
+    status = None               # transient HUD message
+    salves: list = []       # buffer of last 10 salves
+    salve_accum = 0.0
+    SALVE_DT = 1.0 / 6.0   # 6 Hz — world-model / policy cadence
     show_targets = True
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
@@ -90,11 +114,40 @@ def run(headless: bool = False, steps: int = 0) -> None:
                     B.reset(skel)
                     controls = UI.Controls(skel)
                     proprio.reset()
+                    reward.reset()
                     cursor.reset()
                     vision.reset()
                     touch.reset()
+                    intero.reset()
+                    salves.clear()
+                    salve_accum = 0.0
+                    prev_salve = None
+                    user_reward = 0.0
+                    user_punish = 0.0
+                    status = "reset"
                 elif ev.key == pygame.K_g:
                     show_targets = not show_targets
+                elif ev.key == pygame.K_b:
+                    auto = not auto
+                    prev_salve = None
+                    status = "BRAIN on" if auto else "BRAIN off (manual)"
+                elif ev.key == pygame.K_r:
+                    user_reward = 1.0
+                elif ev.key == pygame.K_t:
+                    user_punish = 1.0
+                elif ev.key == pygame.K_s:
+                    if len(brain.buffer) >= 8:
+                        if screen is not None:
+                            msg = font.render("sleeping...", True, R.HUD_C)
+                            screen.blit(msg, (12, 70))
+                            pygame.display.flip()
+                        stats = brain.sleep()
+                        print("[sleep]", stats)
+                        status = (f"slept: wm {stats['wm_loss']:.2f} "
+                                  f"pol {stats['pol_loss']:.2f} "
+                                  f"ret {stats['return']:.2f}")
+                    else:
+                        status = "need >=8 transitions to sleep"
                 else:
                     cursor.on_key(ev.scancode)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
@@ -119,8 +172,10 @@ def run(headless: bool = False, steps: int = 0) -> None:
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 3:
                 drag_plat = None
 
-        # the widgets are the single source of truth for the consignes
-        controls.push(skel)
+        # the widgets are the single source of truth for the consignes in
+        # manual mode; in brain (auto) mode the policy drives them instead.
+        if not auto:
+            controls.push(skel)
 
         # animate the moving platform
         sim_t += 1 / 60
@@ -132,23 +187,62 @@ def run(headless: bool = False, steps: int = 0) -> None:
             W.step(space, skel, 1 / 180)
         signals = proprio.update(skel, 1 / 60)
         touch_signals = touch.update(skel, 1 / 60)
+        reward_signals = reward.update(skel, signals, touch_signals, 1 / 60)
+        intero_signals = intero.update(reward_signals, 1 / 60)
+        # user reward/punish (valenced sensory event, per the design doc):
+        # reward makes reward_pos more negative (reduces cost), punish raises
+        # reward_neg (raises cost). Both decay exponentially.
+        if user_reward > 1e-3 or user_punish > 1e-3:
+            reward_signals["reward_pos"] = reward_signals.get("reward_pos", 0.0) \
+                - user_reward
+            reward_signals["reward_neg"] = reward_signals.get("reward_neg", 0.0) \
+                + user_punish
+            user_reward *= 0.9
+            user_punish *= 0.9
         cursor_signals = cursor.update(skel, pygame.mouse.get_pos(), 1 / 60)
         vision_signals = vision.update(skel, 1 / 60)
 
+        # generate a token salve at 6 Hz
+        salve_accum += 1 / 60
+        if salve_accum >= SALVE_DT:
+            salve_accum -= SALVE_DT
+            salve = encoder.encode(signals, touch_signals, cursor_signals,
+                                   vision_signals, intero_signals,
+                                   reward_signals, skel)
+            salves.append(salve)
+            if len(salves) > 10:
+                salves.pop(0)
+            # brain loop: log (s_t, a_t, s_{t+1}) then command the next action.
+            if auto:
+                if prev_salve is not None:
+                    brain.record(prev_salve, salve)
+                tl, dl, tr, dr, tq = brain.act(salve)
+                skel.limb_l.theta_star = tl
+                skel.limb_l.d_star = dl
+                skel.limb_r.theta_star = tr
+                skel.limb_r.d_star = dr
+                skel.tail_act.theta_star = tq
+            prev_salve = salve
+
         if screen is not None:
             mouse = pygame.mouse.get_pos()
+            R.draw_tokens(screen, font_small, salves, encoder)
             R.draw(screen, skel, font, show_targets)
             R.draw_vision(screen, font, vision, skel)
             h_proprio = R.draw_proprio(screen, font, signals, mouse)
             h_touch = R.draw_touch(screen, font, touch_signals, mouse)
             h_flux = R.draw_flux(screen, font, vision_signals, mouse)
             h_cursor = R.draw_cursor(screen, font, cursor_signals, mouse)
-            hover_text = h_proprio or h_touch or h_flux or h_cursor
+            h_reward = R.draw_reward(screen, font, reward_signals,
+                                     intero_signals, mouse)
+            hover_text = (h_proprio or h_touch or h_flux or h_cursor
+                         or h_reward)
             if hover_text:
                 s = font.render(hover_text, True, R.PROPRIO_LABEL_C)
                 screen.blit(s, ((R.WIDTH - s.get_width()) // 2, R.HEIGHT - 24))
             controls.draw(screen, font)
-            for i, surf in enumerate(hud(font, skel, clock.get_fps())):
+            for i, surf in enumerate(hud(font, skel, clock.get_fps(),
+                                         brain, auto, status)):
                 screen.blit(surf, (12, 10 + i * 20))
             pygame.display.flip()
             clock.tick(60)
