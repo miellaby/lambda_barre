@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 err.log
+brain_ckpt.pt
+wm_ckpt.pt
+pol_ckpt.pt

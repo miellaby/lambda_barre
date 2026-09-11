@@ -1,14 +1,14 @@
 """End-to-end test for the 2-model brain (no pygame window).
 
-Exercises the full pipeline: encode a salve, journal transitions, run a sleep
-cycle that trains both the world model and the policy, and check that the
-world-model loss decreases on structured data and that the policy produces
+Exercises the full pipeline: encode a dense salve, journal transitions, run a
+sleep cycle that trains both the world model and the policy, and check that
+the world-model loss decreases on structured data and that the policy produces
 valid consignes.
 
 Run with the project on PYTHONPATH:
     PYTHONPATH=. python -m pytest lambda_barre/test_brain.py -q
 or directly:
-    PYTHONPATH=. python lambda_barre/test_brain.py
+    PYTHONPATH=. python -m lambda_barre.test_brain
 """
 from __future__ import annotations
 
@@ -19,17 +19,24 @@ from .brain import Brain
 from .models import Policy, WorldModel
 
 
-def _make_salve(scalars: list[int], action_vals: list[int]):
-    """Build a 67-token salve from 55 scalar values and 5 action scalar values."""
-    svals = T.state_vals_from_scalars(scalars)
-    avals = [0] + action_vals  # ACTION sep (value 0) + 5 scalars
-    return list(zip(T.SALVE_IDS, svals + avals))
+def _run_sleep(b, **kw):
+    """Consume a sleep generator and return the final stats dict."""
+    for label, value in b.sleep(**kw):
+        if label == "done":
+            return value
+    return None
+
+
+def _make_salve(state_signals: list[float],
+                action_signals: list[float]) -> list[list[float]]:
+    """Build a 16-token dense salve from 53 sensory + 5 motor [0,1] floats."""
+    return T.make_salve(state_signals, action_signals)
 
 
 def test_policy_outputs_are_valid_consignes():
     import torch
     p = Policy()
-    sv = torch.rand(4, 55)
+    sv = torch.rand(4, 143)
     a = p(sv)
     assert a.shape == (4, 5)
     cons = a.tolist()
@@ -43,29 +50,34 @@ def test_policy_outputs_are_valid_consignes():
 def test_world_model_forward_and_predict_shapes():
     import torch
     wm = WorldModel()
-    seq = T.STATE_IDS + T.ACTION_IDS + T.STATE_IDS  # 128
-    ids = torch.tensor([seq] * 3)
-    vals = torch.randint(0, 256, (3, 128))
-    out = wm(ids, vals)
-    assert out.shape == (3, 128, 256)
-    nxt = wm.predict_next(ids[:, :67], vals[:, :67])
-    assert nxt.shape == (3, T.STATE_LEN)
+    L = T.SALVE_TOKENS + T.SALVE_TOKENS + T.STATE_TOKENS  # 16+16+13 = 45
+    x = torch.rand(3, L, T.DENSE_DIM)
+    out = wm(x)
+    assert out.shape == (3, L, T.N_SIGNAL)
+    assert not torch.isnan(out).any().item()
+    # predict_next: ctx = [B, 16, 25] (one state+action salve) -> [B, 13, 25]
+    ctx = torch.rand(3, T.SALVE_TOKENS, T.DENSE_DIM)
+    nxt = wm.predict_next(ctx)
+    assert nxt.shape == (3, T.STATE_TOKENS, T.DENSE_DIM)
+    sigs = nxt[:, :, 9:]
+    assert bool((sigs >= 0).all().item()) and bool((sigs <= 1).all().item())
 
 
 def test_salve_cost_sign():
-    # reward_pos is signed: token value 0 -> -1.0 (reward, negative cost),
-    # token value 255 -> +1.0 (penalty). reward_neg is unsigned cost.
-    scalars = [0] * 55
-    sv = T.state_vals_from_scalars(scalars)
-    # reward (reward_pos=0 -> -1.0), no cost -> negative total cost
-    sv[T._REWARD_POS_OFF] = 0
-    sv[T._REWARD_NEG_OFF] = 0
-    salve = list(zip(T.SALVE_IDS, sv + [0, 0, 0, 0, 0, 0]))
+    # salve_cost sums the 6 innate signals (effort, douleur, courbature,
+    # instabilite, vertige, confort). confort is signed (negative = reward);
+    # the 5 others are unsigned costs.
+    # Flat state-signal layout: token 11 (Coûts) holds effort, douleur,
+    # courbature, instabilite, vertige at indices 47..51; token 12 (Récompense)
+    # holds confort at index 52.
+    # all-zero: confort=0 -> -1.0 (max reward) -> cost = -1.0 < 0
+    salve = _make_salve([0.0] * 53, [0.5] * 5)
     assert T.salve_cost(salve) < 0.0
-    # punish (reward_neg=255 -> +1.0), no reward -> positive total cost
-    sv[T._REWARD_POS_OFF] = 128   # neutral (dequant ~0)
-    sv[T._REWARD_NEG_OFF] = 255
-    salve = list(zip(T.SALVE_IDS, sv + [0, 0, 0, 0, 0, 0]))
+    # douleur=1.0 (->1.0), confort=0.5 (->0.0) -> cost = 4.0 > 0
+    ss = [0.0] * 53
+    ss[48] = 1.0      # douleur slot
+    ss[52] = 0.5      # confort slot
+    salve = _make_salve(ss, [0.5] * 5)
     assert T.salve_cost(salve) > 0.0
 
 
@@ -73,19 +85,17 @@ def test_sleep_trains_both_models_and_world_loss_decreases():
     random.seed(1)
     b = Brain(seed=1)
     # Structured world: next state ≈ current state (near-static), with low cost
-    # (reward_pos high, reward_neg 0). This gives the world model something
+    # (confort high = reward, costs 0). This gives the world model something
     # learnable: predict the next state ≈ the current state.
     for _ in range(160):
-        scalars = [random.randint(0, 255) for _ in range(55)]
-        svals = T.state_vals_from_scalars(scalars)
-        svals[T._REWARD_POS_OFF] = 255
-        svals[T._REWARD_NEG_OFF] = 0
-        salve = list(zip(T.SALVE_IDS, svals + [0, 128, 128, 128, 128, 128]))
+        ss = [random.random() for _ in range(53)]
+        ss[52] = 0.0  # confort=0 -> -1.0 (max reward)
+        salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
         nxt = list(salve)  # next state equals current state
         b.record(salve, nxt)
-    assert len(b.buffer) == 160
-    s1 = b.sleep(wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12, horizon=2)
-    s2 = b.sleep(wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12, horizon=2)
+    assert len(b.buffer) >= 1  # at least one complete 10-step sequence
+    s1 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12)
+    s2 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12)
     # losses are finite
     for k in ("wm_loss", "pol_loss", "return"):
         assert s2[k] == s2[k], f"{k} is NaN"   # NaN check
@@ -96,18 +106,18 @@ def test_sleep_trains_both_models_and_world_loss_decreases():
 def test_act_returns_five_consignes():
     random.seed(2)
     b = Brain(seed=2)
-    salve = _make_salve([random.randint(0, 255) for _ in range(55)],
-                        [128, 128, 128, 128, 128])
+    salve = _make_salve([random.random() for _ in range(53)],
+                        [0.5, 0.5, 0.5, 0.5, 0.5])
     a = b.act(salve)
     assert len(a) == 5
 
 
 def test_brain_drives_real_sim_and_sleeps():
     """End-to-end: the brain drives the real pymunk body, the real sensors +
-    encoder produce salves, transitions are journaled, and a sleep cycle
+    encoder produce dense salves, transitions are journaled, and a sleep cycle
     trains both models off that real experience. No display is needed."""
     from . import body as B, world as W, sensors as S, extero as E, intero as I
-    from .tokenize import TokenEncoder
+    from .tokenize import DenseEncoder
     space = W.make_space()
     skel = B.build_skeleton(space)
     B.apply_consignes(skel)
@@ -117,7 +127,7 @@ def test_brain_drives_real_sim_and_sleeps():
     vision = E.Vision(skel, space)
     touch = E.Touch(space, skel)
     intero = I.Intero()
-    encoder = TokenEncoder()
+    encoder = DenseEncoder()
     brain = Brain(seed=3)
     accum = 0.0
     DT = 1.0 / 6.0
@@ -144,8 +154,8 @@ def test_brain_drives_real_sim_and_sleeps():
             skel.limb_r.theta_star = tr; skel.limb_r.d_star = dr
             skel.tail_act.theta_star = tq
             prev = salve
-    assert len(brain.buffer) > 10
-    stats = brain.sleep(wm_epochs=2, wm_batch=24, pol_steps=4, pol_batch=12, horizon=2)
+    assert len(brain.buffer) >= 1  # at least one complete sequence from 4s sim
+    stats = _run_sleep(brain, wm_epochs=2, wm_batch=24, pol_steps=4, pol_batch=12)
     for k in ("wm_loss", "pol_loss"):
         assert stats[k] == stats[k]   # finite
     a = brain.act(prev)

@@ -248,6 +248,14 @@ class Controls:
         skel.limb_r.d_star = self.joy_r.d
         skel.tail_act.theta_star = self.tail.theta
 
+    def sync(self, skel: "B.Skeleton") -> None:
+        """Copy skeleton consignes into the widgets (for display in brain mode)."""
+        self.joy_l.theta = skel.limb_l.theta_star
+        self.joy_l.d = skel.limb_l.d_star
+        self.joy_r.theta = skel.limb_r.theta_star
+        self.joy_r.d = skel.limb_r.d_star
+        self.tail.theta = skel.tail_act.theta_star
+
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
         self.joy_l.draw(screen, font)
         self.joy_r.draw(screen, font)

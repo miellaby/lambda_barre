@@ -14,11 +14,6 @@ PLATFORM_DEFS = [
     (45, 78, 20, 12),
 ]
 
-# moving platform: oscillates horizontally like an old platformer
-MOVING_PLATFORM_DEF = (190, 40, 40, 16)   # (cx, cy, half_w, radius)
-MOVING_PLATFORM_AMP = 120.0             # px, amplitude of oscillation
-MOVING_PLATFORM_PERIOD = 4.0            # seconds, full back-and-forth
-
 
 def make_space() -> pymunk.Space:
     space = pymunk.Space()
@@ -41,27 +36,8 @@ def make_space() -> pymunk.Space:
         s.collision_type = B.GROUND_TYPE
         space.add(plat, s)
         platforms.append((plat, s, w, h))
-    # moving platform (also static, repositioned each frame)
-    cx, cy, w, h = MOVING_PLATFORM_DEF
-    mv_plat = pymunk.Body(body_type=pymunk.Body.STATIC)
-    mv_plat.position = (cx, cy)
-    mv_seg = pymunk.Segment(mv_plat, (-w, 0), (w, 0), h)
-    mv_seg.friction = 1.0
-    mv_seg.collision_type = B.GROUND_TYPE
-    space.add(mv_plat, mv_seg)
-    platforms.append((mv_plat, mv_seg, w, h))
     space._platforms = platforms  # type: ignore[attr-defined]
-    space._moving_platform = (mv_plat, mv_seg)  # type: ignore[attr-defined]
     return space
-
-
-def update_moving_platform(space: pymunk.Space, t: float) -> None:
-    """Reposition the moving platform for time t (seconds since start)."""
-    mv_plat, mv_seg = space._moving_platform  # type: ignore[attr-defined]
-    cx, cy, _, _ = MOVING_PLATFORM_DEF
-    offset = MOVING_PLATFORM_AMP * math.sin(2 * math.pi * t / MOVING_PLATFORM_PERIOD)
-    mv_plat.position = (cx + offset, cy)
-    space.reindex_shape(mv_seg)
 
 
 def step(space: pymunk.Space, skel: "B.Skeleton", dt: float) -> None:

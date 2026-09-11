@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [project.scripts]
-lambda-barre = "lambda_barre.main:run"
+lambda-barre = "lambda_barre.main:main"

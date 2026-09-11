@@ -158,6 +158,21 @@ class Skeleton:
 
     # initial spawn pose, used by reset
     spawn: tuple[float, float] = (0.0, 64.0)
+    spawn_foot_l: tuple[float, float] = (0.0, 0.0)
+    spawn_foot_r: tuple[float, float] = (0.0, 0.0)
+    spawn_tail: tuple[float, float] = (0.0, 0.0)
+    spawn_tail_angle: float = 0.0
+    spawn_ear_l: tuple[float, float] = (0.0, 0.0)
+    spawn_ear_l_angle: float = 0.0
+    spawn_ear_r: tuple[float, float] = (0.0, 0.0)
+    spawn_ear_r_angle: float = 0.0
+    spawn_front_l: tuple[float, float] = (0.0, 0.0)
+    spawn_front_l_angle: float = 0.0
+    spawn_front_r: tuple[float, float] = (0.0, 0.0)
+    spawn_front_r_angle: float = 0.0
+    spawn_theta_l: float = 0.28
+    spawn_theta_r: float = -0.8
+    spawn_tail_theta: float = 0.0
     # persistent facing direction: +1 = right, -1 = left. Updated with
     # hysteresis in apply_consignes; never recomputed from the sign of the angle.
     facing: int = 1
@@ -289,6 +304,22 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     # leans right. This widens the support base from ~14px to ~27px.
     skel.limb_l.theta_star = 0.28
     skel.limb_r.theta_star = -0.8
+    # save spawn positions for reset
+    skel.spawn_foot_l = (foot_l.position.x, foot_l.position.y)
+    skel.spawn_foot_r = (foot_r.position.x, foot_r.position.y)
+    skel.spawn_tail = (tail.position.x, tail.position.y)
+    skel.spawn_tail_angle = tail.angle
+    skel.spawn_ear_l = (ear_l.position.x, ear_l.position.y)
+    skel.spawn_ear_l_angle = ear_l.angle
+    skel.spawn_ear_r = (ear_r.position.x, ear_r.position.y)
+    skel.spawn_ear_r_angle = ear_r.angle
+    skel.spawn_front_l = (front_l.position.x, front_l.position.y)
+    skel.spawn_front_l_angle = front_l.angle
+    skel.spawn_front_r = (front_r.position.x, front_r.position.y)
+    skel.spawn_front_r_angle = front_r.angle
+    skel.spawn_theta_l = skel.limb_l.theta_star
+    skel.spawn_theta_r = skel.limb_r.theta_star
+    skel.spawn_tail_theta = skel.tail_act.theta_star
     return skel
 
 
@@ -356,4 +387,25 @@ def reset(skel: Skeleton) -> None:
     for foot in (skel.foot_l, skel.foot_r):
         foot.velocity = (0, 0)
         foot.angular_velocity = 0.0
+    skel.foot_l.position = skel.spawn_foot_l
+    skel.foot_r.position = skel.spawn_foot_r
+    skel.tail.position = skel.spawn_tail
+    skel.tail.angle = skel.spawn_tail_angle
+    skel.tail.velocity = (0, 0)
+    skel.tail.angular_velocity = 0.0
+    for ear, pos, ang in ((skel.ear_l, skel.spawn_ear_l, skel.spawn_ear_l_angle),
+                          (skel.ear_r, skel.spawn_ear_r, skel.spawn_ear_r_angle)):
+        ear.position = pos
+        ear.angle = ang
+        ear.velocity = (0, 0)
+        ear.angular_velocity = 0.0
+    for front, pos, ang in ((skel.front_l, skel.spawn_front_l, skel.spawn_front_l_angle),
+                            (skel.front_r, skel.spawn_front_r, skel.spawn_front_r_angle)):
+        front.position = pos
+        front.angle = ang
+        front.velocity = (0, 0)
+        front.angular_velocity = 0.0
+    skel.limb_l.theta_star = skel.spawn_theta_l
+    skel.limb_r.theta_star = skel.spawn_theta_r
+    skel.tail_act.theta_star = skel.spawn_tail_theta
     apply_consignes(skel)

@@ -5,64 +5,164 @@ This wires the "IA à 2 modèles" (``models.py``) into the live loop. During
 (state, action, next-state) is journaled into an experience buffer. During
 *sommeil* (sleep) the brain trains offline:
 
-  1. the world model learns to predict the next state's token values from
-     logged (state, action, next-state) sequences (teacher forcing);
+  1. the world model learns to predict the signal slots of the next token
+     across a trajectory of SEQ_STEPS consecutive transitions (teacher forcing,
+     salve-within-type attention mask);
   2. the policy is trained by reinforcement learning on *imagined*
-     trajectories: it samples actions, the (frozen) world model rolls them
-     forward, and the policy is pushed (REINFORCE) toward actions whose
+     trajectories: it samples an action, the (frozen) world model rolls the
+     state forward, and the policy is pushed (REINFORCE) toward actions whose
      imagined trajectories have low predicted cost.
 
 That is the model-based RL loop of `Lambda barre.md`: the policy learns from
 the world model's anticipation of consequences, not from direct reward.
 
-All tensors live on CPU. The buffer stores plain Python lists of quantized
-token values (ids are structural and fixed by the salve layout).
+A salve is a list of 16 dense tokens (13 sensory + 3 motor), each a 25-float
+vector (see ``tokenize``). All tensors live on CPU. The buffer stores plain
+Python lists of tokens (list[list[float]]).
 """
 from __future__ import annotations
 
+import os
 import random
+import time
 from collections import deque
 
 import torch
-import torch.nn.functional as F
 
 from . import models as M
-from .tokenize import (STATE_IDS, ACTION_IDS, STATE_LEN, ACTION_LEN,
-                       state_values, salve_cost, encode_action,
-                       state_token_values, action_token_values,
-                       scalars_from_state_vals)
+from .models import build_salve_mask
+from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
+                       N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
+                       _COST_IDX, _REWARD_IDX, _COST_KEYS, _COST_WEIGHTS,
+                       _BY_KEY, _LAYOUT, _prefix,
+                       state_tokens, action_tokens)
 
 
-# Fixed id layout of a training sequence: [state_t, action_t, state_{t+1}].
-_SEQ_IDS = STATE_IDS + ACTION_IDS + STATE_IDS          # 128 ids
-_SEQ_LEN = len(_SEQ_IDS)
-# positions i (0.._SEQ_LEN-2) whose predicted target (token i+1) is a scalar
-# value rather than a separator — the world model is only scored on these.
-_TARGET_SCALAR_MASK = torch.tensor(
-    [_SEQ_IDS[i + 1] not in (1, 2, 3, 4, 5, 6, 7) for i in range(_SEQ_LEN - 1)],
-    dtype=torch.bool)
+# Fixed layout of a training sequence: a trajectory of SEQ_STEPS transitions.
+# [s0, a0, s1, a1, ..., a_{N-1}, sN] = (state + action) * N + state tokens.
+SEQ_STEPS = 10
+_SEQ_LEN = SEQ_STEPS * SALVE_TOKENS + STATE_TOKENS          # 173
+
+# Precomputed cost metadata (from the dense layout) for the vectorized
+# trajectory-cost: 5 unsigned cost signals (token 11) + 1 signed confort
+# signal (token 12). Denormalize: unsigned -> t*scale, signed -> (2t-1)*scale.
+_COST_SCALES = torch.tensor([_BY_KEY[k].scale for k in _COST_KEYS],
+                            dtype=torch.float32)              # [5]
+_COST_SIGNED = torch.tensor([_BY_KEY[k].signed for k in _COST_KEYS],
+                            dtype=torch.bool)                  # [5]
+_COST_W = torch.tensor([_COST_WEIGHTS[k] for k in _COST_KEYS],
+                      dtype=torch.float32)                    # [5]
+_CONFORT_SCALE = _BY_KEY["confort"].scale
+_CONFORT_W = _COST_WEIGHTS["confort"]
+
+# Flat signal-grid indices for the 47 policy scalars: tokens 0..10, first
+# _N_SIGNALS[i] slots each. Used to gather them in one op from a [B, 13, 16]
+# signal grid.
+_POL_SCALAR_IDX = []
+for _i in range(_COST_IDX):               # tokens 0..10
+    for _k in range(_N_SIGNALS[_i]):
+        _POL_SCALAR_IDX.append(_i * N_SIGNAL + _k)
+assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 47
+
+# Action encoding metadata: 5 consignes → (token-within-action-block, slot,
+# scale, signed). The action block is tokens 13..15 (3 tokens).
+_ACT_KEYS = ("limb_l_theta", "limb_l_d", "limb_r_theta", "limb_r_d",
+             "tail_theta")
+_ACT_LAYOUT = []   # (tok_in_block, slot)
+for _i in range(STATE_TOKENS, SALVE_TOKENS):    # 13, 14, 15
+    for _k, _key in enumerate(_LAYOUT[_i].signals):
+        _ACT_LAYOUT.append((_i - STATE_TOKENS, _k, _key))
+_ACT_TOK = torch.tensor([t for t, _, _ in _ACT_LAYOUT], dtype=torch.long)
+_ACT_SLOT = torch.tensor([s for _, s, _ in _ACT_LAYOUT], dtype=torch.long)
+_ACT_SCALES = torch.tensor([_BY_KEY[k].scale for _, _, k in _ACT_LAYOUT],
+                           dtype=torch.float32)
+_ACT_SIGNED = torch.tensor([_BY_KEY[k].signed for _, _, k in _ACT_LAYOUT],
+                           dtype=torch.bool)
+# Template: 3 action tokens with structural prefix, zeroed signals.
+_ACT_TEMPLATE = torch.tensor(
+    [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
+     for i in range(STATE_TOKENS, SALVE_TOKENS)], dtype=torch.float32)
+
+# Per-target-position valid-slot mask: position p predicts token p+1, whose
+# token index within a salve is (p+1) % 16 — only its first ``_N_SIGNALS[tidx]``
+# signal slots are real (the rest are zero-padded and excluded from the loss).
+_target_valid = torch.zeros(_SEQ_LEN - 1, N_SIGNAL, dtype=torch.bool)
+for _p in range(_SEQ_LEN - 1):
+    _tidx = (_p + 1) % SALVE_TOKENS
+    _target_valid[_p, :_N_SIGNALS[_tidx]] = True
+
+# Salve-within-type attention mask for the fixed training sequence.
+_GROUP_MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
 
 
 class ExperienceBuffer:
-    """Ring buffer of (state_vals, action_vals, next_state_vals) as lists of
-    quantized token values (ints in 0-255). State parts are 61 tokens (separators
-    included, value 0), action parts are 6 tokens (the ACTION group: 1 separator
-    + 5 scalars)."""
+    """Concurrent sequence recorder with randomized start offsets.
 
-    def __init__(self, capacity: int = 4000):
-        self._buf: deque = deque(maxlen=capacity)
+    Multiple recorders run in parallel. Each captures ``seq_len`` consecutive
+    transitions. A new recorder starts after a random delay (uniform in
+    [seq_len//2, seq_len*3//2]) to decorrelate the learning cadence from the
+    physics simulation cadence — preventing resonance between what is learned
+    and the simulation's rhythm.
+
+    Completed sequences are stored in a ring buffer. Each sequence is a list
+    of (state_tokens, action_tokens, next_state_tokens) tuples in
+    chronological order, where state_tokens is 13 dense tokens and
+    action_tokens is 3 dense tokens.
+    """
+
+    def __init__(self, seq_len: int = 10, capacity: int = 400, seed: int = 0):
+        self.seq_len = seq_len
+        self._completed: deque = deque(maxlen=capacity)
+        self._active: list[list] = []
+        self._rng = random.Random(seed)
+        self._min_gap = 4
+        self._max_gap = 10
+        self._countdown = self._rng.randint(self._min_gap, self._max_gap)
 
     def __len__(self) -> int:
-        return len(self._buf)
+        return len(self._completed)
 
-    def push(self, state_vals, action_vals, next_state_vals) -> None:
-        self._buf.append((list(state_vals), list(action_vals),
-                         list(next_state_vals)))
+    def push(self, state_tokens, action_tokens, next_state_tokens) -> None:
+        transition = (list(state_tokens), list(action_tokens),
+                     list(next_state_tokens))
+        # append to all active recorders
+        for rec in self._active:
+            rec.append(transition)
+        # seal completed recorders
+        still_active = []
+        for rec in self._active:
+            if len(rec) >= self.seq_len:
+                self._completed.append(rec)
+            else:
+                still_active.append(rec)
+        self._active = still_active
+        # maybe start a new recorder
+        self._countdown -= 1
+        if self._countdown <= 0:
+            self._active.append([transition])
+            self._countdown = self._rng.randint(self._min_gap, self._max_gap)
 
     def sample(self, batch: int):
-        n = len(self._buf)
-        idx = [random.randrange(n) for _ in range(min(batch, n))]
-        out = [self._buf[i] for i in idx]
+        """Sample ``batch`` completed sequences. Returns a list of sequences,
+        each a list of (s, a, s') tuples. Returns [] if empty."""
+        n = len(self._completed)
+        if n == 0:
+            return []
+        idx = [self._rng.randrange(n) for _ in range(min(batch, n))]
+        return [list(self._completed[i]) for i in idx]
+
+    def sample_states(self, batch: int):
+        """Return ``batch`` starting states (13-token lists) sampled from
+        random positions within random completed sequences. For policy
+        training."""
+        n = len(self._completed)
+        if n == 0:
+            return []
+        out = []
+        for _ in range(min(batch, n)):
+            seq = self._completed[self._rng.randrange(n)]
+            t = self._rng.randrange(len(seq))
+            out.append(seq[t][0])  # state_tokens from a random transition
         return out
 
 
@@ -81,15 +181,41 @@ class Brain:
                  explore_std: float = 0.4, device: str = "cpu", seed: int = 0):
         torch.manual_seed(seed)
         self.device = torch.device(device)
-        self.world = M.WorldModel(d_model=96, nhead=4, layers=2, dim_ff=384).to(self.device)
-        self.policy = M.Policy().to(self.device)
+        d_model = 96
+        self.world = M.WorldModel(d_model=d_model, nhead=4, layers=2,
+                                  dim_ff=384).to(self.device)
+        self.policy = M.Policy(n_state=N_POLICY_STATE + d_model).to(self.device)
+        # Normalizes the world model's intermediate latent before feeding it
+        # to the policy, so scalars [0,1] and latent are on the same scale.
+        self.latent_norm = torch.nn.LayerNorm(d_model).to(self.device)
         self.opt_wm = torch.optim.Adam(self.world.parameters(), lr=lr_wm)
-        self.opt_pol = torch.optim.Adam(self.policy.parameters(), lr=lr_pol)
-        self.buffer = ExperienceBuffer()
-        self.seq_ids = torch.tensor([_SEQ_IDS], dtype=torch.long,
-                                    device=self.device)
-        self.target_mask = _TARGET_SCALAR_MASK.to(self.device)
+        self.opt_pol = torch.optim.Adam(
+            list(self.policy.parameters()) + list(self.latent_norm.parameters()),
+            lr=lr_pol)
+        self.buffer = ExperienceBuffer(seq_len=SEQ_STEPS, seed=seed)
+        self.group_mask = _GROUP_MASK.to(self.device)
+        self.target_valid = _target_valid.to(self.device)
         self.explore_std = explore_std
+        # Precomputed cost tensors, moved to device for the vectorized
+        # trajectory-cost in train_policy.
+        self._cost_scales = _COST_SCALES.to(self.device)
+        self._cost_signed = _COST_SIGNED.to(self.device)
+        self._cost_w = _COST_W.to(self.device)
+        # Policy-scalar and action-encode indices/templates for the vectorized
+        # train_policy path.
+        self._pol_idx = torch.tensor(_POL_SCALAR_IDX, dtype=torch.long,
+                                      device=self.device)
+        self._act_tok = _ACT_TOK.to(self.device)
+        self._act_slot = _ACT_SLOT.to(self.device)
+        self._act_scales = _ACT_SCALES.to(self.device)
+        self._act_signed = _ACT_SIGNED.to(self.device)
+        self._act_tmpl = _ACT_TEMPLATE.to(self.device)
+        # Rolling history of recent (state_tokens, action_tokens) for the
+        # wake-time world model context. The policy reads the world model's
+        # intermediate latent, which needs the last SEQ_STEPS-1 transitions.
+        self._wake_history: list[tuple[list, list]] = []
+        self._cached_latent = None   # [1, d_model] — refreshed at 1 Hz by wake_tick
+        self._cached_scalars = None  # [1, 47] — scalar state at last wake_tick
         # REINFORCE baseline (running mean of imagined returns)
         self._baseline = 0.0
         self._baseline_alpha = 0.1
@@ -98,92 +224,238 @@ class Brain:
         self.last_pol_loss = float("nan")
         self.last_return = float("nan")
         self.mode = "wake"
+        # inference timing (exponential moving average, ms)
+        self._wm_time = 0.0
+        self._pol_time = 0.0
+        self._time_alpha = 0.1
 
     # --- live loop -----------------------------------------------------------
     @torch.no_grad()
-    def act(self, salve) -> tuple[float, float, float, float, float]:
-        """Return 5 actuator consignes for the current state salve."""
+    def wake_tick(self, salve) -> None:
+        """World model tick: run a forward pass on the rolling history +
+        current salve to produce a fresh latent for the policy. Also journals
+        the transition into the experience buffer."""
         self.mode = "wake"
-        sv = torch.tensor([state_values(salve)], dtype=torch.float32,
-                          device=self.device) / 255.0
-        action, _, _ = self.policy.sample(sv, self.explore_std)
+        cur_state = state_tokens(salve)
+        ctx = self._build_context(cur_state)
+        self.world.eval()
+        t0 = time.perf_counter()
+        self.world(ctx)
+        self._cached_latent = self.latent_norm(self.world.last_latent())  # [1, d_model]
+        self._wm_time = (1 - self._time_alpha) * self._wm_time \
+            + self._time_alpha * (time.perf_counter() - t0) * 1000
+        self._cached_scalars = self._policy_scalars_batch(
+            torch.tensor(cur_state, dtype=torch.float32,
+                         device=self.device).unsqueeze(0))   # [1, 47]
+        # update history with this transition's state + action
+        a_toks = action_tokens(salve)
+        self._wake_history.append((cur_state, a_toks))
+        if len(self._wake_history) > SEQ_STEPS - 1:
+            self._wake_history.pop(0)
+
+    @torch.no_grad()
+    def act(self, salve) -> tuple[float, float, float, float, float]:
+        """Return 5 actuator consignes. Reuses the cached latent from the
+        last wake_tick(). If no latent yet (first tick), runs a fallback forward."""
+        if self._cached_latent is None:
+            self.wake_tick(salve)
+        t0 = time.perf_counter()
+        pol_in = torch.cat([self._cached_scalars, self._cached_latent], dim=1)
+        action, _, _ = self.policy.sample(pol_in, self.explore_std)
+        self._pol_time = (1 - self._time_alpha) * self._pol_time \
+            + self._time_alpha * (time.perf_counter() - t0) * 1000
         a = action[0].tolist()
         return a[0], a[1], a[2], a[3], a[4]
 
     def record(self, salve, next_salve) -> None:
-        """Journal one transition. The action is read out of ``salve``'s ACTION
-        group; the states are the state parts of both salves (61 tokens each,
-        separators included)."""
-        self.buffer.push(state_token_values(salve), action_token_values(salve),
-                         state_token_values(next_salve))
+        """Journal one transition into the experience buffer."""
+        self.buffer.push(state_tokens(salve), action_tokens(salve),
+                         state_tokens(next_salve))
+
+    def clear_history(self) -> None:
+        """Clear the wake context history, cached latent, and active recorders."""
+        self._wake_history.clear()
+        self._cached_latent = None
+        self._cached_scalars = None
+        self.buffer._active.clear()
+
+    def _build_context(self, cur_state: list):
+        """Build a [1, L, 25] context tensor from the wake history + current
+        state. The layout is [s0, a0, s1, a1, ..., s_{k-1}, a_{k-1}, s_k]."""
+        n = len(self._wake_history)
+        ctx_len = n * SALVE_TOKENS + STATE_TOKENS
+        ctx = torch.zeros(1, ctx_len, DENSE_DIM, device=self.device)
+        pos = 0
+        for s_toks, a_toks in self._wake_history:
+            ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
+                s_toks, dtype=torch.float32, device=self.device)
+            pos += STATE_TOKENS
+            ctx[0, pos:pos + ACTION_TOKENS] = torch.tensor(
+                a_toks, dtype=torch.float32, device=self.device)
+            pos += ACTION_TOKENS
+        ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
+            cur_state, dtype=torch.float32, device=self.device)
+        return ctx
 
     # --- sleep: world model training ----------------------------------------
-    def _batch_tensors(self, samples):
-        """Build (ids[B,128], vals[B,128], target_vals[B,127], mask[127]) for
-        a batch of transitions."""
-        B = len(samples)
-        vals = torch.zeros(B, _SEQ_LEN, dtype=torch.long, device=self.device)
-        for b, (s, a, ns) in enumerate(samples):
-            vals[b, :STATE_LEN] = torch.tensor(s, dtype=torch.long)
-            vals[b, STATE_LEN:STATE_LEN + ACTION_LEN] = torch.tensor(a, dtype=torch.long)
-            vals[b, STATE_LEN + ACTION_LEN:] = torch.tensor(ns, dtype=torch.long)
-        ids = self.seq_ids.expand(B, -1)
-        target_vals = vals[:, 1:]            # what each position must predict
-        return ids, vals, target_vals
+    def _batch_tensors(self, windows):
+        """Build a [B, L, 25] tensor for a batch of multi-step transition
+        windows.
 
-    def train_world(self, epochs: int = 4, batch: int = 32) -> float:
-        """Train the world model on the buffer. Returns mean loss."""
-        if len(self.buffer) < 8:
-            return float("nan")
+        Each window is a list of SEQ_STEPS (s, a, s') tuples. The sequence is
+        [s0, a0, s1, a1, ..., a_{N-1}, sN] = N*16 + 13 tokens."""
+        B = len(windows)
+        vals = torch.zeros(B, _SEQ_LEN, DENSE_DIM, device=self.device)
+        for b, window in enumerate(windows):
+            pos = 0
+            for i, (s, a, ns) in enumerate(window):
+                vals[b, pos:pos + STATE_TOKENS] = torch.tensor(
+                    s, dtype=torch.float32, device=self.device)
+                pos += STATE_TOKENS
+                vals[b, pos:pos + ACTION_TOKENS] = torch.tensor(
+                    a, dtype=torch.float32, device=self.device)
+                pos += ACTION_TOKENS
+            # final next-state (window[-1]'s s')
+            vals[b, pos:pos + STATE_TOKENS] = torch.tensor(
+                window[-1][2], dtype=torch.float32, device=self.device)
+        return vals
+
+    def train_world(self, epochs: int = 4, batch: int = 32):
+        """Train the world model. Generator: yields (label, value) after each
+        epoch."""
+        if len(self.buffer) < 1:
+            return
         self.world.train()
         losses = []
-        for _ in range(epochs):
-            samples = self.buffer.sample(batch)
-            if not samples:
+        for ep in range(epochs):
+            windows = self.buffer.sample(batch)
+            if not windows:
                 break
-            ids, vals, target_vals = self._batch_tensors(samples)
-            logits = self.world(ids, vals)          # [B, L, 256]
-            pred = logits[:, :-1, :]                 # predict positions 1..L-1
-            tgt = target_vals.clamp(0, 255)
-            # CE only on scalar-target positions
-            m = self.target_mask
-            loss = F.cross_entropy(pred[:, m].transpose(1, 2), tgt[:, m])
+            vals = self._batch_tensors(windows)             # [B, L, 25]
+            pred = self.world(vals, attn_mask=self.group_mask)  # [B, L, 16]
+            # position p predicts token p+1's signal slots
+            pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
+            tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
+            m = self.target_valid                              # [L-1, 16]
+            m_b = m.unsqueeze(0).expand_as(pred_signals)        # [B, L-1, 16]
+            sq = (pred_signals - tgt_signals) ** 2
+            loss = (sq * m_b).sum() / m_b.sum().clamp(min=1)
             self.opt_wm.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
             self.opt_wm.step()
             losses.append(loss.item())
-        return sum(losses) / len(losses) if losses else float("nan")
+            yield "wm", loss.item()
+        self.last_wm_loss = sum(losses) / len(losses) if losses else float("nan")
 
-    # --- sleep: policy training via imagined trajectories --------------------
-    def train_policy(self, steps: int = 32, horizon: int = 4, batch: int = 16,
-                     gamma: float = 0.9) -> float:
-        """REINFORCE on imagined trajectories. Returns mean policy loss.
+    def _salve_cost_batch(self, gen: torch.Tensor) -> torch.Tensor:
+        """Vectorized ``salve_cost`` over a batch of predicted states.
 
-        For each sampled starting state, the policy samples an action; the
-        world model imagines the next state and its cost; we repeat for
-        ``horizon`` steps, discounting cost. The policy is pushed toward
-        actions whose imagined return (negative cumulative cost) is high."""
-        if len(self.buffer) < 8:
-            return float("nan")
+        gen: [B, 13, 25] (or [B, 16, 25]) float tensors. Returns [B] cost —
+        the same weighted innate cost as ``tokenize.salve_cost`` but computed
+        in one tensor op, no per-element Python loop or ``.tolist()`` sync."""
+        n = len(_COST_KEYS)
+        c = gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + n]        # [B, 5]
+        denorm = torch.where(self._cost_signed,
+                             (2 * c - 1) * self._cost_scales,
+                             c * self._cost_scales)             # [B, 5]
+        confort = gen[:, _REWARD_IDX, SIG_OFFSET]               # [B]
+        confort_phys = (2 * confort - 1) * _CONFORT_SCALE       # [B]
+        return (denorm * self._cost_w).sum(1) + _CONFORT_W * confort_phys
+
+    def _policy_scalars_batch(self, state_tokens: torch.Tensor) -> torch.Tensor:
+        """Vectorized ``policy_scalars``: extract the 47 non-reward sensory
+        scalars from a batch of state tokens. state_tokens: [B, 13, 25] →
+        [B, 47], one gather op, no per-element loop or ``.tolist()``."""
+        B = state_tokens.shape[0]
+        sigs = state_tokens[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]   # [B,13,16]
+        flat = sigs.reshape(B, STATE_TOKENS * N_SIGNAL)                # [B,208]
+        return flat.index_select(1, self._pol_idx)                    # [B,47]
+
+    def _encode_action_batch(self, action: torch.Tensor) -> torch.Tensor:
+        """Vectorized ``encode_action``: [B, 5] raw consignes → [B, 3, 25]
+        dense action tokens. Normalizes (signed → (t+1)/2, unsigned → t),
+        scatters into the structural-prefixed template — no ``.tolist()``."""
+        B = action.shape[0]
+        s = self._act_scales                              # [5]
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        clamped = action.clamp(
+            torch.where(self._act_signed, -s, torch.zeros_like(s)),
+            s)                                           # [B, 5]
+        t = clamped / s                                   # [B, 5]
+        norm = torch.where(self._act_signed, (t + 1) / 2, t)  # [B, 5]
+        toks = self._act_tmpl.unsqueeze(0).expand(B, -1, -1).clone()  # [B,3,25]
+        toks[:, self._act_tok, SIG_OFFSET + self._act_slot] = norm
+        return toks                                      # [B, 3, 25]
+
+    # --- sleep: policy training via real context + imagined rollout ----------
+    def train_policy(self, steps: int = 32, batch: int = 16,
+                     gamma: float = 0.9):
+        """REINFORCE with one gradient step per sequence. Generator: yields
+        (label, value) after each step."""
+        if len(self.buffer) < 1:
+            return
         self.world.eval()
         self.policy.train()
+        n_ctx = 4  # real transitions used as context (s0..s3, a0..a3, s4)
+        n_imagine = SEQ_STEPS - n_ctx  # 6 imagined steps (s5..s10)
         losses = []
         for _ in range(steps):
-            samples = self.buffer.sample(batch)
-            if not samples:
+            sequences = self.buffer.sample(batch)
+            if not sequences:
                 break
-            starts = [s for (s, a, ns) in samples]   # 61-token state-val lists
-            state_vals = torch.tensor(
-                [scalars_from_state_vals(s) for s in starts],
-                dtype=torch.float32, device=self.device) / 255.0
-            # sample first action from the policy (keeps grad)
-            action, raw, raw_mean = self.policy.sample(state_vals, self.explore_std)
-            logp = self.policy.log_prob(raw, raw_mean, self.explore_std)
-            # roll imagined trajectory
+            B = len(sequences)
+            device = self.device
+
+            # build real context: [s0, a0, s1, ..., a3, s4]
+            ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
+            ctx = torch.zeros(B, ctx_len, DENSE_DIM, device=device)
+            for b, seq in enumerate(sequences):
+                pos = 0
+                for i in range(n_ctx):
+                    s, a, _ = seq[i]
+                    ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
+                        s, dtype=torch.float32, device=device)
+                    pos += STATE_TOKENS
+                    ctx[b, pos:pos + ACTION_TOKENS] = torch.tensor(
+                        a, dtype=torch.float32, device=device)
+                    pos += ACTION_TOKENS
+                # s4 (the state the policy acts on)
+                s4 = seq[n_ctx][0]
+                ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
+                    s4, dtype=torch.float32, device=device)
+
+            # 1. world model forward on real context → intermediate latent
+            ctx_mask = build_salve_mask(ctx_len, device)
             with torch.no_grad():
-                returns = self._roll_return(action, starts, horizon, gamma)
-            # REINFORCE: maximize E[logp * (return - baseline)]
+                self.world(ctx, attn_mask=ctx_mask)
+                latent = self.world.last_latent().detach()  # [B, d_model]
+                latent = self.latent_norm(latent)
+
+            # 2. policy infers a4 from scalars + latent (keeps gradient)
+            cur_scalars = self._policy_scalars_batch(
+                ctx[:, -STATE_TOKENS:])                        # [B, 47]
+            pol_in = torch.cat([cur_scalars, latent], dim=1)    # [B, 47+d_model]
+            action, raw, raw_mean = self.policy.sample(pol_in, self.explore_std)
+            logp = self.policy.log_prob(raw, raw_mean, self.explore_std)
+
+            # 3. append a4 to context
+            act_toks = self._encode_action_batch(action)      # [B, 3, 25]
+            ctx = torch.cat([ctx, act_toks], dim=1)
+
+            # 4. WM imagines s5..s10, accumulate cost
+            total_cost = torch.zeros(B, device=device)
+            for k in range(n_imagine):
+                with torch.no_grad():
+                    gen = self.world.predict_next(ctx)         # [B, 13, 25]
+                step_cost = self._salve_cost_batch(gen)        # [B]
+                total_cost = total_cost + (gamma ** k) * step_cost
+                # append imagined state for next prediction
+                ctx = torch.cat([ctx, gen], dim=1)
+
+            # 5. REINFORCE
+            returns = -total_cost
             adv = returns - self._baseline
             self._baseline = (1 - self._baseline_alpha) * self._baseline \
                 + self._baseline_alpha * float(returns.mean().item())
@@ -193,66 +465,22 @@ class Brain:
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.opt_pol.step()
             losses.append(loss.item())
+            yield "pol", loss.item()
+        self.last_pol_loss = sum(losses) / len(losses) if losses else float("nan")
         self.last_return = float(returns.mean().item()) if losses else float("nan")
-        return sum(losses) / len(losses) if losses else float("nan")
-
-    @torch.no_grad()
-    def _roll_return(self, first_action, start_states, horizon, gamma):
-        """Imagine ``horizon`` steps from each start state, beginning with the
-        policy's sampled first action, then greedy policy actions. Returns the
-        discounted cumulative cost (a cost → low is good) as a [B] tensor."""
-        B = first_action.shape[0]
-        device = first_action.device
-        total = torch.zeros(B, device=device)
-        action = first_action
-        # current state as token-value lists
-        cur = [list(start_states[b]) for b in range(B)]
-        for k in range(horizon):
-            # tokenize the action (consignes) into ACTION group values
-            act_vals = []
-            for b in range(B):
-                a = action[b].tolist()
-                toks = encode_action(a[0], a[1], a[2], a[3], a[4])
-                act_vals.append([v for (_id, v) in toks])  # 6 vals (sep + 5)
-            # build context tensors [B, 67]
-            ids = torch.zeros(B, STATE_LEN + ACTION_LEN, dtype=torch.long,
-                              device=device)
-            vals = torch.zeros(B, STATE_LEN + ACTION_LEN, dtype=torch.long,
-                               device=device)
-            for b in range(B):
-                ids[b, :STATE_LEN] = torch.tensor(STATE_IDS, device=device)
-                ids[b, STATE_LEN:] = torch.tensor(ACTION_IDS, device=device)
-                vals[b, :STATE_LEN] = torch.tensor(cur[b], dtype=torch.long, device=device)
-                vals[b, STATE_LEN:] = torch.tensor(act_vals[b], dtype=torch.long, device=device)
-            gen = self.world.predict_next(ids, vals)
-            # cost + next state
-            step_cost = torch.zeros(B, device=device)
-            next_states = []
-            for b in range(B):
-                ns = gen[b].tolist()
-                stoks = list(zip(STATE_IDS, ns))
-                step_cost[b] = salve_cost(stoks)
-                next_states.append(ns)
-            total += (gamma ** k) * step_cost
-            # next action: greedy policy on the new state (55 scalar view)
-            sv = torch.tensor([scalars_from_state_vals(ns) for ns in next_states],
-                              dtype=torch.float32, device=self.device) / 255.0
-            action = self.policy(sv)
-            cur = next_states
-        # return = -cumulative cost (we maximize return ⇔ minimize cost)
-        return -total
 
     # --- sleep entry point ---------------------------------------------------
     def sleep(self, wm_epochs: int = 4, wm_batch: int = 32,
-              pol_steps: int = 32, pol_batch: int = 16, horizon: int = 4):
-        """One full sleep cycle: train the world model, then the policy.
-
-        Returns a dict of stats for the HUD."""
+              pol_steps: int = 32, pol_batch: int = 16):
+        """One full sleep cycle. Generator: yields (phase, value) after each
+        training step so the caller can keep the UI responsive."""
         self.mode = "sleep"
-        self.last_wm_loss = self.train_world(wm_epochs, wm_batch)
-        self.last_pol_loss = self.train_policy(pol_steps, horizon, pol_batch)
+        for label, value in self.train_world(wm_epochs, wm_batch):
+            yield label, value
+        for label, value in self.train_policy(pol_steps, pol_batch):
+            yield label, value
         self.mode = "wake"
-        return {
+        yield "done", {
             "wm_loss": self.last_wm_loss,
             "pol_loss": self.last_pol_loss,
             "return": self.last_return,
@@ -271,3 +499,33 @@ class Brain:
             self.world.load_state_dict(sd["world"])
         if "policy" in sd:
             self.policy.load_state_dict(sd["policy"])
+
+    def save_checkpoint(self, wm_path: str, pol_path: str) -> None:
+        """Save world model and policy to separate files."""
+        torch.save({
+            "world": self.world.state_dict(),
+            "opt_wm": self.opt_wm.state_dict(),
+        }, wm_path)
+        torch.save({
+            "policy": self.policy.state_dict(),
+            "latent_norm": self.latent_norm.state_dict(),
+            "opt_pol": self.opt_pol.state_dict(),
+        }, pol_path)
+
+    def load_checkpoint(self, wm_path: str, pol_path: str) -> None:
+        """Load world model and policy from separate files. Each is loaded
+        independently — a mismatch in one does not affect the other."""
+        if os.path.exists(wm_path):
+            sd = torch.load(wm_path, map_location=self.device, weights_only=True)
+            if "world" in sd:
+                self.world.load_state_dict(sd["world"])
+            if "opt_wm" in sd:
+                self.opt_wm.load_state_dict(sd["opt_wm"])
+        if os.path.exists(pol_path):
+            sd = torch.load(pol_path, map_location=self.device, weights_only=True)
+            if "policy" in sd:
+                self.policy.load_state_dict(sd["policy"])
+            if "latent_norm" in sd:
+                self.latent_norm.load_state_dict(sd["latent_norm"])
+            if "opt_pol" in sd:
+                self.opt_pol.load_state_dict(sd["opt_pol"])

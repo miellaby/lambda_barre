@@ -167,7 +167,7 @@ _PROPRIO_SPECS = [
     ("YA", "accel_tete_haut",          2000.0,           "acceleration tete haut (+ = vers le haut)"),
 ]
 
-PROPRIO_BLOCK = 56
+PROPRIO_BLOCK = 40
 PROPRIO_GAP = 4
 PROPRIO_TOP = 70
 
@@ -241,9 +241,9 @@ _CURSOR_SPECS = [
     ("S4", "son_4",       1.0,    "son cellule 4"),
 ]
 
-CURSOR_BLOCK = 56
+CURSOR_BLOCK = 40
 CURSOR_GAP = 4
-CURSOR_TOP = 160
+CURSOR_TOP = 115
 
 
 def draw_cursor(screen, font, signals: dict,
@@ -345,9 +345,9 @@ _TOUCH_SPECS = [
     ("TD", "collision_tronc_cy", 200.0, "collision tronc"),
 ]
 
-TOUCH_BLOCK = 56
+TOUCH_BLOCK = 40
 TOUCH_GAP = 4
-TOUCH_TOP = 220
+TOUCH_TOP = 160
 
 
 def draw_touch(screen, font, signals: dict,
@@ -396,9 +396,9 @@ _FLUX_SPECS = [
     ("FY", "flux_y",       150.0,  "flux y (deplacement vers le haut = +)"),
 ]
 
-FLUX_BLOCK = 56
+FLUX_BLOCK = 40
 FLUX_GAP = 4
-FLUX_TOP = 290
+FLUX_TOP = 205
 
 
 def draw_flux(screen, font, signals: dict,
@@ -441,9 +441,9 @@ def draw_flux(screen, font, signals: dict,
 
 # --- reward + intéroception ---------------------------------------------------
 
-REWARD_BLOCK = 56
+REWARD_BLOCK = 40
 REWARD_GAP = 4
-REWARD_TOP = 360
+REWARD_TOP = 250
 
 REWARD_POS_C = (110, 200, 140)   # green = comfort (reward)
 REWARD_NEG_C = (200, 110, 110)   # red = costs (penalty)
@@ -544,28 +544,16 @@ def draw_tokens(screen, font_small, salves: list,
                  encoder) -> None:
     """Draw the last N salves as decoded text in 2 columns on the right.
     Most recent salves at the bottom. Auto-scrolls to show the latest."""
-    from .tokenize import _SEP_NAMES, _BY_ID
-
     # flatten all salves into lines, skipping vision tokens (too many)
     all_lines: list[tuple[str, int]] = []
-    in_vision = False
     for si, salve in enumerate(salves):
         if si > 0:
             all_lines.append(("---", 2))
-        in_vision = False
-        for tid, val in salve:
-            if tid in _SEP_NAMES:
-                name = _SEP_NAMES[tid]
-                in_vision = (name == "VISION")
-                all_lines.append((f"[{name}]", 1))
-            elif in_vision:
+        # token index 4 is the VISION/Luminosité channel — too many signals
+        for tidx, line in enumerate(encoder.decode(salve)):
+            if tidx == 4:
                 continue
-            else:
-                spec = _BY_ID.get(tid)
-                if spec:
-                    all_lines.append((f"{spec.code}={val:3d}", 0))
-                else:
-                    all_lines.append((f"?{tid}={val:3d}", 0))
+            all_lines.append((line, 0))
 
     # how many lines fit per column?
     max_per_col = TOKEN_PANEL_H // TOKEN_LINE_H

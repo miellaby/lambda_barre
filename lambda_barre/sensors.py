@@ -29,7 +29,8 @@ COURBATURE_WINDOW = 1.0           # seconds — proprio variance window
 COURBATURE_SEUIL_VAR = 5.0        # below this variance, courbature accrues
 COURBATURE_ACCRUE = 0.005          # accrual rate when immobile (~4 min to saturate)
 COURBATURE_DECAY = 0.80           # per-frame decay when moving
-INSTABILITE_K = 0.01              # marge → cost scale
+INSTABILITE_K = 0.01              # marge → raw cost scale
+INSTABILITE_SCALE = 1.0          # raw at which instabilite = 0.5
 VERTIGE_SCALE = 5.0             # omega at which vertige = 0.5
 CONFORT_K = 0.3                   # tronc_angle² → reward scale
 CONFORT_DEG = math.radians(10.0)  # comfort zone around upright
@@ -231,7 +232,8 @@ class Reward:
         left = min(fx_front, fx_back)
         right = max(fx_front, fx_back)
         marge = min(com_x - left, right - com_x)
-        instabilite = INSTABILITE_K * max(0.0, -marge)
+        raw = INSTABILITE_K * max(0.0, -marge)
+        instabilite = raw / (raw + INSTABILITE_SCALE)
 
         # --- vertige (smoothed angular velocity) ---
         omega_raw = abs(skel.torso.angular_velocity)
@@ -245,8 +247,9 @@ class Reward:
         else:
             confort = 0.0
 
-        reward_neg = effort + douleur + courbature + instabilite + vertige
-        reward_pos = confort  # already negative (reward)
+        reward_neg = (1.0 * effort + 4.0 * douleur + 2.0 * courbature
+                      + 2.0 * instabilite + 3.0 * vertige)
+        reward_pos = 1.0 * confort  # already negative (reward)
 
         return {
             "effort": effort,

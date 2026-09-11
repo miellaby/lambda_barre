@@ -3,24 +3,27 @@
 This is the "IA à 2 modèles" from `Lambda barre.md` § "Architecture du système
 de décision apprenant":
 
-  World model  — an autoregressive transformer over the multimodal token stream
-                 that learns P(s(t+1) | s(t), a(t)). Trained offline during sleep
-                 on logged (state, action, next-state) sequences.
+  World model  — an autoregressive transformer over the dense multimodal token
+                 stream that learns P(s(t+1) | s(t), a(t)). Trained offline
+                 during sleep on logged (state, action, next-state) sequences.
 
   Policy      — a small network π(a|s) that produces the 5 actuator consignes
                  and is trained by reinforcement learning to minimize the cost
                  *predicted* by the world model, using imagined trajectories.
 
-Tokens come from ``tokenize`` as (id, value) pairs, both in 0-255. The world
-model embeds each token as ``id_embed(id) + value_embed(value) + pos_embed(pos)``
-and predicts the *value* of the next token (256 classes) under a causal mask;
-the token id is structural (fixed salve layout) so only the value is a free
-prediction — which is exactly the multi-modal distribution over quantized
-values the design doc calls for.
+Tokens come from ``tokenize`` as dense 25-float vectors (9-float structural
+prefix + 16 normalized signal slots). There are no learned embeddings: the
+world model projects the 25-dim token to ``d_model`` with a linear layer, adds
+a non-learned sinusoidal positional encoding keyed by *salve* index (all 16
+tokens of a salve share the same position — this encodes time, not intra-salve
+order), and regresses the 16 signal slots of the next token (MSE). The token
+id/structure is fixed by the layout, so only the 16 signal values are free
+predictions.
 
-The policy reads the 55 sensory scalar values of the state (normalized to
-[0, 1]) and outputs a Gaussian over the 5 actuator consignes in their physical
-ranges, so sampled actions are always valid consignes.
+The policy reads the 47 non-reward sensory scalars of the state (normalized
+to [0, 1]) plus the world model's intermediate latent (d_model) and outputs a
+Gaussian over the 5 actuator consignes in their physical ranges, so sampled
+actions are always valid consignes.
 """
 from __future__ import annotations
 
@@ -51,9 +54,10 @@ _configure_torch()
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .tokenize import STATE_IDS, STATE_LEN
+from .tokenize import (DENSE_DIM, N_SIGNAL, STATE_TOKENS, SALVE_TOKENS,
+                       TYPE_DIM, MOD_DIM, CANAL_DIM, N_POLICY_STATE,
+                       _LAYOUT, _prefix)
 
 
 # --- actuator consigne ranges (mirror body.py) -------------------------------
@@ -62,108 +66,149 @@ LIMB_MAX = 32.0
 THETA_RANGE = math.pi / 2.0   # limb / tail theta consignes in [-pi/2, +pi/2]
 
 
+def build_salve_mask(L: int, device, salve_tokens: int = SALVE_TOKENS,
+                     state_tokens: int = STATE_TOKENS) -> torch.Tensor:
+    """Build the [L, L] float attention mask for a dense salve sequence.
+
+    A query token may attend to a key token if the key is in an earlier salve,
+    or in the same salve but of a different type (sensory vs motor) and not in
+    the future, or is itself. This is the "masque par salve dans le type":
+    when predicting a sensory token of salve i, the other sensory tokens of
+    salve i are masked (no peeking at the state being predicted), while the
+    full history remains visible. Self-attention is always allowed so no row
+    is fully blocked. Returns a float mask (0.0 = allowed, -inf = blocked).
+    """
+    pos = torch.arange(L, device=device)
+    salve_id = pos // salve_tokens                 # [L] salve index per pos
+    is_sensory = (pos % salve_tokens) < state_tokens  # [L] bool
+    si_q = salve_id.unsqueeze(1)                     # [L, 1] query salve
+    si_k = salve_id.unsqueeze(0)                     # [1, L] key salve
+    earlier = si_k < si_q                            # [L, L] key salve < query
+    same = si_k == si_q
+    diff_type = is_sensory.unsqueeze(0) != is_sensory.unsqueeze(1)
+    k_idx = pos.unsqueeze(0)                         # [1, L]
+    q_idx = pos.unsqueeze(1)                         # [L, 1]
+    k_le_q = k_idx <= q_idx                          # [L, L] key not future
+    same_diff_causal = same & diff_type & k_le_q
+    self_eye = torch.eye(L, dtype=torch.bool, device=device)
+    visible = earlier | same_diff_causal | self_eye
+    mask = torch.zeros(L, L, device=device)
+    mask[~visible] = float("-inf")
+    return mask
+
+
 # =============================================================================
 # World model
 # =============================================================================
 class WorldModel(nn.Module):
-    """Autoregressive next-value transformer over the token stream.
+    """Autoregressive next-signal transformer over the dense token stream.
 
-    A "transition" sequence is ``[state_t (61), action_t (6), state_{t+1} (61)]``
-    = 128 tokens. ``forward`` returns value logits at every position predicting
-    the *next* token's value (shifted by one). Training masks separator positions
-    (their value is always 0 and carries no signal).
+    A training sequence is a trajectory of N transitions:
+    ``[s0 (13), a0 (3), s1 (13), ..., a_{N-1} (3), sN (13)]`` (e.g. 173 tokens
+    for N=10), each a 25-float vector. ``forward`` returns the predicted 16
+    signal slots at every position (regression) under the salve-within-type
+    mask; the target is the next token's signal section (shifted by one).
 
-    ``roll`` autoregressively generates the 61 next-state tokens given a context
-    of ``[state_t, action_t]`` (67 tokens), sampling one value at a time. Since
-    the id layout of the next state is fixed and known, only values are sampled.
+    ``predict_next`` produces the 13 next-state tokens in one parallel pass
+    given a ``[state_t, action_t]`` context (16 tokens): it appends 13
+    zero-signal state placeholders and reads the head outputs there.
     """
 
-    VOCAB = 256
-
-    def __init__(self, d_model: int = 128, nhead: int = 4, layers: int = 3,
-                 dim_ff: int = 512, dropout: float = 0.0):
+    def __init__(self, d_model: int = 96, nhead: int = 4, layers: int = 2,
+                 dim_ff: int = 384, dropout: float = 0.0):
         super().__init__()
         self.d_model = d_model
-        self.id_embed = nn.Embedding(self.VOCAB, d_model)
-        self.val_embed = nn.Embedding(self.VOCAB, d_model)
-        # +1 so a 0 position is distinct from any token id/value embedding of 0
-        self.pos_embed = nn.Embedding(256, d_model)
+        self.in_proj = nn.Linear(DENSE_DIM, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_ff, dropout=dropout,
             activation="gelu", batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, layers)
-        self.head = nn.Linear(d_model, self.VOCAB)
-        self.state_ids = torch.tensor(STATE_IDS, dtype=torch.long)
+        self.head = nn.Linear(d_model, N_SIGNAL)
+        # Fixed next-state template: 13 state tokens with their structural
+        # prefix and zeroed signal slots.
+        tmpl = [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
+                for i in range(STATE_TOKENS)]
+        self.register_buffer("state_template",
+                             torch.tensor(tmpl, dtype=torch.float32))
+        # Hook on the first transformer layer to capture the intermediate
+        # latent representation — the policy reads this instead of raw scalars.
+        self._latent = None
+        self.transformer.layers[0].register_forward_hook(self._capture_latent)
 
-    @staticmethod
-    def _causal_mask(L: int, device) -> torch.Tensor:
-        # True = position i may attend to position j
-        return torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
+    def _capture_latent(self, module, input, output):
+        self._latent = output  # [B, L, d_model]
 
-    def forward(self, ids: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
-        """ids, vals: [B, L] long tensors. Returns value logits [B, L, 256]
-        predicting the value of the token at position i+1 (causal)."""
-        B, L = ids.shape
-        device = ids.device
-        pos = torch.arange(L, device=device)
-        x = (self.id_embed(ids) + self.val_embed(vals)
-             + self.pos_embed(pos)) * math.sqrt(self.d_model)
-        mask = self._causal_mask(L, device)
-        x = self.transformer(x, mask=mask)
-        return self.head(x)
+    def last_latent(self) -> torch.Tensor:
+        """Return the last token's intermediate-layer embedding from the most
+        recent forward pass. This is the policy's observation: a compressed
+        representation of the current state conditioned on the full history."""
+        return self._latent[:, -1, :]  # [B, d_model]
+
+    def _sinusoidal_pe(self, positions: torch.Tensor) -> torch.Tensor:
+        """Non-learned sinusoidal positional encoding by salve index.
+
+        ``positions`` is [L] long (salve indices); returns [L, d_model]. All
+        tokens of the same salve share the same position — this encodes the
+        salve's time step, not the intra-salve order (irrelevant since the
+        structural prefix already identifies each channel)."""
+        L = positions.shape[0]
+        d = self.d_model
+        device = positions.device
+        div = torch.exp(torch.arange(0, d, 2, device=device,
+                                     dtype=torch.float32)
+                        * (-math.log(10000.0) / d))      # [d/2]
+        pos_f = positions.float().unsqueeze(1)            # [L, 1]
+        pe = torch.zeros(L, d, device=device)
+        pe[:, 0::2] = torch.sin(pos_f * div)
+        pe[:, 1::2] = torch.cos(pos_f * div)
+        return pe
+
+    def forward(self, x: torch.Tensor,
+                attn_mask: torch.Tensor = None) -> torch.Tensor:
+        """x: [B, L, 25] float tokens. Returns predicted signal slots
+        [B, L, 16] (each position predicts the next token's 16 signals)."""
+        B, L, _ = x.shape
+        device = x.device
+        h = self.in_proj(x)                              # [B, L, d_model]
+        salve_pos = torch.arange(L, device=device) // SALVE_TOKENS
+        h = h + self._sinusoidal_pe(salve_pos).unsqueeze(0)
+        if attn_mask is None:
+            attn_mask = build_salve_mask(L, device)
+        else:
+            attn_mask = attn_mask.to(device)
+        h = self.transformer(h, mask=attn_mask)
+        return self.head(h)                              # [B, L, 16]
 
     @torch.no_grad()
-    def roll(self, ctx_ids: torch.Tensor, ctx_vals: torch.Tensor,
-             n_gen: int = STATE_LEN, temperature: float = 0.0) -> torch.Tensor:
-        """Generate ``n_gen`` next-state token values given context tokens.
+    def predict_next(self, ctx: torch.Tensor) -> torch.Tensor:
+        """One-shot (parallel) prediction of the next state's 13 tokens from
+        the ``[state_t, action_t]`` context.
 
-        ctx_ids/ctx_vals: [B, Ctx] (the [state_t, action_t] context, 67 tokens).
-        Returns generated values [B, n_gen]. The generated ids are the fixed
-        state layout. temperature=0 → greedy (argmax); >0 → sampling.
-        """
-        device = ctx_ids.device
-        B = ctx_ids.shape[0]
-        gen_ids = self.state_ids.to(device).unsqueeze(0).expand(B, -1)[:, :n_gen]
-        ids = ctx_ids.clone()
-        vals = ctx_vals.clone()
-        out_vals = []
-        for t in range(n_gen):
-            logits = self.forward(ids, vals)  # [B, L, 256]
-            last = logits[:, -1, :]            # predict next token's value
-            if temperature <= 0:
-                nxt = last.argmax(dim=-1)
-            else:
-                probs = F.softmax(last / temperature, dim=-1)
-                nxt = torch.multinomial(probs, 1).squeeze(-1)
-            out_vals.append(nxt)
-            nid = gen_ids[:, t].unsqueeze(1)
-            nval = nxt.unsqueeze(1)
-            ids = torch.cat([ids, nid], dim=1)
-            vals = torch.cat([vals, nval], dim=1)
-        return torch.stack(out_vals, dim=1)  # [B, n_gen]
-
-    @torch.no_grad()
-    def predict_next(self, ctx_ids: torch.Tensor, ctx_vals: torch.Tensor
-                     ) -> torch.Tensor:
-        """One-shot (parallel) prediction of the next state's 61 token values
-        from the [state_t, action_t] context (67 tokens).
-
-        Unlike ``roll`` (autoregressive), this predicts every next-state token
-        in a single forward pass, conditioning each only on (state, action)
-        plus a zeroed placeholder for the rest of the next state. It is far
-        cheaper and is what the policy uses to *imagine* trajectories during
-        sleep; the world model itself is still trained with the causal
-        autoregressive objective. Returns predicted values [B, STATE_LEN]."""
-        device = ctx_ids.device
-        B = ctx_ids.shape[0]
-        ns_ids = self.state_ids.to(device).unsqueeze(0).expand(B, -1)
-        ns_vals = torch.zeros(B, STATE_LEN, dtype=torch.long, device=device)
-        ids = torch.cat([ctx_ids, ns_ids], dim=1)        # [B, 128]
-        vals = torch.cat([ctx_vals, ns_vals], dim=1)     # [B, 128]
-        logits = self.forward(ids, vals)                # [B, 128, 256]
-        # token at position p is predicted by logits[:, p-1]; the next-state
-        # tokens occupy positions 67..127, predicted by logits[:, 66:127].
-        return logits[:, 66:127, :].argmax(dim=-1)       # [B, 61]
+        Appends 13 zero-signal state placeholders, runs one forward pass under
+        the salve mask (each predicted sensory token attends to the context
+        only, not to its siblings), and reconstructs the full 25-dim tokens by
+        combining the known structural prefix with the clamped [0,1] predicted
+        signals. Returns [B, 13, 25]."""
+        B = ctx.shape[0]
+        device = ctx.device
+        ctx_len = ctx.shape[1]
+        placeholder = self.state_template.to(device).unsqueeze(0).expand(
+            B, -1, -1)                                    # [B, 13, 25]
+        x = torch.cat([ctx, placeholder], dim=1)         # [B, ctx+13, 25]
+        # Causal mask: the placeholder state tokens carry zero signals (nothing
+        # to leak), and the imagined-rollout context may grow by 13-token
+        # states (non-16-aligned), so the regular salve mask would mislabel
+        # positions. Plain causality is robust to any context length.
+        L = x.shape[1]
+        causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
+        mask = torch.zeros(L, L, device=device)
+        mask[~causal] = float("-inf")
+        out = self.forward(x, attn_mask=mask)            # [B, L, 16]
+        pred = out[:, ctx_len:, :].clamp(0.0, 1.0)        # [B, 13, 16]
+        full = self.state_template.to(device).unsqueeze(0).expand(
+            B, -1, -1).clone()                            # [B, 13, 25]
+        full[:, :, TYPE_DIM + MOD_DIM + CANAL_DIM:] = pred
+        return full                                       # [B, 13, 25]
 
 
 # =============================================================================
@@ -171,7 +216,8 @@ class WorldModel(nn.Module):
 # =============================================================================
 class Policy(nn.Module):
     """π(a|s): a Gaussian over the 5 actuator consignes, conditioned on the
-    55 normalized sensory scalar values of the state.
+    intermediate latent of the world model (d_model dimensions) concatenated
+    with the 47 non-reward sensory scalars (normalized to [0,1]).
 
     Output means are squashed into valid consigne ranges:
       limb theta / tail theta -> tanh * THETA_RANGE  in [-pi/2, pi/2]
@@ -181,20 +227,20 @@ class Policy(nn.Module):
     rollouts and REINFORCE, the same Gaussian defines log_prob.
     """
 
-    N_STATE = 55   # 55 sensory scalar values (state part, separators excluded)
     N_ACT = 5
 
-    def __init__(self, hidden: int = 128):
+    def __init__(self, n_state: int = N_POLICY_STATE + 96, hidden: int = 128):
         super().__init__()
+        self.N_STATE = n_state
         self.net = nn.Sequential(
-            nn.Linear(self.N_STATE, hidden), nn.Tanh(),
+            nn.Linear(n_state, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
         self.mean_head = nn.Linear(hidden, self.N_ACT)
 
     def forward(self, state_vec: torch.Tensor) -> torch.Tensor:
-        """state_vec: [B, 55] float in [0, 1]. Returns action consignes [B, 5]
+        """state_vec: [B, 143] float. Returns action consignes [B, 5]
         in physical ranges (the policy mean / greedy action)."""
         h = self.net(state_vec)
         raw = self.mean_head(h)
