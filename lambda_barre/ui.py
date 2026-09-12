@@ -240,7 +240,7 @@ class Controls:
         for w in self._widgets:
             w.on_up()
 
-    def push(self, skel: "B.Skeleton") -> None:
+    def drive(self, skel: "B.Skeleton") -> None:
         """Copy widget state into the skeleton consignes."""
         skel.limb_l.theta_star = self.joy_l.theta
         skel.limb_l.d_star = self.joy_l.d

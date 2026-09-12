@@ -114,7 +114,7 @@ class WorldModel(nn.Module):
     zero-signal state placeholders and reads the head outputs there.
     """
 
-    def __init__(self, d_model: int = 96, nhead: int = 4, layers: int = 2,
+    def __init__(self, d_model: int = 64, nhead: int = 4, layers: int = 3,
                  dim_ff: int = 384, dropout: float = 0.0):
         super().__init__()
         self.d_model = d_model
@@ -130,10 +130,10 @@ class WorldModel(nn.Module):
                 for i in range(STATE_TOKENS)]
         self.register_buffer("state_template",
                              torch.tensor(tmpl, dtype=torch.float32))
-        # Hook on the first transformer layer to capture the intermediate
+        # Hook on the n-1 transformer layer to capture the intermediate
         # latent representation — the policy reads this instead of raw scalars.
         self._latent = None
-        self.transformer.layers[0].register_forward_hook(self._capture_latent)
+        self.transformer.layers[-2].register_forward_hook(self._capture_latent)
 
     def _capture_latent(self, module, input, output):
         self._latent = output  # [B, L, d_model]

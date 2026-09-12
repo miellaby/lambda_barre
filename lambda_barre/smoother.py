@@ -1,8 +1,8 @@
 """IIR exponential smoother for sensor signals.
 
 Each sensor signal is smoothed with a first-order IIR (exponential moving
-average) with a time constant of ~1 s. The smoother is updated every frame
-(60 Hz) and read once per world-model tick (1 Hz), producing a salve that
+average) with a time constant of ~1/3 s. The smoother is updated every frame
+(60 Hz) and read once per world-model tick (3 Hz), producing a salve that
 synthesizes the last second of sensory experience into a single token set.
 
 This is the "compression temporelle" described in Lambda barre.md §
@@ -17,7 +17,7 @@ import math
 from .tokenize import _BY_KEY, DenseEncoder
 
 # Time constant of the IIR filter (seconds). At 60 Hz, alpha = dt / (tau + dt).
-TAU = 1.0
+TAU = 1.0 / 3.0
 
 # Keys of all sensor signals that get smoothed (everything except actions,
 # which are read directly from the skeleton at tick time).

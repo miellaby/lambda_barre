@@ -9,9 +9,10 @@ from . import body as B
 
 # platforms: (centre_x, centre_y, half_width, radius)
 PLATFORM_DEFS = [
-    (360, -40, 90, 16),
+    (360, 60, 90, 16),
+    (180, 40, 40, 12),
     (-360, 60, 90, 16),
-    (45, 78, 20, 12),
+    (-180, 40, 40, 12),
 ]
 
 

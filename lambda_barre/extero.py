@@ -1,4 +1,4 @@
-"""Extéroception: perception of the external environment.
+"""Exteroception: perception of the external environment.
 
 See exteroception.md for the full spec. This module implements the cursor
 modality (position, velocity, click/keyboard sound), the vision modality (4×4

@@ -25,7 +25,7 @@ from . import body as B
 from . import world as W
 from . import render as R
 from . import ui as UI
-from . import sensors as S
+from . import proprio as S
 from . import extero as E
 from . import intero as I
 from .tokenize import DenseEncoder
@@ -96,7 +96,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
     space = W.make_space()
     skel = B.build_skeleton(space)
     controls = UI.Controls(skel)
-    controls.push(skel)
+    controls.drive(skel)
     B.apply_consignes(skel)
     proprio = S.Proprio(space, skel)
     reward = S.Reward(skel)
@@ -111,23 +111,22 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
         for p in (_WM_CKPT, _POL_CKPT):
             if os.path.exists(p):
                 os.remove(p)
-        status = "reset (fresh brain)"
+        status = "brain CLEARED"
     else:
         try:
             brain.load_checkpoint(_WM_CKPT, _POL_CKPT)
-            status = "brain loaded from checkpoint"
+            status = "brain restored"
         except Exception:
             for p in (_WM_CKPT, _POL_CKPT):
                 if os.path.exists(p):
                     os.remove(p)
-            status = "checkpoint incompatible, fresh brain"
-    prev_salve = None           # last salve, for (s_t, a_t, s_{t+1}) logging
+            status = "brain can't be restored"
     smoother = Smoother(tau=1.0)
     # salves: list = []       # buffer of last 10 salves (for display, disabled)
-    wm_accum = 0.0          # world model tick accumulator (1 Hz)
-    pol_accum = 0.0         # policy tick accumulator (6 Hz)
-    WM_DT = 0.5             # world model cadence — 2 Hz
+    WM_DT = 1.0 / 3.0       # world model cadence — 3 Hz
     POL_DT = 1.0 / 6.0      # policy cadence — 6 Hz
+    wm_accum = WM_DT        # world model tick accumulator (1 Hz)   - starts full to produce a first salve on the first frame
+    pol_accum = 0.0         # policy tick accumulator (6 Hz)
     show_targets = True
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
@@ -155,16 +154,14 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
                     smoother.reset()
                     brain.clear_history()
                     # salves.clear()
-                    wm_accum = 0.0
+                    wm_accum = WM_DT
                     pol_accum = 0.0
-                    prev_salve = None
                     status = "reset"
                 elif ev.key == pygame.K_g:
                     show_targets = not show_targets
                 elif ev.key == pygame.K_b:
                     auto = not auto
-                    prev_salve = None
-                    brain.clear_history()
+                    # brain.clear_history() # toggling brain on/off doesn't justify clearing history
                     status = "BRAIN on" if auto else "BRAIN off (manual)"
                 elif ev.key == pygame.K_s:
                     if len(brain.buffer) >= 1:
@@ -218,10 +215,10 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
                 sleep_gen = None
 
         # manual mode; in brain (auto) mode the policy drives them instead.
-        if not auto:
-            controls.push(skel)
-        elif sleep_gen is None:
+        if auto:
             controls.sync(skel)
+        else:
+            controls.drive(skel)
 
         # fixed timestep physics, several substeps for stability
         touch.reset_contacts()
@@ -238,32 +235,31 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
         smoother.update(signals, touch_signals, cursor_signals,
                         vision_signals, intero_signals, reward_signals, 1 / 60)
 
-        # world model tick at 2 Hz: produce smoothed salve + fresh latent
-        wm_accum += dt
-        if wm_accum >= WM_DT:
-            wm_accum -= WM_DT
-            salve = smoother.salve(skel)
-            # salves.append(salve)
-            # if len(salves) > 10:
-            #     salves.pop(0)
-            if auto:
-                if prev_salve is not None:
-                    brain.record(prev_salve, salve)
-                brain.wake_tick(salve)
-                prev_salve = salve
+        if sleep_gen is None: # brain is offline when not sleeping
 
-        # policy tick at 6 Hz: reuse cached latent, produce new consignes
-        # (frozen during sleep — the policy is offline)
-        pol_accum += dt
-        if auto and sleep_gen is None and pol_accum >= POL_DT:
-            pol_accum -= POL_DT
-            tl, dl, tr, dr, tq = brain.act(prev_salve if prev_salve is not None
-                                           else smoother.salve(skel))
-            skel.limb_l.theta_star = tl
-            skel.limb_l.d_star = dl
-            skel.limb_r.theta_star = tr
-            skel.limb_r.d_star = dr
-            skel.tail_act.theta_star = tq
+            # world model tick at 3 Hz: produce smoothed salve
+            wm_accum += dt
+            if wm_accum >= WM_DT:
+                wm_accum -= WM_DT
+                salve = smoother.salve(skel)
+                # even with the brain offline, we record the salve for the next sleep cycle
+                brain.record(salve)
+                if auto: # produces fresh latent for policy when brain online
+                    brain.wake_tick(salve)
+
+
+            if auto:
+                # policy tick at 6 Hz: reuse cached latent, produce new consignes
+                # (frozen during sleep — the policy is offline)
+                pol_accum += dt
+                if pol_accum >= POL_DT:
+                    pol_accum -= POL_DT
+                    tl, dl, tr, dr, tq = brain.act(smoother.salve(skel))
+                    skel.limb_l.theta_star = tl
+                    skel.limb_l.d_star = dl
+                    skel.limb_r.theta_star = tr
+                    skel.limb_r.d_star = dr
+                    skel.tail_act.theta_star = tq
 
         if screen is not None:
             mouse = pygame.mouse.get_pos()

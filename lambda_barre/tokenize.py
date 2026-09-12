@@ -296,7 +296,7 @@ def state_tokens(salve: list[list[float]]) -> list[list[float]]:
 
 def action_tokens(salve: list[list[float]]) -> list[list[float]]:
     """The 3 motor tokens of a salve."""
-    return salve[STATE_TOKENS:]
+    return salve[STATE_TOKENS:SALVE_TOKENS]
 
 
 def policy_scalars(salve: list[list[float]]) -> list[float]:

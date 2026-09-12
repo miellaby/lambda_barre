@@ -99,15 +99,13 @@ class ExperienceBuffer:
     """Concurrent sequence recorder with randomized start offsets.
 
     Multiple recorders run in parallel. Each captures ``seq_len`` consecutive
-    transitions. A new recorder starts after a random delay (uniform in
-    [seq_len//2, seq_len*3//2]) to decorrelate the learning cadence from the
+    salves. A new recorder starts after a random delay (uniform in
+    [seq_len//3, seq_len]) to decorrelate the learning cadence from the
     physics simulation cadence — preventing resonance between what is learned
     and the simulation's rhythm.
 
     Completed sequences are stored in a ring buffer. Each sequence is a list
-    of (state_tokens, action_tokens, next_state_tokens) tuples in
-    chronological order, where state_tokens is 13 dense tokens and
-    action_tokens is 3 dense tokens.
+    of salves in chronological order
     """
 
     def __init__(self, seq_len: int = 10, capacity: int = 400, seed: int = 0):
@@ -115,19 +113,17 @@ class ExperienceBuffer:
         self._completed: deque = deque(maxlen=capacity)
         self._active: list[list] = []
         self._rng = random.Random(seed)
-        self._min_gap = 4
-        self._max_gap = 10
-        self._countdown = self._rng.randint(self._min_gap, self._max_gap)
+        self._min_gap = seq_len//3
+        self._max_gap = seq_len
+        self._countdown = 2   # start a new recorder after 2 ticks
 
     def __len__(self) -> int:
         return len(self._completed)
 
-    def push(self, state_tokens, action_tokens, next_state_tokens) -> None:
-        transition = (list(state_tokens), list(action_tokens),
-                     list(next_state_tokens))
+    def push(self, salve) -> None:
         # append to all active recorders
         for rec in self._active:
-            rec.append(transition)
+            rec.append(salve)
         # seal completed recorders
         still_active = []
         for rec in self._active:
@@ -139,31 +135,17 @@ class ExperienceBuffer:
         # maybe start a new recorder
         self._countdown -= 1
         if self._countdown <= 0:
-            self._active.append([transition])
+            self._active.append([salve])
             self._countdown = self._rng.randint(self._min_gap, self._max_gap)
 
     def sample(self, batch: int):
         """Sample ``batch`` completed sequences. Returns a list of sequences,
-        each a list of (s, a, s') tuples. Returns [] if empty."""
+        each a list of salves. Returns [] if empty."""
         n = len(self._completed)
         if n == 0:
             return []
         idx = [self._rng.randrange(n) for _ in range(min(batch, n))]
         return [list(self._completed[i]) for i in idx]
-
-    def sample_states(self, batch: int):
-        """Return ``batch`` starting states (13-token lists) sampled from
-        random positions within random completed sequences. For policy
-        training."""
-        n = len(self._completed)
-        if n == 0:
-            return []
-        out = []
-        for _ in range(min(batch, n)):
-            seq = self._completed[self._rng.randrange(n)]
-            t = self._rng.randrange(len(seq))
-            out.append(seq[t][0])  # state_tokens from a random transition
-        return out
 
 
 class Brain:
@@ -177,12 +159,12 @@ class Brain:
         brain.sleep()                 # on demand: offline training of both models
     """
 
-    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 1e-3,
-                 explore_std: float = 0.4, device: str = "cpu", seed: int = 0):
+    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 1e-3, act_std: float = 0.05,
+                 explore_std: float = 0.2, device: str = "cpu", seed: int = 0):
         torch.manual_seed(seed)
         self.device = torch.device(device)
-        d_model = 96
-        self.world = M.WorldModel(d_model=d_model, nhead=4, layers=2,
+        d_model = 64
+        self.world = M.WorldModel(d_model=d_model, nhead=4, layers=3,
                                   dim_ff=384).to(self.device)
         self.policy = M.Policy(n_state=N_POLICY_STATE + d_model).to(self.device)
         # Normalizes the world model's intermediate latent before feeding it
@@ -195,6 +177,7 @@ class Brain:
         self.buffer = ExperienceBuffer(seq_len=SEQ_STEPS, seed=seed)
         self.group_mask = _GROUP_MASK.to(self.device)
         self.target_valid = _target_valid.to(self.device)
+        self.act_std = act_std
         self.explore_std = explore_std
         # Precomputed cost tensors, moved to device for the vectorized
         # trajectory-cost in train_policy.
@@ -254,23 +237,22 @@ class Brain:
             self._wake_history.pop(0)
 
     @torch.no_grad()
-    def act(self, salve) -> tuple[float, float, float, float, float]:
+    def act(self, salve, std=None) -> tuple[float, float, float, float, float]:
         """Return 5 actuator consignes. Reuses the cached latent from the
         last wake_tick(). If no latent yet (first tick), runs a fallback forward."""
         if self._cached_latent is None:
-            self.wake_tick(salve)
+            self.wake_tick(salve)   # has to run wm at least one
         t0 = time.perf_counter()
         pol_in = torch.cat([self._cached_scalars, self._cached_latent], dim=1)
-        action, _, _ = self.policy.sample(pol_in, self.explore_std)
+        action, _, _ = self.policy.sample(pol_in, self.act_std if std is None else std)
         self._pol_time = (1 - self._time_alpha) * self._pol_time \
             + self._time_alpha * (time.perf_counter() - t0) * 1000
         a = action[0].tolist()
         return a[0], a[1], a[2], a[3], a[4]
 
-    def record(self, salve, next_salve) -> None:
+    def record(self, salve) -> None:
         """Journal one transition into the experience buffer."""
-        self.buffer.push(state_tokens(salve), action_tokens(salve),
-                         state_tokens(next_salve))
+        self.buffer.push(salve)
 
     def clear_history(self) -> None:
         """Clear the wake context history, cached latent, and active recorders."""
@@ -278,6 +260,7 @@ class Brain:
         self._cached_latent = None
         self._cached_scalars = None
         self.buffer._active.clear()
+        self._countdown = 0
 
     def _build_context(self, cur_state: list):
         """Build a [1, L, 25] context tensor from the wake history + current
@@ -298,26 +281,27 @@ class Brain:
         return ctx
 
     # --- sleep: world model training ----------------------------------------
-    def _batch_tensors(self, windows):
+    def _batch_tensors(self, sequences):
         """Build a [B, L, 25] tensor for a batch of multi-step transition
-        windows.
+        sequences.
 
-        Each window is a list of SEQ_STEPS (s, a, s') tuples. The sequence is
-        [s0, a0, s1, a1, ..., a_{N-1}, sN] = N*16 + 13 tokens."""
-        B = len(windows)
+        Each sequence is a list of SEQ_STEPS salves of 16 Sensor tokens and 3 Actuator tokens:
+        [s0, a0, s1, a1, ..., a_{N-1}, sN]"""
+        B = len(sequences)
+
         vals = torch.zeros(B, _SEQ_LEN, DENSE_DIM, device=self.device)
-        for b, window in enumerate(windows):
+        for b, seq in enumerate(sequences):
             pos = 0
-            for i, (s, a, ns) in enumerate(window):
+            for i, salve in enumerate(seq):
+                assert len(salve) == SALVE_TOKENS
                 vals[b, pos:pos + STATE_TOKENS] = torch.tensor(
-                    s, dtype=torch.float32, device=self.device)
+                    salve[:STATE_TOKENS], dtype=torch.float32, device=self.device)
                 pos += STATE_TOKENS
-                vals[b, pos:pos + ACTION_TOKENS] = torch.tensor(
-                    a, dtype=torch.float32, device=self.device)
-                pos += ACTION_TOKENS
-            # final next-state (window[-1]'s s')
-            vals[b, pos:pos + STATE_TOKENS] = torch.tensor(
-                window[-1][2], dtype=torch.float32, device=self.device)
+                # last action tokens are not predicted
+                if i < len(seq) - 1:
+                    vals[b, pos:pos + ACTION_TOKENS] = torch.tensor(
+                        salve[STATE_TOKENS:SALVE_TOKENS], dtype=torch.float32, device=self.device)
+                    pos += ACTION_TOKENS
         return vals
 
     def train_world(self, epochs: int = 4, batch: int = 32):
@@ -328,10 +312,10 @@ class Brain:
         self.world.train()
         losses = []
         for ep in range(epochs):
-            windows = self.buffer.sample(batch)
-            if not windows:
+            sequences = self.buffer.sample(batch)
+            if not sequences:
                 break
-            vals = self._batch_tensors(windows)             # [B, L, 25]
+            vals = self._batch_tensors(sequences)             # [B, L, 25]
             pred = self.world(vals, attn_mask=self.group_mask)  # [B, L, 16]
             # position p predicts token p+1's signal slots
             pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
@@ -414,7 +398,10 @@ class Brain:
             for b, seq in enumerate(sequences):
                 pos = 0
                 for i in range(n_ctx):
-                    s, a, _ = seq[i]
+                    salve = seq[i]
+                    assert len(salve) == SALVE_TOKENS
+                    s = salve[:STATE_TOKENS]
+                    a = salve[STATE_TOKENS:SALVE_TOKENS]
                     ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
                         s, dtype=torch.float32, device=device)
                     pos += STATE_TOKENS
@@ -422,7 +409,7 @@ class Brain:
                         a, dtype=torch.float32, device=device)
                     pos += ACTION_TOKENS
                 # s4 (the state the policy acts on)
-                s4 = seq[n_ctx][0]
+                s4 = seq[n_ctx][:STATE_TOKENS]
                 ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
                     s4, dtype=torch.float32, device=device)
 

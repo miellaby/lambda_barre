@@ -77,7 +77,7 @@ position a la sienne. La somme est normalisée par `sqrt(d_model)`.
 
 ### Architecture
 
-- `d_model = 96`, `nhead = 4`, `layers = 2`, `dim_ff = 384` (taille réduite
+- `d_model = 64`, `nhead = 4`, `layers = 3`, `dim_ff = 384` (taille réduite
   pour la vitesse CPU)
 - `TransformerEncoder` avec `norm_first=True` (pre-LN) et activation GELU
 - Masque causal triangulaire (chaque position n'attend que les précédentes)
