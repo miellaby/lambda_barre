@@ -153,7 +153,7 @@ class Reward:
     Signals produced:
         effort, douleur, courbature, instabilite, vertige, confort
         reward_pos  — confort (negative = reward, clamped to 0 from below)
-        reward_neg  — sum of costs (positive = penalty, clamped to 0 from above)
+        reward_neg  — pondered cost average (positive = penalty, clamped to 0 from above)
     """
 
     def __init__(self, skel: "B.Skeleton", substep_dt: float = 1 / 180):
@@ -248,7 +248,7 @@ class Reward:
             confort = 0.0
 
         reward_neg = (1.0 * effort + 4.0 * douleur + 2.0 * courbature
-                      + 2.0 * instabilite + 3.0 * vertige)
+                      + 2.0 * instabilite + 3.0 * vertige) / 12.0
         reward_pos = 1.0 * confort  # already negative (reward)
 
         return {

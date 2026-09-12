@@ -203,7 +203,7 @@ besoin d'effectuer réellement toutes ces actions.
 Le coût instantané est lu sur les tokens REWARD de l'état :
 
 ```python
-cost = reward_neg (coût non signé, 0..1) + reward_pos (signé, −1..+1)
+cost = reward_neg (coût, 0..1) + reward_pos (coût négatif, −1..0)
 ```
 
 `reward_pos` négatif = récompense (réduit le coût) ; `reward_neg` positif =
