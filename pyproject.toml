@@ -1,7 +1,7 @@
 [project]
 name = "lambda-barre"
 version = "0.0.1"
-description = "Lambda barre — a learning desktop-pet animat. Stage 1: actuated body."
+description = "Lambda barre — a learning desktop-pet animat."
 requires-python = ">=3.11"
 dependencies = [
     "pymunk>=7.3",

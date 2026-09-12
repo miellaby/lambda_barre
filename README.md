@@ -5,12 +5,10 @@
 This is in a work in progress.
 
 # Install
-
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e .
+     # Install uv on your system
+     uv venv
+     uv pip install -e .
 
 # Run
 
-.venv/bin/python -m lambda_barre.main
+     .venv/bin/python -m lambda_barre.main
