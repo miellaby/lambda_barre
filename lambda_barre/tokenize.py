@@ -24,6 +24,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from lambda_barre.body import LIMB_MAX, LIMB_MIN
+
 
 # --- dense token geometry -----------------------------------------------------
 TYPE_DIM = 1
@@ -45,23 +47,26 @@ VAL_MAX = 8
 class TokenSpec:
     key: str
     code: str          # 2-3 letter code for display
-    scale: float       # normalization scale
+    max_val: float       # maximum value
     signed: bool       # whether the value can be negative
+    min_val: float = 0.0  # optional minimum value
 
 
 def _build_specs() -> dict[str, TokenSpec]:
     specs: dict[str, TokenSpec] = {}
 
-    def add(key, code, scale, signed):
-        specs[key] = TokenSpec(key, code, scale, signed)
+    def add(key, code, max_val, signed, min_val=None):
+        if min_val is None:
+            min_val = -max_val if signed else 0.0
+        specs[key] = TokenSpec(key, code, max_val, signed, min_val)
 
     # Proprioception (11)
     add("tronc_angle",              "TA", math.radians(45), True)
     add("membre_angle_avant",       "AA", math.pi,          True)
-    add("membre_distance_avant",    "DA", 32.0,             False)
+    add("membre_distance_avant",    "DA", LIMB_MAX,         False)
     add("force_actuateur_avant",    "FA", 2000.0,           True)
     add("membre_angle_arriere",     "AR", math.pi,          True)
-    add("membre_distance_arriere",  "DR", 32.0,             False)
+    add("membre_distance_arriere",  "DR", LIMB_MAX,         False)
     add("force_actuateur_arriere",  "FR", 2000.0,           True)
     add("queue_angle",             "QA", math.pi,          True)
     add("couple_queue",            "CQ", 200000.0,         True)
@@ -110,11 +115,11 @@ def _build_specs() -> dict[str, TokenSpec]:
     add("reward_neg",  "RN", 1.0, False)
 
     # Actions (5)
-    add("limb_l_theta", "LT", math.pi / 2, True)
-    add("limb_l_d",     "LD", 32.0,        False)
-    add("limb_r_theta", "RT", math.pi / 2, True)
-    add("limb_r_d",     "RD", 32.0,        False)
-    add("tail_theta",   "TQ", math.pi / 2, True)
+    add("membre_avant_theta", "FT", math.pi, True)
+    add("membre_avant_d",     "FD", LIMB_MAX,    False, LIMB_MIN)
+    add("membre_arriere_theta", "RT", math.pi, True)
+    add("membre_arriere_d",     "RD"    , LIMB_MAX,    False, LIMB_MIN)
+    add("queue_theta",   "QT", math.pi, True)
 
     return specs
 
@@ -125,20 +130,24 @@ _BY_KEY: dict[str, TokenSpec] = _SPECS
 
 def _quantize(raw: float, spec: TokenSpec) -> int:
     if spec.signed:
-        t = raw / spec.scale
+        t = raw / spec.max_val
         t = max(-1.0, min(1.0, t))
         return int(round((t + 1.0) / 2.0 * VAL_MAX))
     else:
-        t = max(0.0, min(1.0, raw / spec.scale))
+        t = (raw - spec.min_val) / (spec.max_val - spec.min_val)
+        t = max(0.0, min(1.0, t))
         return int(round(t * VAL_MAX))
 
 
 def _dequantize(val: int, spec: TokenSpec) -> float:
+    val = max(0, min(VAL_MAX, val))
+
     if spec.signed:
         t = (val / VAL_MAX) * 2.0 - 1.0
-        return t * spec.scale
+        return t * spec.max_val
     else:
-        return (val / VAL_MAX) * spec.scale
+        t = val / VAL_MAX
+        return spec.min_val + t * (spec.max_val - spec.min_val)
 
 
 def dequantize(val: int, key: str) -> float:
@@ -155,21 +164,21 @@ def quantize_value(raw: float, key: str) -> int:
 def _normalize(raw: float, spec: TokenSpec) -> float:
     """Map a raw physical value to a [0,1] float slot value."""
     if spec.signed:
-        t = raw / spec.scale
+        t = raw / spec.max_val
         t = max(-1.0, min(1.0, t))
         return (t + 1.0) / 2.0
     else:
-        t = max(0.0, min(1.0, raw / spec.scale))
-        return t
-
+        t = (raw - spec.min_val) / (spec.max_val - spec.min_val)
+        return max(0.0, min(1.0, t))
 
 def _denormalize(t: float, spec: TokenSpec) -> float:
     """Inverse of ``_normalize`` — recover the physical value from [0,1]."""
     t = max(0.0, min(1.0, t))
+
     if spec.signed:
-        return (t * 2.0 - 1.0) * spec.scale
+        return (t * 2.0 - 1.0) * spec.max_val
     else:
-        return t * spec.scale
+        return spec.min_val + t * (spec.max_val - spec.min_val)
 
 
 # --- dense channel layout -----------------------------------------------------
@@ -229,11 +238,11 @@ def _build_layout() -> list[ChannelSpec]:
                     ["confort"], "reward"),
         # --- motor (13..15) ---
         ChannelSpec(13, True, _M_ACTION, (0.0, 0.0, 0.0, 1.0),
-                    ["limb_l_theta", "limb_l_d"], "action"),
+                    ["membre_avant_theta", "membre_avant_d"], "action"),
         ChannelSpec(14, True, _M_ACTION, (0.0, 0.0, 1.0, 0.0),
-                    ["limb_r_theta", "limb_r_d"], "action"),
+                    ["membre_arriere_theta", "membre_arriere_d"], "action"),
         ChannelSpec(15, True, _M_ACTION, (0.0, 1.0, 0.0, 0.0),
-                    ["tail_theta"], "action"),
+                    ["queue_theta"], "action"),
     ]
 
 
@@ -241,6 +250,7 @@ _LAYOUT: list[ChannelSpec] = _build_layout()
 
 # Number of valid (non-padded) signal slots per token index.
 _N_SIGNALS: list[int] = [len(ch.signals) for ch in _LAYOUT]
+print(f"signal slots per token: {_N_SIGNALS}")
 
 # Index of the reward tokens within the state.
 _COST_IDX = 11        # "Coûts"  (effort, douleur, courbature, instabilite, vertige)
@@ -261,11 +271,11 @@ N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 47
 
 # Per-token action-key → (skeleton attribute, field) lookup.
 _ACTION_LOOKUP = {
-    "limb_l_theta": ("limb_l", "theta_star"),
-    "limb_l_d":     ("limb_l", "d_star"),
-    "limb_r_theta": ("limb_r", "theta_star"),
-    "limb_r_d":     ("limb_r", "d_star"),
-    "tail_theta":   ("tail_act", "theta_star"),
+    "membre_avant_theta":   ("limb_front", "theta_star"),
+    "membre_avant_d":       ("limb_front", "d_star"),
+    "membre_arriere_theta": ("limb_back", "theta_star"),
+    "membre_arriere_d":     ("limb_back", "d_star"),
+    "queue_theta":   ("tail_act", "theta_star"),
 }
 
 # Weights for each innate cost signal in salve_cost.
@@ -331,13 +341,13 @@ def salve_cost(salve: list[list[float]]) -> float:
     return total
 
 
-def encode_action(theta_l: float, d_l: float, theta_r: float, d_r: float,
+def encode_action(theta_front: float, d_front: float, theta_back: float, d_back: float,
                   tail_t: float) -> list[list[float]]:
     """Encode the 5 actuator consignes into the 3 motor dense tokens (13..15)."""
     raw = {
-        "limb_l_theta": theta_l, "limb_l_d": d_l,
-        "limb_r_theta": theta_r, "limb_r_d": d_r,
-        "tail_theta": tail_t,
+        "membre_avant_theta": theta_front, "membre_avant_d": d_front,
+        "membre_arriere_theta": theta_back, "membre_arriere_d": d_back,
+        "queue_theta": tail_t,
     }
     out: list[list[float]] = []
     for i in range(STATE_TOKENS, SALVE_TOKENS):
@@ -395,6 +405,12 @@ class DenseEncoder:
                 for k, key in enumerate(ch.signals):
                     attr, fld = _ACTION_LOOKUP[key]
                     raw = getattr(getattr(skel, attr), fld)
+                    # Convert anatomical limb coordinates to the
+                    # egocentric front/back coordinate frame (angle > 0 = outward rotation).
+                    if skel.facing == 1 and key == "membre_avant_theta":
+                        raw = -raw
+                    elif skel.facing == -1 and key == "membre_arriere_theta":
+                        raw = -raw
                     sigs[k] = _normalize(raw, _BY_KEY[key])
             else:
                 src = dicts[ch.source]
@@ -409,7 +425,7 @@ class DenseEncoder:
         lines: list[str] = []
         for i, token in enumerate(salve):
             ch = _LAYOUT[i] if i < len(_LAYOUT) else None
-            kind = "M" if (ch and ch.is_motor) else "S"
+            kind = "A" if (ch and ch.is_motor) else "S"
             codes = []
             if ch:
                 for k, key in enumerate(ch.signals):

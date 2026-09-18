@@ -529,10 +529,10 @@ def draw_reward(screen, font, signals: dict, intero_signals: dict,
 
 # --- token stream display -----------------------------------------------------
 
-TOKEN_PANEL_X = WIDTH - 190
-TOKEN_PANEL_W = 180
-TOKEN_PANEL_Y = 10
-TOKEN_PANEL_H = HEIGHT - 20
+TOKEN_PANEL_X = WIDTH - 300
+TOKEN_PANEL_W = 290
+TOKEN_PANEL_Y = 50
+TOKEN_PANEL_H = HEIGHT - 70
 TOKEN_COL_W = TOKEN_PANEL_W // 2 - 4
 TOKEN_LINE_H = 11
 TOKEN_SEP_C = (90, 100, 120)

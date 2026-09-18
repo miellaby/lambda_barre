@@ -43,9 +43,9 @@ Total : 25 dimensions. Pas d'embedding appris — l'encodeur produit ces vecteur
 
 | # | Modalité | Encodage modalité (4d) | Canal | Encodage canal (4d) | Signaux | Nb |
 |---|----------|----------------------|-------|---------------------|---------|-----|
-| 13 | ACTION | (0,0,0,0) | Patte gauche | (0,0,0,1) | limb_l_theta, limb_l_d | 2 |
-| 14 | ACTION | (0,0,0,0) | Patte droite | (0,0,1,0) | limb_r_theta, limb_r_d | 2 |
-| 15 | ACTION | (0,0,0,0) | Queue | (0,1,0,0) | tail_theta | 1 |
+| 13 | ACTION | (0,0,0,0) | Patte avant | (0,0,0,1) | membre_avant_theta, membre_avant_d | 2 |
+| 14 | ACTION | (0,0,0,0) | Patte arrière | (0,0,1,0) | membre_arriere_theta, membre_arriere_d | 2 |
+| 15 | ACTION | (0,0,0,0) | Queue | (0,1,0,0) | queue_theta | 1 |
 
 ## Changements à faire
 
@@ -69,7 +69,7 @@ Total : 25 dimensions. Pas d'embedding appris — l'encodeur produit ces vecteur
 ### brain.py
 - `ExperienceBuffer` stocke des `list[list[float]]` au lieu de `list[int]`
 - `_batch_tensors` construit des tenseurs `[B, L, 25]`
-- `_GROUP_MASK` adapté pour masquer tout un type de token (S ou A)
+- `_MASK` masque pour transformer causal
 - `wake_tick`, `act`, `train_world`, `train_policy` adaptés
 
 ### smoother.py

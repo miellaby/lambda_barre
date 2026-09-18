@@ -75,8 +75,7 @@ class Joystick:
 
     # --- consigne <-> handle geometry ----------------------------------------
     def _handle_dist(self) -> float:
-        t = (self.d - B.LIMB_MIN) / (B.LIMB_MAX - B.LIMB_MIN)
-        return _clamp(t, 0.0, 1.0) * self.radius
+        return self.d * self.radius
 
     def handle_pos(self) -> tuple[int, int]:
         r = self._handle_dist()
@@ -94,9 +93,8 @@ class Joystick:
             r = self.radius
         if r > 0.5:
             self.theta = math.atan2(-dx, dy)
-        # distance: centre = retracted (LIMB_MIN), rim = extended (LIMB_MAX)
-        self.d = B.LIMB_MIN + (r / self.radius) * (B.LIMB_MAX - B.LIMB_MIN)
-        self.d = _clamp(self.d, B.LIMB_MIN, B.LIMB_MAX)
+        # distance: centre = 0, rim = 1
+        self.d = _clamp(r / self.radius, 0.0, 1.0)
 
     # --- hit testing / interaction -------------------------------------------
     def hit(self, mx: int, my: int) -> bool:
@@ -217,11 +215,13 @@ class Controls:
 
     def __init__(self, skel: "B.Skeleton"):
         self.joy_l = Joystick(JOY_L_CENTRE, JOY_RADIUS,
-                              skel.limb_l.theta_star, skel.limb_l.d_star, "L")
+            skel.limb_l.theta_star,
+            (skel.limb_l.d_star - B.LIMB_MIN) / (B.LIMB_MAX - B.LIMB_MIN), "L")
         self.joy_r = Joystick(JOY_R_CENTRE, JOY_RADIUS,
-                              skel.limb_r.theta_star, skel.limb_r.d_star, "R")
+            skel.limb_r.theta_star,
+            (skel.limb_r.d_star - B.LIMB_MIN) / (B.LIMB_MAX - B.LIMB_MIN), "R")
         self.tail = Slider(TAIL_TRACK_X1, TAIL_TRACK_X2, TAIL_TRACK_Y,
-                           skel.tail_act.theta_star, TAIL_RANGE, "tail")
+            skel.tail_act.theta_star, TAIL_RANGE, "tail")
 
     @property
     def _widgets(self):
@@ -241,19 +241,39 @@ class Controls:
             w.on_up()
 
     def drive(self, skel: "B.Skeleton") -> None:
-        """Copy widget state into the skeleton consignes."""
+        """Copy normalized widget state into the skeleton consignes."""
+        assert 0.0 <= self.joy_l.d <= 1.0, (
+            f"Invalid joy_l.d={self.joy_l.d}, expected [0, 1]"
+        )
+        assert 0.0 <= self.joy_r.d <= 1.0, (
+            f"Invalid joy_r.d={self.joy_r.d}, expected [0, 1]"
+        )
         skel.limb_l.theta_star = self.joy_l.theta
-        skel.limb_l.d_star = self.joy_l.d
+        skel.limb_l.d_star = (
+            B.LIMB_MIN
+            + self.joy_l.d * (B.LIMB_MAX - B.LIMB_MIN)
+        )
+
         skel.limb_r.theta_star = self.joy_r.theta
-        skel.limb_r.d_star = self.joy_r.d
+        skel.limb_r.d_star = (
+            B.LIMB_MIN
+            + self.joy_r.d * (B.LIMB_MAX - B.LIMB_MIN)
+        )
+
         skel.tail_act.theta_star = self.tail.theta
 
     def sync(self, skel: "B.Skeleton") -> None:
         """Copy skeleton consignes into the widgets (for display in brain mode)."""
         self.joy_l.theta = skel.limb_l.theta_star
-        self.joy_l.d = skel.limb_l.d_star
+        self.joy_l.d = (
+            skel.limb_l.d_star - B.LIMB_MIN
+        ) / (B.LIMB_MAX - B.LIMB_MIN)
+
         self.joy_r.theta = skel.limb_r.theta_star
-        self.joy_r.d = skel.limb_r.d_star
+        self.joy_r.d = (
+            skel.limb_r.d_star - B.LIMB_MIN
+        ) / (B.LIMB_MAX - B.LIMB_MIN)
+
         self.tail.theta = skel.tail_act.theta_star
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:

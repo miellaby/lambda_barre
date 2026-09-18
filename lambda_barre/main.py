@@ -21,6 +21,8 @@ import math
 
 import pygame
 
+from lambda_barre.models import THETA_RANGE
+
 from . import body as B
 from . import world as W
 from . import render as R
@@ -50,9 +52,10 @@ def hud(font, skel, fps, brain=None, auto=False, status=None):
     if brain is not None:
         wm = brain.last_wm_loss
         pol = brain.last_pol_loss
+        dev = getattr(brain, "device_desc", str(brain.device))
+        lines.append(f"dev {dev}")
         lines.append(
-            f"buf {len(brain.buffer)} wm {wm:.2f} pol {pol:.2f} "
-            f"ret {brain.last_return:.2f}")
+            f"buf {len(brain.buffer)} (pool {brain.buffer.pool_size}, {brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f} ")
         lines.append(
             f"inf wm {brain._wm_time:.1f}ms pol {brain._pol_time:.1f}ms")
     if status:
@@ -82,7 +85,8 @@ def _platform_hit(space, world_pos):
     return None
 
 
-def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
+def run(headless: bool = False, steps: int = 0, reset: bool = False,
+        device: str | None = None) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
     pygame.init()
@@ -105,7 +109,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
     touch = E.Touch(space, skel)
     intero = I.Intero()
     encoder = DenseEncoder()
-    brain = Brain()
+    brain = Brain(device=device)
     auto = False                 # brain drives the consignes when True
     if reset:
         for p in (_WM_CKPT, _POL_CKPT):
@@ -122,7 +126,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
                     os.remove(p)
             status = "brain can't be restored"
     smoother = Smoother(tau=1.0)
-    # salves: list = []       # buffer of last 10 salves (for display, disabled)
+    salves: list = []       # buffer of last 10 salves (for display, disabled)
     WM_DT = 1.0 / 3.0       # world model cadence — 3 Hz
     POL_DT = 1.0 / 6.0      # policy cadence — 6 Hz
     wm_accum = WM_DT        # world model tick accumulator (1 Hz)   - starts full to produce a first salve on the first frame
@@ -131,6 +135,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
     sleep_gen = None       # active sleep generator (None when not sleeping)
+
+    prev_facing = skel.facing
 
     n = 0
     running = True
@@ -153,9 +159,10 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
                     intero.reset()
                     smoother.reset()
                     brain.clear_history()
-                    # salves.clear()
+                    salves.clear()
                     wm_accum = WM_DT
                     pol_accum = 0.0
+                    prev_facing = skel.facing
                     status = "reset"
                 elif ev.key == pygame.K_g:
                     show_targets = not show_targets
@@ -206,11 +213,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
                     stats = value
                     sleep_gen = None
                     brain.save_checkpoint(_WM_CKPT, _POL_CKPT)
-                    brain.clear_history()
                     print("[sleep]", stats)
                     status = (f"slept: wm {stats['wm_loss']:.2f} "
-                              f"pol {stats['pol_loss']:.2f} "
-                              f"ret {stats['return']:.2f}")
+                              f"pol {stats['pol_loss']:.2f} ")
             except StopIteration:
                 sleep_gen = None
 
@@ -231,9 +236,49 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
         cursor_signals = cursor.update(skel, pygame.mouse.get_pos(), 1 / 60)
         vision_signals = vision.update(skel, 1 / 60)
 
-        # update IIR smoother every frame (60 Hz)
-        smoother.update(signals, touch_signals, cursor_signals,
-                        vision_signals, intero_signals, reward_signals, 1 / 60)
+        # detect instantaneous facing direction flip (frame of reference change)
+        if skel.facing != prev_facing:
+            prev_facing = skel.facing
+            # 1. Re-initialize smoother without EMA blending to prevent cross-facing signal corruption
+            smoother.reinit(signals, touch_signals, cursor_signals,
+                           vision_signals, intero_signals, reward_signals)
+            if sleep_gen is None:
+                # 2. Clear pre-flip wake context history
+                brain.clear_history()
+                # 3. Produce clean salve in new frame, record it, and update WM latent immediately
+                salve = smoother.salve(skel)
+                salves.append(salve)
+                if len(salves) > 3:
+                    salves.pop(0)
+                brain.record(salve)
+                if auto:
+                    brain.wake_tick(salve)
+                    # 4. Immediately re-evaluate policy in the new reference frame
+                    theta_front, d_front, theta_back, d_back, tail_t = brain.act(salve)
+                    facing = skel.facing
+                    theta_front_phys = theta_front * THETA_RANGE
+                    theta_back_phys = theta_back * THETA_RANGE
+                    d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
+                    d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
+                    tail_t_phys = tail_t * THETA_RANGE
+                    if facing == 1:
+                        skel.limb_r.theta_star = -theta_front_phys
+                        skel.limb_r.d_star = d_front_phys
+                        skel.limb_l.theta_star = +theta_back_phys
+                        skel.limb_l.d_star = d_back_phys
+                    else:
+                        skel.limb_l.theta_star = +theta_front_phys
+                        skel.limb_l.d_star = d_front_phys
+                        skel.limb_r.theta_star = -theta_back_phys
+                        skel.limb_r.d_star = d_back_phys
+                    skel.tail_act.theta_star = tail_t_phys
+                    B.apply_consignes(skel)
+                wm_accum = 0.0
+                pol_accum = 0.0
+        else:
+            # update IIR smoother normally every frame (60 Hz)
+            smoother.update(signals, touch_signals, cursor_signals,
+                            vision_signals, intero_signals, reward_signals, 1 / 60)
 
         if sleep_gen is None: # brain is offline when not sleeping
 
@@ -242,29 +287,51 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False) -> None:
             if wm_accum >= WM_DT:
                 wm_accum -= WM_DT
                 salve = smoother.salve(skel)
+                salves.append(salve)
+                if len(salves) > 3:
+                    salves.pop(0)
                 # even with the brain offline, we record the salve for the next sleep cycle
                 brain.record(salve)
                 if auto: # produces fresh latent for policy when brain online
                     brain.wake_tick(salve)
 
 
-            if auto:
-                # policy tick at 6 Hz: reuse cached latent, produce new consignes
-                # (frozen during sleep — the policy is offline)
-                pol_accum += dt
-                if pol_accum >= POL_DT:
-                    pol_accum -= POL_DT
-                    tl, dl, tr, dr, tq = brain.act(smoother.salve(skel))
-                    skel.limb_l.theta_star = tl
-                    skel.limb_l.d_star = dl
-                    skel.limb_r.theta_star = tr
-                    skel.limb_r.d_star = dr
-                    skel.tail_act.theta_star = tq
+            # policy tick at 6 Hz: reuse cached latent, produce new consignes
+            # (frozen during sleep — the policy is offline)
+            pol_accum += dt
+            if pol_accum >= POL_DT:
+                pol_accum -= POL_DT
+                theta_front, d_front, theta_back, d_back, tail_t = brain.act(smoother.salve(skel))
+                if auto:
+                    # put the consignes back into the skeleton for the next physics step
+                    facing = skel.facing
+                    theta_front_phys = theta_front * THETA_RANGE
+                    theta_back_phys = theta_back * THETA_RANGE
+                    d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
+                    d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
+                    tail_t_phys = tail_t * THETA_RANGE
+
+                    if facing == 1:
+                        # limb_front = limb_r (right side: outward is right (+x), so theta_r = -theta_front)
+                        # limb_back = limb_l (left side: outward is left (-x), so theta_l = +theta_back)
+                        skel.limb_r.theta_star = -theta_front_phys
+                        skel.limb_r.d_star = d_front_phys
+                        skel.limb_l.theta_star = +theta_back_phys
+                        skel.limb_l.d_star = d_back_phys
+                    else:
+                        # limb_front = limb_l (left side: outward is left (-x), so theta_l = +theta_front)
+                        # limb_back = limb_r (right side: outward is right (+x), so theta_r = -theta_back)
+                        skel.limb_l.theta_star = +theta_front_phys
+                        skel.limb_l.d_star = d_front_phys
+                        skel.limb_r.theta_star = -theta_back_phys
+                        skel.limb_r.d_star = d_back_phys
+
+                    skel.tail_act.theta_star = tail_t_phys
 
         if screen is not None:
             mouse = pygame.mouse.get_pos()
             R.draw(screen, skel, font, show_targets)
-            # R.draw_tokens(screen, font_small, salves, encoder)
+            R.draw_tokens(screen, font_small, salves, encoder)
             R.draw_vision(screen, font, vision, skel)
             h_proprio = R.draw_proprio(screen, font, signals, mouse)
             h_touch = R.draw_touch(screen, font, touch_signals, mouse)
@@ -300,11 +367,17 @@ def main() -> None:
                    help="in headless mode, stop after this many frames")
     p.add_argument("--reset", action="store_true",
                    help="discard saved brain parameters and start fresh")
+    p.add_argument("--device", type=str, default=os.environ.get("LAMBDA_DEVICE", "cpu"),
+                   choices=["cpu", "cuda", "auto", "cpu-fast"],
+                   help="computation device: 'cpu' (default safe), 'cuda', 'auto', or 'cpu-fast'")
+    p.add_argument("--accel", action="store_true", default=bool(os.environ.get("LAMBDA_ACCEL")),
+                   help="enable maximum hardware acceleration (CUDA if available, else CPU)")
     args = p.parse_args()
     if args.headless and not args.steps:
         p.error("--headless requires --steps")
+    dev = "auto" if args.accel else args.device
     try:
-        run(headless=args.headless, steps=args.steps, reset=args.reset)
+        run(headless=args.headless, steps=args.steps, reset=args.reset, device=dev)
     except KeyboardInterrupt:
         pygame.quit()
 

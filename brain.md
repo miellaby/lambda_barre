@@ -136,11 +136,11 @@ Les 5 sorties sont squashed dans les plages valides des consignes :
 
 | Sortie | Transformation | Plage |
 |--------|----------------|-------|
-| limb_l_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
-| limb_l_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
-| limb_r_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
-| limb_r_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
-| tail_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
+| membre_avant_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
+| membre_avant_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
+| membre_arriere_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
+| membre_arriere_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
+| queue_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
 
 Ainsi toute action échantillonnée est une consigne valide pour la physique.
 

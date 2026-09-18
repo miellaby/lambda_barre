@@ -42,7 +42,7 @@ def _limb_measure(torso, foot, hip_local):
     ox = ol.x - hip_local[0]
     oy = ol.y - hip_local[1]
     d = math.hypot(ox, oy)
-    theta = math.atan2(-ox, oy)  # same convention as theta_star (torso-local)
+    theta = math.atan2(-ox, -oy)  # same convention as theta_star (torso-local)
     return theta, d
 
 
@@ -71,28 +71,28 @@ class Proprio:
 
     def update(self, skel: "B.Skeleton", dt: float) -> dict:
         """Compute the 11 egocentric signals. Call after the physics substeps."""
-        facing = -skel.facing
+        facing = skel.facing
         torso = skel.torso
 
         # --- limbs: which is front / back depends on facing ---
-        if facing == -1:
-            foot_front, hip_front = skel.foot_r, B.HIP_R
-            foot_back, hip_back = skel.foot_l, B.HIP_L
-            spring_front = skel.spring_r
-            spring_back = skel.spring_l
+        if facing == 1:
+            foot_front, hip_front, spring_front = skel.foot_r, B.HIP_R, skel.spring_r
+            foot_back, hip_back, spring_back = skel.foot_l, B.HIP_L, skel.spring_l
+            th_f_ego = -1.0  # foot_r: egocentric outward angle is -th
+            th_b_ego = +1.0  # foot_l: egocentric outward angle is +th
         else:
-            foot_front, hip_front = skel.foot_l, B.HIP_L
-            foot_back, hip_back = skel.foot_r, B.HIP_R
-            spring_front = skel.spring_l
-            spring_back = skel.spring_r
+            foot_front, hip_front, spring_front = skel.foot_l, B.HIP_L, skel.spring_l
+            foot_back, hip_back, spring_back = skel.foot_r, B.HIP_R, skel.spring_r
+            th_f_ego = +1.0  # foot_l: egocentric outward angle is +th
+            th_b_ego = -1.0  # foot_r: egocentric outward angle is -th
 
         th_f, d_f = _limb_measure(torso, foot_front, hip_front)
         th_b, d_b = _limb_measure(torso, foot_back, hip_back)
 
         # --- tail ---
         tail_rel = skel.tail.angle - torso.angle
-        tail_neutral = -facing * (math.pi / 2)
-        queue_angle = tail_rel - tail_neutral
+        tail_neutral = skel.facing * (math.pi / 2)
+        queue_angle = skel.facing * (tail_rel - tail_neutral)
 
         # --- head acceleration (finite difference, world frame) ---
         head = B.head_world(skel)
@@ -111,11 +111,11 @@ class Proprio:
         torque_tail = skel.tail_spring.impulse / sdt if sdt > 0 else 0.0
 
         return {
-            "tronc_angle": facing * torso.angle,
-            "membre_angle_avant": facing * th_f,
+            "tronc_angle": -facing * torso.angle,
+            "membre_angle_avant": th_f_ego * th_f,
             "membre_distance_avant": d_f,
             "force_actuateur_avant": f_spring_f,
-            "membre_angle_arriere": facing * th_b,
+            "membre_angle_arriere": th_b_ego * th_b,
             "membre_distance_arriere": d_b,
             "force_actuateur_arriere": f_spring_b,
             "queue_angle": queue_angle,
@@ -177,7 +177,7 @@ class Reward:
         # --- effort (power = force * velocity) ---
         # At rest (immobile), velocity = 0 → effort = 0, regardless of the
         # spring tension holding the body up.
-        if facing == -1:
+        if facing == 1:
             foot_front = skel.foot_r
             foot_back = skel.foot_l
         else:

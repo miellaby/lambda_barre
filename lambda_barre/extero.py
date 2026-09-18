@@ -462,8 +462,8 @@ class Touch:
         self._signals = {k: 0.0 for k in self._signals}
 
     def update(self, skel: "B.Skeleton", dt: float) -> dict:
-        facing = -skel.facing
-        if facing == -1:
+        facing = skel.facing
+        if facing == 1:
             foot_front = skel.foot_r
             foot_back = skel.foot_l
         else:

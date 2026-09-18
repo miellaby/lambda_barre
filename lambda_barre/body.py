@@ -177,6 +177,13 @@ class Skeleton:
     # hysteresis in apply_consignes; never recomputed from the sign of the angle.
     facing: int = 1
 
+    @property
+    def limb_front(self: Skeleton) -> LimbActuator:
+        return self.limb_r if self.facing == 1 else self.limb_l
+
+    @property
+    def limb_back(self: Skeleton) -> LimbActuator:
+        return self.limb_l if self.facing == 1 else self.limb_r
 
 def _add_limb(space, torso, hip_local, mass, radius, stiffness, damping):
     """Foot body + DampedSpring to torso. The spring anchor on the torso is
@@ -364,7 +371,7 @@ def apply_consignes(skel: Skeleton) -> None:
     elif skel.facing == -1 and skel.torso.angle < -FACING_DEADZONE:
         skel.facing = 1
     sgn = -skel.facing
-    skel.tail_spring.rest_angle = -sgn * (math.pi / 2) + skel.tail_act.theta_star
+    skel.tail_spring.rest_angle = -sgn * (math.pi / 2) + skel.facing * skel.tail_act.theta_star
     # front legs: instant angular servo toward facing direction
     front_base = -sgn * (math.pi / 2 - FRONT_REST)
     skel.front_l.angle = skel.torso.angle + front_base + sgn * 0.12

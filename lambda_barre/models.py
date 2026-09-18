@@ -31,71 +31,88 @@ import math
 import os
 
 
-def _configure_torch() -> None:
-    """Pick a portable CPU torch configuration.
+def configure_hardware(device_preference: str | None = None) -> tuple[torch.device, str]:
+    """Configure PyTorch execution backend and return (torch.device, description).
 
-    On some hosts (e.g. containers with an unusable /proc/cpuinfo) the oneDNN
-    (MKL-DNN) fused kernels raise SIGILL. This project is a single-machine,
-    CPU-only desktop pet, so we default to the portable "math" attention
-    backend with oneDNN disabled. Set ``LAMBDA_TORCH_MKLDNN=1`` to restore the
-    optimized kernels on machines known to support them.
+    Modes:
+      - 'cuda': Force CUDA GPU if available. Enables FlashSDP and MemEfficient SDP.
+      - 'auto': Use CUDA if available, otherwise safe CPU.
+      - 'cpu': Safe, portable CPU (default). Disables MKL-DNN to prevent SIGILL
+               crashes on VMs or hosts with incomplete cpuinfo flags.
+      - 'cpu-fast': Enable MKL-DNN on CPU if the host CPU is known to support it.
+
+    Controlled via argument, or LAMBDA_DEVICE env var ('cuda', 'cpu', 'auto'),
+    or LAMBDA_ACCEL=1 ('auto').
     """
-    if os.environ.get("LAMBDA_TORCH_MKLDNN"):
-        return
+    import os
     import torch
-    torch.set_num_threads(1)
+    torch.set_printoptions(precision=4, sci_mode=False, linewidth=200)
+
+    env_dev = os.environ.get("LAMBDA_DEVICE")
+    env_accel = os.environ.get("LAMBDA_ACCEL")
+    if device_preference is None:
+        if env_dev:
+            device_preference = env_dev.lower().strip()
+        elif env_accel and env_accel not in ("0", "false", "no"):
+            device_preference = "auto"
+        else:
+            device_preference = "cpu"
+
+    pref = device_preference.lower().strip()
+
+    if pref in ("cuda", "auto"):
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+            torch.backends.cudnn.benchmark = True
+            dev_name = torch.cuda.get_device_name(0)
+            return torch.device("cuda"), f"CUDA ({dev_name})"
+        elif pref == "cuda":
+            import warnings
+            warnings.warn("CUDA was requested but torch.cuda.is_available() is False. Falling back to safe CPU.")
+
+    if pref == "cpu-fast" or os.environ.get("LAMBDA_TORCH_MKLDNN"):
+        torch.set_num_threads(min(os.cpu_count() or 4, 8))
+        torch.backends.mkldnn.enabled = True
+        return torch.device("cpu"), "CPU (MKL-DNN accelerated)"
+
+    # Default: Safe, crash-free CPU (no MKL-DNN, math attention)
+    torch.set_num_threads(4)
     torch.backends.mkldnn.enabled = False
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
+    return torch.device("cpu"), "CPU (Safe/Portable)"
 
 
-_configure_torch()
+# Safe initialization
+_ACTIVE_DEVICE, _ACTIVE_DESC = configure_hardware()
 
 import torch
 import torch.nn as nn
 
-from .tokenize import (DENSE_DIM, N_SIGNAL, STATE_TOKENS, SALVE_TOKENS,
-                       TYPE_DIM, MOD_DIM, CANAL_DIM, N_POLICY_STATE,
-                       _LAYOUT, _prefix)
+from .tokenize import (_COST_IDX, _REWARD_IDX, DENSE_DIM, N_SIGNAL, STATE_TOKENS, SALVE_TOKENS,
+                       ACTION_TOKENS, TYPE_DIM, MOD_DIM, CANAL_DIM, N_POLICY_STATE,
+                       _LAYOUT, _prefix, _N_SIGNALS)
 
 
 # --- actuator consigne ranges (mirror body.py) -------------------------------
 LIMB_MIN = 10.0
 LIMB_MAX = 32.0
-THETA_RANGE = math.pi / 2.0   # limb / tail theta consignes in [-pi/2, +pi/2]
+THETA_RANGE = math.pi   # limb / tail theta consignes in [-pi, +pi]
 
 
-def build_salve_mask(L: int, device, salve_tokens: int = SALVE_TOKENS,
-                     state_tokens: int = STATE_TOKENS) -> torch.Tensor:
-    """Build the [L, L] float attention mask for a dense salve sequence.
-
-    A query token may attend to a key token if the key is in an earlier salve,
-    or in the same salve but of a different type (sensory vs motor) and not in
-    the future, or is itself. This is the "masque par salve dans le type":
-    when predicting a sensory token of salve i, the other sensory tokens of
-    salve i are masked (no peeking at the state being predicted), while the
-    full history remains visible. Self-attention is always allowed so no row
-    is fully blocked. Returns a float mask (0.0 = allowed, -inf = blocked).
+def build_salve_mask(
+    L: int,
+    device
+) -> torch.Tensor:
+    """Classical Transformer mask
     """
-    pos = torch.arange(L, device=device)
-    salve_id = pos // salve_tokens                 # [L] salve index per pos
-    is_sensory = (pos % salve_tokens) < state_tokens  # [L] bool
-    si_q = salve_id.unsqueeze(1)                     # [L, 1] query salve
-    si_k = salve_id.unsqueeze(0)                     # [1, L] key salve
-    earlier = si_k < si_q                            # [L, L] key salve < query
-    same = si_k == si_q
-    diff_type = is_sensory.unsqueeze(0) != is_sensory.unsqueeze(1)
-    k_idx = pos.unsqueeze(0)                         # [1, L]
-    q_idx = pos.unsqueeze(1)                         # [L, 1]
-    k_le_q = k_idx <= q_idx                          # [L, L] key not future
-    same_diff_causal = same & diff_type & k_le_q
-    self_eye = torch.eye(L, dtype=torch.bool, device=device)
-    visible = earlier | same_diff_causal | self_eye
-    mask = torch.zeros(L, L, device=device)
-    mask[~visible] = float("-inf")
-    return mask
-
+    return torch.triu(
+            torch.ones(L, L, dtype=torch.bool, device=device),
+            diagonal=1,
+        )    
 
 # =============================================================================
 # World model
@@ -130,10 +147,32 @@ class WorldModel(nn.Module):
                 for i in range(STATE_TOKENS)]
         self.register_buffer("state_template",
                              torch.tensor(tmpl, dtype=torch.float32))
-        # Hook on the n-1 transformer layer to capture the intermediate
-        # latent representation — the policy reads this instead of raw scalars.
+        # Fixed action template: 3 action tokens with their structural
+        # prefix and zeroed signal slots.
+        tmpl_act = [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
+                    for i in range(STATE_TOKENS, SALVE_TOKENS)]
+        self.register_buffer("action_template",
+                             torch.tensor(tmpl_act, dtype=torch.float32))
+
+        # Valid-signal masks to zero out padding slots in predicted tokens:
+        # Each token has _N_SIGNALS[i] valid signal dimensions out of 16.
+        # Slots >= _N_SIGNALS[i] must strictly remain 0.0 to prevent unpenalized
+        # logits from leaking into in_proj(x) during multi-step imagination.
+        s_mask = torch.zeros(STATE_TOKENS, N_SIGNAL, dtype=torch.float32)
+        for i in range(STATE_TOKENS):
+            s_mask[i, :_N_SIGNALS[i]] = 1.0
+        self.register_buffer("state_valid_mask", s_mask)
+
+        a_mask = torch.zeros(ACTION_TOKENS, N_SIGNAL, dtype=torch.float32)
+        for i in range(ACTION_TOKENS):
+            a_mask[i, :_N_SIGNALS[STATE_TOKENS + i]] = 1.0
+        self.register_buffer("action_valid_mask", a_mask)
+
+        # Hook on the middle transformer layer to capture the intermediate
+        # latent representation (layer index 1 for 3 layers) — the policy reads this.
         self._latent = None
-        self.transformer.layers[-2].register_forward_hook(self._capture_latent)
+        mid_layer = layers // 2
+        self.transformer.layers[mid_layer].register_forward_hook(self._capture_latent)
 
     def _capture_latent(self, module, input, output):
         self._latent = output  # [B, L, d_model]
@@ -177,16 +216,16 @@ class WorldModel(nn.Module):
         else:
             attn_mask = attn_mask.to(device)
         h = self.transformer(h, mask=attn_mask)
-        return self.head(h)                              # [B, L, 16]
+        # self.head produit les logits bruts, la sigmoid les transforme en [0,1]
+        return self.head(h)                   # [B, L, 16]
 
     @torch.no_grad()
-    def predict_next(self, ctx: torch.Tensor) -> torch.Tensor:
+    def predict_next_state(self, ctx: torch.Tensor) -> torch.Tensor:
         """One-shot (parallel) prediction of the next state's 13 tokens from
         the ``[state_t, action_t]`` context.
 
         Appends 13 zero-signal state placeholders, runs one forward pass under
-        the salve mask (each predicted sensory token attends to the context
-        only, not to its siblings), and reconstructs the full 25-dim tokens by
+        the causal mask, and reconstructs the full 25-dim tokens by
         combining the known structural prefix with the clamped [0,1] predicted
         signals. Returns [B, 13, 25]."""
         B = ctx.shape[0]
@@ -195,20 +234,62 @@ class WorldModel(nn.Module):
         placeholder = self.state_template.to(device).unsqueeze(0).expand(
             B, -1, -1)                                    # [B, 13, 25]
         x = torch.cat([ctx, placeholder], dim=1)         # [B, ctx+13, 25]
-        # Causal mask: the placeholder state tokens carry zero signals (nothing
-        # to leak), and the imagined-rollout context may grow by 13-token
-        # states (non-16-aligned), so the regular salve mask would mislabel
-        # positions. Plain causality is robust to any context length.
         L = x.shape[1]
         causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
         mask = torch.zeros(L, L, device=device)
         mask[~causal] = float("-inf")
         out = self.forward(x, attn_mask=mask)            # [B, L, 16]
-        pred = out[:, ctx_len:, :].clamp(0.0, 1.0)        # [B, 13, 16]
+        pred = out[:, ctx_len - 1 : ctx_len - 1 + STATE_TOKENS, :]
+        pred = pred.clamp(0.0, 1.0) * self.state_valid_mask.unsqueeze(0)
         full = self.state_template.to(device).unsqueeze(0).expand(
             B, -1, -1).clone()                            # [B, 13, 25]
         full[:, :, TYPE_DIM + MOD_DIM + CANAL_DIM:] = pred
         return full                                       # [B, 13, 25]
+
+    @torch.no_grad()
+    def predict_next(self, ctx: torch.Tensor) -> torch.Tensor:
+        """Alias for ``predict_next_state`` for backwards compatibility."""
+        return self.predict_next_state(ctx)
+
+    @torch.no_grad()
+    def predict_next_action(self, ctx: torch.Tensor) -> torch.Tensor:
+        """Autoregressive prediction of the 3 action tokens from a context
+        ending in state tokens (e.g. length = N * 16 + 13).
+
+        For each action token i in 0..2:
+          - appends placeholder i
+          - runs forward pass under causal mask
+          - reads prediction at position L-2 (predicting position L-1)
+          - clamps to [0, 1], zeroes unused signal slots, and constructs 25-dim token
+        Returns [B, 3, 25]."""
+        B = ctx.shape[0]
+        device = ctx.device
+        cur = ctx
+        pred_tokens = []
+        for i in range(ACTION_TOKENS):
+            ph = self.action_template[i:i + 1].to(device).unsqueeze(0).expand(
+                B, -1, -1)                                # [B, 1, 25]
+            x = torch.cat([cur, ph], dim=1)              # [B, cur_len+1, 25]
+            L = x.shape[1]
+            causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
+            mask = torch.zeros(L, L, device=device)
+            mask[~causal] = float("-inf")
+            out = self.forward(x, attn_mask=mask)        # [B, L, 16]
+            pred = out[:, -2, :].clamp(0.0, 1.0) * self.action_valid_mask[i]  # [B, 16]
+            tok = ph.clone()                             # [B, 1, 25]
+            tok[:, 0, TYPE_DIM + MOD_DIM + CANAL_DIM:] = pred
+            pred_tokens.append(tok)
+            cur = torch.cat([cur, tok], dim=1)
+        return torch.cat(pred_tokens, dim=1)             # [B, 3, 25]
+
+    @torch.no_grad()
+    def predict_next_salve(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict both next state (13 tokens) and next action (3 tokens).
+        Returns (state [B, 13, 25], action [B, 3, 25])."""
+        state = self.predict_next_state(ctx)
+        ctx_with_state = torch.cat([ctx, state], dim=1)
+        action = self.predict_next_action(ctx_with_state)
+        return state, action
 
 
 # =============================================================================
@@ -220,11 +301,8 @@ class Policy(nn.Module):
     with the 47 non-reward sensory scalars (normalized to [0,1]).
 
     Output means are squashed into valid consigne ranges:
-      limb theta / tail theta -> tanh * THETA_RANGE  in [-pi/2, pi/2]
+      limb theta / tail theta -> tanh * THETA_RANGE  in [-pi, pi]
       limb d                   -> LIMB_MIN + sigmoid*(LIMB_MAX-LIMB_MIN)
-
-    Exploration uses a fixed (decaying) std supplied by the caller. For imagined
-    rollouts and REINFORCE, the same Gaussian defines log_prob.
     """
 
     N_ACT = 5
@@ -248,13 +326,12 @@ class Policy(nn.Module):
 
     @staticmethod
     def _squash(raw: torch.Tensor) -> torch.Tensor:
-        # raw: [B, 5] -> consignes [B, 5]
-        theta_l = torch.tanh(raw[:, 0]) * THETA_RANGE
-        d_l = LIMB_MIN + torch.sigmoid(raw[:, 1]) * (LIMB_MAX - LIMB_MIN)
-        theta_r = torch.tanh(raw[:, 2]) * THETA_RANGE
-        d_r = LIMB_MIN + torch.sigmoid(raw[:, 3]) * (LIMB_MAX - LIMB_MIN)
-        tail = torch.tanh(raw[:, 4]) * THETA_RANGE
-        return torch.stack([theta_l, d_l, theta_r, d_r, tail], dim=1)
+        theta_front = torch.tanh(raw[:, 0])
+        d_front = torch.sigmoid(raw[:, 1])
+        theta_back = torch.tanh(raw[:, 2])
+        d_back = torch.sigmoid(raw[:, 3])
+        tail = torch.tanh(raw[:, 4])
+        return torch.stack([theta_front, d_front, theta_back, d_back, tail], dim=1)
 
     def sample(self, state_vec: torch.Tensor, std: float):
         """Sample an action and return (action [B,5], pre-squash raw [B,5]).
@@ -264,13 +341,11 @@ class Policy(nn.Module):
         distribution (a standard simplification: we optimize in raw space)."""
         h = self.net(state_vec)
         raw_mean = self.mean_head(h)             # [B, 5]
+        # print("raw[:,1]", raw_mean[:, 1])
+        # print("raw[:,3]", raw_mean[:, 3])
+        # print("sigmoid", torch.sigmoid(raw_mean[:, [1, 3]]))
+        # print("action", self._squash(raw_mean)[:, [1, 3]])
         dist = torch.distributions.Normal(raw_mean, std)
         raw = dist.rsample()
         action = self._squash(raw)
         return action, raw, raw_mean
-
-    def log_prob(self, raw: torch.Tensor, raw_mean: torch.Tensor, std: float) -> torch.Tensor:
-        """log p(raw | mean) under the isotropic Gaussian, summed over the 5
-        dims. Returns [B]."""
-        dist = torch.distributions.Normal(raw_mean, std)
-        return dist.log_prob(raw).sum(dim=-1)

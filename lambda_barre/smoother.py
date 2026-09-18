@@ -21,8 +21,8 @@ TAU = 1.0 / 3.0
 
 # Keys of all sensor signals that get smoothed (everything except actions,
 # which are read directly from the skeleton at tick time).
-_ACTION_KEYS = {"limb_l_theta", "limb_l_d", "limb_r_theta", "limb_r_d",
-                "tail_theta"}
+_ACTION_KEYS = {"membre_avant_theta", "membre_avant_d", "membre_arriere_theta", "membre_arriere_d",
+                "queue_theta"}
 _SENSOR_KEYS = [k for k in _BY_KEY if k not in _ACTION_KEYS]
 
 
@@ -37,6 +37,15 @@ class Smoother:
     def reset(self) -> None:
         for k in self._state:
             self._state[k] = 0.0
+
+    def reinit(self, proprio: dict, touch: dict, cursor: dict,
+               vision: dict, intero: dict, reward: dict) -> None:
+        """Immediately overwrite all filter states with the new sensor snapshot
+        without EMA blending (used when a discrete reference-frame flip occurs)."""
+        for k in _SENSOR_KEYS:
+            raw = self._lookup(k, proprio, touch, cursor, vision, intero, reward)
+            if raw is not None:
+                self._state[k] = raw
 
     def update(self, proprio: dict, touch: dict, cursor: dict,
                vision: dict, intero: dict, reward: dict, dt: float) -> None:
