@@ -221,30 +221,23 @@ class WorldModel(nn.Module):
 
     @torch.no_grad()
     def predict_next_state(self, ctx: torch.Tensor) -> torch.Tensor:
-        """One-shot (parallel) prediction of the next state's 13 tokens from
-        the ``[state_t, action_t]`` context.
+        """Autoregressive prediction of the next state's 13 tokens.
 
-        Appends 13 zero-signal state placeholders, runs one forward pass under
-        the causal mask, and reconstructs the full 25-dim tokens by
-        combining the known structural prefix with the clamped [0,1] predicted
-        signals. Returns [B, 13, 25]."""
+        Sequentially generates tokens 0..12, feeding each predicted token
+        back into the context with its known structural prefix and valid signal slots.
+        Returns [B, 13, 25]."""
         B = ctx.shape[0]
         device = ctx.device
-        ctx_len = ctx.shape[1]
-        placeholder = self.state_template.to(device).unsqueeze(0).expand(
-            B, -1, -1)                                    # [B, 13, 25]
-        x = torch.cat([ctx, placeholder], dim=1)         # [B, ctx+13, 25]
-        L = x.shape[1]
-        causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
-        mask = torch.zeros(L, L, device=device)
-        mask[~causal] = float("-inf")
-        out = self.forward(x, attn_mask=mask)            # [B, L, 16]
-        pred = out[:, ctx_len - 1 : ctx_len - 1 + STATE_TOKENS, :]
-        pred = pred.clamp(0.0, 1.0) * self.state_valid_mask.unsqueeze(0)
-        full = self.state_template.to(device).unsqueeze(0).expand(
-            B, -1, -1).clone()                            # [B, 13, 25]
-        full[:, :, TYPE_DIM + MOD_DIM + CANAL_DIM:] = pred
-        return full                                       # [B, 13, 25]
+        curr = ctx
+        preds = []
+        for i in range(STATE_TOKENS):
+            out = self.forward(curr)
+            sig = out[:, -1, :].clamp(0.0, 1.0) * self.state_valid_mask[i].to(device)
+            tok = self.state_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
+            tok[:, TYPE_DIM + MOD_DIM + CANAL_DIM:] = sig
+            preds.append(tok)
+            curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
+        return torch.stack(preds, dim=1)
 
     @torch.no_grad()
     def predict_next(self, ctx: torch.Tensor) -> torch.Tensor:
@@ -254,33 +247,23 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def predict_next_action(self, ctx: torch.Tensor) -> torch.Tensor:
         """Autoregressive prediction of the 3 action tokens from a context
-        ending in state tokens (e.g. length = N * 16 + 13).
+        ending in state tokens.
 
-        For each action token i in 0..2:
-          - appends placeholder i
-          - runs forward pass under causal mask
-          - reads prediction at position L-2 (predicting position L-1)
-          - clamps to [0, 1], zeroes unused signal slots, and constructs 25-dim token
+        Sequentially generates action tokens 0..2, feeding each predicted token
+        back into the context with its known structural prefix and valid signal slots.
         Returns [B, 3, 25]."""
         B = ctx.shape[0]
         device = ctx.device
-        cur = ctx
-        pred_tokens = []
+        curr = ctx
+        preds = []
         for i in range(ACTION_TOKENS):
-            ph = self.action_template[i:i + 1].to(device).unsqueeze(0).expand(
-                B, -1, -1)                                # [B, 1, 25]
-            x = torch.cat([cur, ph], dim=1)              # [B, cur_len+1, 25]
-            L = x.shape[1]
-            causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
-            mask = torch.zeros(L, L, device=device)
-            mask[~causal] = float("-inf")
-            out = self.forward(x, attn_mask=mask)        # [B, L, 16]
-            pred = out[:, -2, :].clamp(0.0, 1.0) * self.action_valid_mask[i]  # [B, 16]
-            tok = ph.clone()                             # [B, 1, 25]
-            tok[:, 0, TYPE_DIM + MOD_DIM + CANAL_DIM:] = pred
-            pred_tokens.append(tok)
-            cur = torch.cat([cur, tok], dim=1)
-        return torch.cat(pred_tokens, dim=1)             # [B, 3, 25]
+            out = self.forward(curr)
+            sig = out[:, -1, :].clamp(0.0, 1.0) * self.action_valid_mask[i].to(device)
+            tok = self.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
+            tok[:, TYPE_DIM + MOD_DIM + CANAL_DIM:] = sig
+            preds.append(tok)
+            curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
+        return torch.stack(preds, dim=1)
 
     @torch.no_grad()
     def predict_next_salve(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

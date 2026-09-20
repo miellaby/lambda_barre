@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import bisect
 import itertools
+import math
 import os
 import random
 import time
@@ -32,6 +33,7 @@ from collections import deque
 import torch
 
 from . import models as M
+from .dream import DreamStep, DreamTrajectory, DreamRecord, REGIME_NAMES
 from .models import build_salve_mask
 from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
@@ -44,6 +46,8 @@ from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
 # [s0, a0, s1, a1, ..., a_{N-1}, sN] = (state + action) * N + state tokens.
 SEQ_STEPS = 10
 _SEQ_LEN = SEQ_STEPS * SALVE_TOKENS + STATE_TOKENS          # 173
+_N_CTX = 4                                                 # 4 real transitions used as context (s0..s3, a0..a3, s4)
+_EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
 # trajectory-cost: 5 unsigned cost signals (token 11) + 1 signed confort
@@ -118,8 +122,8 @@ class ExperienceBuffer:
         forgetting on short wake sessions.
     """
 
-    def __init__(self, seq_len: int = SEQ_STEPS + 1, capacity: int = 1000,
-                 pool_capacity: int = 1000, seed: int = 0):
+    def __init__(self, seq_len: int = SEQ_STEPS + 1, capacity: int = 100_000,
+                 pool_capacity: int = 100_000, seed: int = 0):
         self.seq_len = seq_len
         self.capacity = capacity
         self.pool_capacity = pool_capacity
@@ -181,7 +185,7 @@ class ExperienceBuffer:
         """Alias for boundary()."""
         self.boundary()
 
-    def consolidate(self, stride: int = 2) -> int:
+    def consolidate(self, stride: int = 1) -> int:
         """Extract sequences of length ``seq_len`` from all valid segments
         in the session journal and append them to the persistent replay pool.
         Clears the extracted session segments from the journal so they are not re-processed.
@@ -213,6 +217,24 @@ class ExperienceBuffer:
         """Discard all session segments AND the persistent replay pool."""
         self.clear_journal()
         self._persistent_pool.clear()
+
+    def save(self, path: str) -> None:
+        """Save the persistent replay pool and active segments to disk."""
+        torch.save({
+            "persistent_pool": list(self._persistent_pool),
+            "segments": list(self._segments),
+            "current": self._current,
+        }, path)
+
+    def load(self, path: str) -> bool:
+        """Load persistent replay pool and segments from disk. Returns True if loaded."""
+        if os.path.exists(path):
+            data = torch.load(path, weights_only=False)
+            self._persistent_pool = deque(data.get("persistent_pool", []), maxlen=self.pool_capacity)
+            self._segments = deque(data.get("segments", []))
+            self._current = data.get("current", [])
+            return True
+        return False
 
     def _enforce_capacity(self) -> None:
         """Ensure total extractable sequences in the session journal do not exceed ``capacity``."""
@@ -276,7 +298,7 @@ class Brain:
         brain.sleep()                 # on demand: offline training of both models
     """
 
-    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 1e-3, act_std: float = 0.05,
+    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 2e-4, act_std: float = 0.05,
                  explore_std: float = 0.2, device: str | None = None, seed: int = 0):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
@@ -290,7 +312,7 @@ class Brain:
         self.opt_wm = torch.optim.Adam(self.world.parameters(), lr=lr_wm)
         self.opt_pol = torch.optim.Adam(
             list(self.policy.parameters()) + list(self.latent_norm.parameters()),
-            lr=lr_pol)
+            lr=lr_pol, weight_decay=1e-4)
         self.buffer = ExperienceBuffer(seq_len=SEQ_STEPS + 1, seed=seed)
         self.mask = _MASK.to(self.device)
         self.target_valid = _target_valid.to(self.device)
@@ -312,6 +334,7 @@ class Brain:
         self._act_min = torch.where(self._act_signed, -1.0, 0.0).to(self.device)
         self._act_max = torch.tensor(1.0, device=self.device)
         self._act_tmpl = _ACT_TEMPLATE.to(self.device)
+        self._kalman_max_v = torch.tensor([0.20, 0.15, 0.20, 0.15, 0.20], device=self.device)
         # Rolling history of recent (state_tokens, action_tokens) for the
         # wake-time world model context. The policy reads the world model's
         # intermediate latent, which needs the last SEQ_STEPS-1 transitions.
@@ -321,6 +344,9 @@ class Brain:
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
         self.last_pol_loss = float("nan")
+        self.last_dream_record: DreamRecord | None = None
+        self.sleep_wm_epochs = 0
+        self.sleep_wm_step = 0
         self.mode = "wake"
         # inference timing (exponential moving average, ms)
         self._wm_time = 0.0
@@ -348,17 +374,23 @@ class Brain:
                          device=self.device).unsqueeze(0))   # [1, 47]
         # update history with this transition's state + action
         self._wake_history.append((cur_state, a_toks))
-        if len(self._wake_history) > SEQ_STEPS - 1:
+        if len(self._wake_history) > _N_CTX:
             self._wake_history.pop(0)
 
     @torch.no_grad()
     def act(self, salve, std=None) -> tuple[float, float, float, float, float]:
-        """Return 5 actuator consignes. Reuses the cached latent from the
-        last wake_tick(). If no latent yet (first tick), runs a fallback forward."""
+        """Return 5 actuator consignes. Uses fresh scalar sensory readings
+        from ``salve`` directly and reuses the cached latent from the last
+        wake_tick(). If no latent yet (first tick), runs a fallback forward."""
         if self._cached_latent is None:
-            self.wake_tick(salve)   # has to run wm at least one
+            self.wake_tick(salve)   # has to run wm at least once
         t0 = time.perf_counter()
-        pol_in = torch.cat([self._cached_scalars, self._cached_latent], dim=1)
+        cur_state = state_tokens(salve)
+        cur_state_t = torch.tensor(cur_state, dtype=torch.float32,
+                                   device=self.device).unsqueeze(0)
+        cur_scalars = self._policy_scalars_batch(cur_state_t)
+        self._cached_scalars = cur_scalars
+        pol_in = torch.cat([cur_scalars, self._cached_latent], dim=1)
         action, _, _ = self.policy.sample(pol_in, self.act_std if std is None else std)
         self._pol_time = (1 - self._time_alpha) * self._pol_time \
             + self._time_alpha * (time.perf_counter() - t0) * 1000
@@ -398,6 +430,34 @@ class Brain:
             cur_state, dtype=torch.float32, device=self.device)
         return ctx
 
+    def _refresh_wake_latent(self) -> None:
+        """Recompute _cached_latent and _cached_scalars from _wake_history with
+        the current world model weights (e.g. after sleep training), preventing
+        wake shock from obsolete pre-sleep latents."""
+        if not self._wake_history:
+            return
+        cur_state = self._wake_history[-1][0]
+        n = len(self._wake_history) - 1
+        ctx_len = n * SALVE_TOKENS + STATE_TOKENS
+        ctx = torch.zeros(1, ctx_len, DENSE_DIM, device=self.device)
+        pos = 0
+        for s_toks, a_toks in self._wake_history[:-1]:
+            ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
+                s_toks, dtype=torch.float32, device=self.device)
+            pos += STATE_TOKENS
+            ctx[0, pos:pos + ACTION_TOKENS] = torch.tensor(
+                a_toks, dtype=torch.float32, device=self.device)
+            pos += ACTION_TOKENS
+        ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
+            cur_state, dtype=torch.float32, device=self.device)
+        self.world.eval()
+        with torch.no_grad():
+            self.world(ctx)
+            self._cached_latent = self.latent_norm(self.world.last_latent())
+            self._cached_scalars = self._policy_scalars_batch(
+                torch.tensor(cur_state, dtype=torch.float32,
+                             device=self.device).unsqueeze(0))
+
     # --- sleep: world model training ----------------------------------------
     def _batch_tensors(self, sequences):
         """Build a [B, L, 25] tensor for a batch of multi-step transition
@@ -423,7 +483,7 @@ class Brain:
             assert pos == _SEQ_LEN, f"Expected pos={_SEQ_LEN}, got {pos}"
         return vals
 
-    def train_world(self, epochs: int = 4, batch: int = 32):
+    def train_world(self, epochs: int = 512, batch: int = 32):
         """Train the world model. Generator: yields (label, value) after each
         epoch."""
         if len(self.buffer) < 1:
@@ -431,6 +491,7 @@ class Brain:
         self.world.train()
         losses = []
         for ep in range(epochs):
+            self.sleep_wm_step = ep + 1
             sequences = self.buffer.sample(batch)
             if not sequences:
                 break
@@ -510,6 +571,16 @@ class Brain:
 
         return toks
 
+    def _decode_action_batch(self, act_toks: torch.Tensor) -> torch.Tensor:
+        """Vectorized action token decoding: [B, 3, 25] -> [B, 5] in model action space.
+        Signed consignes: [-1, +1]
+        Unsigned consignes: [0, 1]
+        """
+        if act_toks.dim() == 2:
+            act_toks = act_toks.unsqueeze(0)
+        norm = act_toks[:, self._act_tok, SIG_OFFSET + self._act_slot]
+        return torch.where(self._act_signed, 2.0 * norm - 1.0, norm)
+
     def _random_action_batch(self, B: int, device: torch.device) -> torch.Tensor:
         action = torch.rand(
             B,
@@ -534,7 +605,7 @@ class Brain:
         return torch.clamp(base_action + noise, self._act_min, self._act_max)
 
     # --- sleep: policy training via real context + imagined rollout ----------
-    def train_policy(self, steps: int = 64, batch: int = 4,
+    def train_policy(self, steps: int = 16, batch: int = 32,
                      gamma: float = 0.9, n_imagine: int = 6):
         """Policy training via candidate evaluation in WM imagination.
         Generator: yields (label, value) after each step."""
@@ -542,10 +613,10 @@ class Brain:
             return
         self.world.eval()
         self.policy.train()
-        n_ctx = 4  # real transitions used as context (s0..s3, a0..a3, s4)
+        n_ctx = _N_CTX  # real transitions used as context (s0..s3, a0..a3, s4)
         # n_imagine = 6 steps: 2.0s forward horizon at 3 Hz
         losses = []
-        for _ in range(steps):
+        for step in range(steps):
             sequences = self.buffer.sample(batch)
             if not sequences:
                 break
@@ -619,60 +690,197 @@ class Brain:
                 dim=1,
             )  # [B, 4, 5]
 
-            # 4. evaluate every candidate with the world model
+            # Decode past actions a2 and a3 from the context for trajectory extrapolation:
+            # salve 2 action is at tokens 45..47 (index 2 * 16 + 13)
+            # salve 3 action is at tokens 61..63 (index 3 * 16 + 13)
+            past_a2 = self._decode_action_batch(ctx[:, 45:48, :])
+            past_a3 = self._decode_action_batch(ctx[:, 61:64, :])
+
+            # 4. evaluate every candidate with 3 futures under Bellman optimism
             candidate_costs = []
+            dream_cand_trajs = [{} for _ in range(4)]
+            s4_toks = ctx[0, n_ctx * 16 : n_ctx * 16 + 13].tolist()
+
             for candidate_idx in range(4):
                 action = candidates[:, candidate_idx, :]
                 action_toks = self._encode_action_batch(action)
-                # Start from the real context and append candidate a4
-                candidate_ctx = torch.cat([ctx, action_toks], dim=1)
-                total_cost = torch.zeros(B, device=device)
-                for k in range(n_imagine):
-                    with torch.no_grad():
-                        gen = self.world.predict_next_state(candidate_ctx)
-                    step_cost = self._salve_cost_batch(gen)
-                    total_cost = total_cost + (gamma ** k) * step_cost
-                    if k < n_imagine - 1:
-                        # World Model predicts the next motor reaction a_{k+1}
-                        with torch.no_grad():
-                            ctx_with_s = torch.cat([candidate_ctx, gen], dim=1)
-                            pred_action_toks = self.world.predict_next_action(ctx_with_s)
-                        candidate_ctx = torch.cat([ctx_with_s, pred_action_toks], dim=1)
 
-                candidate_costs.append(total_cost)
+                # Step 0: candidate a4 acts on s4 -> predicts s5
+                cand_ctx_0 = torch.cat([ctx, action_toks], dim=1)
+                with torch.no_grad():
+                    s5 = self.world.predict_next_state(cand_ctx_0)
+                c0 = self._salve_cost_batch(s5)
+                ctx_s5 = torch.cat([cand_ctx_0, s5], dim=1)
+
+                if n_imagine <= 1:
+                    candidate_costs.append(c0)
+                    continue
+
+                cand_a = action[0].tolist()
+                c0_val = c0[0].item()
+                s5_toks = s5[0].tolist()
+
+                # Future 1: Kalman / inertia extrapolation from (a2, a3, a4)
+                # Damped velocity clamped to physical limits to prevent quadrant-flipping rotations
+                cur_ctx = ctx_s5
+                v = 0.7 * (action - past_a3) + 0.3 * (past_a3 - past_a2)
+                v = torch.clamp(v, -self._kalman_max_v, self._kalman_max_v)
+                cur_a = action.clone()
+                cost_kalman = c0.clone()
+                cur_state_toks = s5_toks
+                cur_cost_val = c0_val
+                f1_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
+                for k in range(1, n_imagine):
+                    cur_a = torch.clamp(cur_a + v, self._act_min, self._act_max)
+                    v = v * 0.8
+                    next_a_toks = self._encode_action_batch(cur_a)
+                    cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
+                    with torch.no_grad():
+                        gen = self.world.predict_next_state(cand_ctx)
+                    sc = self._salve_cost_batch(gen)
+                    cost_kalman = cost_kalman + (gamma ** k) * sc
+                    f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=cur_a[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
+                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    cur_state_toks = gen[0].tolist()
+                    cur_cost_val = sc[0].item()
+                f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
+                dream_cand_trajs[candidate_idx][0] = {"steps": f1_steps, "cost": cost_kalman[0].item()}
+
+                # Future 2: World Model autoregressive continuation
+                cur_ctx = ctx_s5
+                cost_wm = c0.clone()
+                cur_state_toks = s5_toks
+                cur_cost_val = c0_val
+                f2_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
+                for k in range(1, n_imagine):
+                    with torch.no_grad():
+                        next_a_toks = self.world.predict_next_action(cur_ctx)
+                        cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
+                        gen = self.world.predict_next_state(cand_ctx)
+                    sc = self._salve_cost_batch(gen)
+                    cost_wm = cost_wm + (gamma ** k) * sc
+                    a_dec = self._decode_action_batch(next_a_toks)[0].tolist()
+                    f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=a_dec, step_cost=cur_cost_val, label=f"s{4+k}"))
+                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    cur_state_toks = gen[0].tolist()
+                    cur_cost_val = sc[0].item()
+                f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
+                dream_cand_trajs[candidate_idx][1] = {"steps": f2_steps, "cost": cost_wm[0].item()}
+
+                # Future 3: Policy closed-loop reaction
+                # Uses a sliding window of the last n_ctx transitions (77 tokens) with salve-within-type
+                # attention mask, matching live wake_tick and avoiding out-of-distribution latents.
+                cur_ctx = ctx_s5
+                cur_state = s5
+                cur_state_toks = s5_toks
+                cur_cost_val = c0_val
+                cost_pol = c0.clone()
+                f3_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
+                for k in range(1, n_imagine):
+                    with torch.no_grad():
+                        slide_ctx = cur_ctx[:, -ctx_len:]
+                        self.world(slide_ctx, attn_mask=ctx_mask)
+                        next_latent = self.latent_norm(self.world.last_latent().detach())
+                        next_scalars = self._policy_scalars_batch(cur_state)
+                        next_pol_in = torch.cat([next_scalars, next_latent], dim=1)
+                        next_action = self.policy(next_pol_in)
+                        next_a_toks = self._encode_action_batch(next_action)
+                        cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
+                        gen = self.world.predict_next_state(cand_ctx)
+                    sc = self._salve_cost_batch(gen)
+                    cost_pol = cost_pol + (gamma ** k) * sc
+                    f3_steps.append(DreamStep(state_tokens=cur_state_toks, action=next_action[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
+                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    cur_state = gen
+                    cur_state_toks = gen[0].tolist()
+                    cur_cost_val = sc[0].item()
+                f3_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
+                dream_cand_trajs[candidate_idx][2] = {"steps": f3_steps, "cost": cost_pol[0].item()}
+
+                # Bellman optimism: optimistic minimum across the 3 futures
+                cand_cost = torch.minimum(torch.minimum(cost_kalman, cost_wm), cost_pol)
+                candidate_costs.append(cand_cost)
+
             # [B, 4]
             candidate_costs = torch.stack(candidate_costs, dim=1)
 
-            # 5. select the best action with 2% minimal improvement margin.
-            #    Exploratory candidates (2 and 3) must beat the baseline
-            #    min(policy, demonstrated) by at least 2% to overcome
-            #    world model extrapolation uncertainty / hallucinations.
-            cost_baseline = torch.minimum(candidate_costs[:, 0], candidate_costs[:, 1])
-            margin = 0.02 * cost_baseline.abs().clamp(min=1.0)
-            effective_costs = candidate_costs.clone()
-            effective_costs[:, 2:] += margin.unsqueeze(1)
-
-            best_idx = effective_costs.argmin(dim=1)
+            # 5. Select the best action
+            cost_baseline = candidate_costs[:, 0:1]  # [B, 1]
+            margin = _EXPLORE_MARGIN_PCT * cost_baseline.abs().clamp(min=1.0)  # [B, 1]
+            adjusted_costs = candidate_costs.clone()
+            adjusted_costs[:, 1:] += margin
+            best_idx = adjusted_costs.argmin(dim=1)
             batch_idx = torch.arange(B, device=device)
             best_action = candidates[batch_idx, best_idx].detach()  # [B, 5]
 
             # 6. Supervised learning
             #    The action selected by the WM becomes the target.
-            #    Re-run the policy without no_grad
-            #    so that the loss propagates through the policy.
+            #    Re-run the policy without no_grad so that loss propagates.
             pred_action = self.policy(pol_in)
             loss = torch.nn.functional.mse_loss(pred_action, best_action)
+
             self.opt_pol.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.opt_pol.step()
+
+            # Build DreamRecord for visualization (sample 0)
+            if B > 0 and n_imagine > 1:
+                context_steps = []
+                for s_i in range(n_ctx):
+                    s_tokens = ctx[0, s_i * 16 : s_i * 16 + 13].tolist()
+                    a_vals = self._decode_action_batch(ctx[0:1, s_i * 16 + 13 : (s_i + 1) * 16])[0].tolist()
+                    context_steps.append(DreamStep(
+                        state_tokens=s_tokens,
+                        action=a_vals,
+                        label=f"s{s_i}+a{s_i}"
+                    ))
+                context_steps.append(DreamStep(
+                    state_tokens=s4_toks,
+                    action=None,
+                    label="s4 (decision)"
+                ))
+
+                all_trajs = []
+                best_futures_per_cand = []
+                win_cand = int(best_idx[0].item())
+                for c_idx in range(4):
+                    c_costs = [dream_cand_trajs[c_idx][f]["cost"] for f in range(3)]
+                    b_f_idx = int(torch.tensor(c_costs).argmin().item())
+                    best_futures_per_cand.append(b_f_idx)
+                    for f_idx in range(3):
+                        traj_info = dream_cand_trajs[c_idx][f_idx]
+                        is_b = (f_idx == b_f_idx)
+                        is_w = (c_idx == win_cand and is_b)
+                        all_trajs.append(DreamTrajectory(
+                            candidate_idx=c_idx,
+                            regime_idx=f_idx,
+                            regime_name=REGIME_NAMES[f_idx],
+                            steps=traj_info["steps"],
+                            total_cost=traj_info["cost"],
+                            is_best_future=is_b,
+                            is_winner=is_w,
+                        ))
+
+                self.last_dream_record = DreamRecord(
+                    step_idx=step,
+                    total_steps=steps,
+                    loss=loss.item(),
+                    facing=1,
+                    context_steps=context_steps,
+                    candidate_actions=[candidates[0, c].tolist() for c in range(4)],
+                    trajectories=all_trajs,
+                    best_candidate_idx=win_cand,
+                    best_future_indices=best_futures_per_cand,
+                )
+
             losses.append(loss.item())
             yield "pol", loss.item()
         self.last_pol_loss = sum(losses) / len(losses) if losses else float("nan")
 
     # --- sleep entry point ---------------------------------------------------
     def sleep(self, wm_epochs: int = 128, wm_batch: int = 64,
-              pol_steps: int = 32, pol_batch: int = 32,
+              pol_steps: int = 64, pol_batch: int = 32,
               pol_n_imagine: int = 6, clear_buffer: bool = True):
         """One full sleep cycle. Generator: yields (phase, value) after each
         training step so the caller can keep the UI responsive.
@@ -681,19 +889,23 @@ class Brain:
         before training, ensuring recent experience is rehearsed alongside
         historical experience without catastrophic forgetting."""
         self.mode = "sleep"
+        self.last_dream_record = None
         self.buffer.consolidate()
+
+        self.sleep_wm_epochs = wm_epochs
+        self.sleep_wm_step = 0
+
         for label, value in self.train_world(wm_epochs, wm_batch):
             yield label, value
         for label, value in self.train_policy(pol_steps, pol_batch, n_imagine=pol_n_imagine):
             yield label, value
+        # Refresh wake latent with newly trained WM weights to avoid wake shock
+        self._refresh_wake_latent()
         self.mode = "wake"
         stats = {
             "wm_loss": self.last_wm_loss,
             "pol_loss": self.last_pol_loss,
-            "buffer": len(self.buffer),
         }
-        if clear_buffer:
-            self.buffer.clear_journal()
         yield "done", stats
 
     # --- persistence ---------------------------------------------------------
@@ -709,8 +921,8 @@ class Brain:
         if "policy" in sd:
             self.policy.load_state_dict(sd["policy"])
 
-    def save_checkpoint(self, wm_path: str, pol_path: str) -> None:
-        """Save world model and policy to separate files."""
+    def save_checkpoint(self, wm_path: str, pol_path: str, buf_path: str | None = None) -> None:
+        """Save world model, policy, and optionally the experience buffer to disk."""
         torch.save({
             "world": self.world.state_dict(),
             "opt_wm": self.opt_wm.state_dict(),
@@ -720,10 +932,12 @@ class Brain:
             "latent_norm": self.latent_norm.state_dict(),
             "opt_pol": self.opt_pol.state_dict(),
         }, pol_path)
+        if buf_path:
+            self.buffer.save(buf_path)
 
-    def load_checkpoint(self, wm_path: str, pol_path: str) -> None:
-        """Load world model and policy from separate files. Each is loaded
-        independently — a mismatch in one does not affect the other."""
+    def load_checkpoint(self, wm_path: str, pol_path: str, buf_path: str | None = None) -> None:
+        """Load world model, policy, and optionally the experience buffer from disk.
+        Each is loaded independently — a mismatch in one does not affect the others."""
         if os.path.exists(wm_path):
             sd = torch.load(wm_path, map_location=self.device, weights_only=True)
             if "world" in sd:
@@ -738,3 +952,5 @@ class Brain:
                 self.latent_norm.load_state_dict(sd["latent_norm"])
             if "opt_pol" in sd:
                 self.opt_pol.load_state_dict(sd["opt_pol"])
+        if buf_path and os.path.exists(buf_path):
+            self.buffer.load(buf_path)

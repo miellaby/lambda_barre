@@ -154,7 +154,7 @@ def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True) -> None:
 
 # (2-letter code, dict key, scale, description) — scale maps value to [-1, +1]
 _PROPRIO_SPECS = [
-    ("TA", "tronc_angle",              math.radians(45), "tronc angle (inclinaison, + = penche avant)"),
+    ("TA", "tronc_angle",              math.pi,          "tronc angle (inclinaison, + = penche avant)"),
     ("AA", "membre_angle_avant",       math.pi,          "angle patte avant (+ = pied vers avant)"),
     ("DA", "membre_distance_avant",    32.0,             "distance patte avant (longueur de patte)"),
     ("FA", "force_actuateur_avant",    2000.0,           "force actuateur patte avant (effort musculaire)"),

@@ -91,7 +91,7 @@ class Proprio:
 
         # --- tail ---
         tail_rel = skel.tail.angle - torso.angle
-        tail_neutral = skel.facing * (math.pi / 2)
+        tail_neutral = -skel.facing * (math.pi / 2)
         queue_angle = skel.facing * (tail_rel - tail_neutral)
 
         # --- head acceleration (finite difference, world frame) ---
@@ -110,8 +110,17 @@ class Proprio:
         f_spring_b = spring_back.impulse / sdt if sdt > 0 else 0.0
         torque_tail = skel.tail_spring.impulse / sdt if sdt > 0 else 0.0
 
+        # Egocentric torso tilt: + = leaning forward.
+        # Expressed in [-15°, 345°] (matching the 15° facing switch limit)
+        raw_angle = -facing * torso.angle
+        two_pi = 2.0 * math.pi
+        t_min = -math.radians(15.0)
+        t_max = math.radians(345.0)
+        tronc_angle = (raw_angle - t_min) % two_pi + t_min
+        if tronc_angle > t_max - math.radians(5.0) and (raw_angle - t_min) < 0 and (raw_angle - t_min) > -math.radians(30.0):
+            tronc_angle = t_min
         return {
-            "tronc_angle": -facing * torso.angle,
+            "tronc_angle": tronc_angle,
             "membre_angle_avant": th_f_ego * th_f,
             "membre_distance_avant": d_f,
             "force_actuateur_avant": f_spring_f,

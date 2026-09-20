@@ -61,7 +61,7 @@ def _build_specs() -> dict[str, TokenSpec]:
         specs[key] = TokenSpec(key, code, max_val, signed, min_val)
 
     # Proprioception (11)
-    add("tronc_angle",              "TA", math.radians(45), True)
+    add("tronc_angle",              "TA", math.radians(345.0), False, -math.radians(15.0))
     add("membre_angle_avant",       "AA", math.pi,          True)
     add("membre_distance_avant",    "DA", LIMB_MAX,         False)
     add("force_actuateur_avant",    "FA", 2000.0,           True)

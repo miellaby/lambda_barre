@@ -156,22 +156,25 @@ class Skeleton:
     limb_r: LimbActuator = field(default_factory=LimbActuator)
     tail_act: TailActuator = field(default_factory=TailActuator)
 
-    # initial spawn pose, used by reset
-    spawn: tuple[float, float] = (0.0, 64.0)
-    spawn_foot_l: tuple[float, float] = (0.0, 0.0)
-    spawn_foot_r: tuple[float, float] = (0.0, 0.0)
-    spawn_tail: tuple[float, float] = (0.0, 0.0)
-    spawn_tail_angle: float = 0.0
-    spawn_ear_l: tuple[float, float] = (0.0, 0.0)
-    spawn_ear_l_angle: float = 0.0
-    spawn_ear_r: tuple[float, float] = (0.0, 0.0)
-    spawn_ear_r_angle: float = 0.0
-    spawn_front_l: tuple[float, float] = (0.0, 0.0)
-    spawn_front_l_angle: float = 0.0
-    spawn_front_r: tuple[float, float] = (0.0, 0.0)
-    spawn_front_r_angle: float = 0.0
+    # initial spawn pose, used by reset (empirically measured 5s physical equilibrium)
+    spawn: tuple[float, float] = (0.0, 44.75)
+    spawn_torso_angle: float = -0.1574
+    spawn_foot_l: tuple[float, float] = (-17.31, 9.94)
+    spawn_foot_r: tuple[float, float] = (14.57, 9.90)
+    spawn_tail: tuple[float, float] = (-2.51, 28.95)
+    spawn_tail_angle: float = -1.7271
+    spawn_ear_l: tuple[float, float] = (6.99, 76.04)
+    spawn_ear_l_angle: float = -2.4567
+    spawn_ear_r: tuple[float, float] = (14.89, 74.79)
+    spawn_ear_r_angle: float = -2.6567
+    spawn_front_l: tuple[float, float] = (0.0, 44.75)
+    spawn_front_l_angle: float = 1.0935
+    spawn_front_r: tuple[float, float] = (0.0, 44.75)
+    spawn_front_r_angle: float = 1.3335
     spawn_theta_l: float = 0.28
     spawn_theta_r: float = -0.8
+    spawn_d_l: float = 20.0
+    spawn_d_r: float = 20.0
     spawn_tail_theta: float = 0.0
     # persistent facing direction: +1 = right, -1 = left. Updated with
     # hysteresis in apply_consignes; never recomputed from the sign of the angle.
@@ -276,7 +279,8 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     cx = sum(v[0] for v in TORSO_VERTS) / len(TORSO_VERTS)
     cy = sum(v[1] for v in TORSO_VERTS) / len(TORSO_VERTS)
     torso.center_of_mass = (cx, cy)
-    torso.position = (0.0, 64.0)
+    torso.position = (0.0, 44.75)
+    torso.angle = -0.1574
     torso_shape = pymunk.Poly(torso, TORSO_VERTS)
     torso_shape.friction = 0.8
     torso_shape.filter = _animat_filter()
@@ -286,7 +290,7 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     foot_l, spring_l, shape_l = _add_limb(space, torso, HIP_L, LIMB_MASS, LIMB_RADIUS,
                                  LIMB_STIFFNESS, LIMB_DAMPING)
     foot_r, spring_r, shape_r = _add_limb(space, torso, HIP_R, LIMB_MASS, LIMB_RADIUS,
-                                LIMB_STIFFNESS, LIMB_DAMPING)
+                                 LIMB_STIFFNESS, LIMB_DAMPING)
     tail, tail_spring = _add_tail(space, torso, TAIL_ATTACH, TAIL_MASS,
                      TAIL_LEN, TAIL_RADIUS, TAIL_STIFFNESS, TAIL_DAMPING)
     ear_l, es_l = _add_ear(space, torso, EAR_ATTACH_L, EAR_MASS, EAR_LEN, EAR_BASE,
@@ -307,11 +311,37 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
         front_l=front_l, front_r=front_r,
         foot_shape_l=shape_l, foot_shape_r=shape_r,
     )
-    # splay feet outward for a wider stance: left foot leans left, right foot
-    # leans right. This widens the support base from ~14px to ~27px.
+    # Balanced asymmetric resting stance (retrieved from 5s physical equilibrium)
     skel.limb_l.theta_star = 0.28
     skel.limb_r.theta_star = -0.8
+    skel.limb_l.d_star = 20.0
+    skel.limb_r.d_star = 20.0
+    skel.tail_act.theta_star = 0.0
+
+    foot_l.position = (-17.31, 9.94)
+    foot_r.position = (14.57, 9.90)
+    foot_l.velocity = (0, 0)
+    foot_r.velocity = (0, 0)
+
+    apply_consignes(skel)
+    tail.position = (-2.51, 28.95)
+    tail.angle = -1.7271
+    tail.velocity = (0, 0)
+    tail.angular_velocity = 0.0
+
+    ear_l.position = (6.99, 76.04)
+    ear_l.angle = -2.4567
+    ear_r.position = (14.89, 74.79)
+    ear_r.angle = -2.6567
+
+    front_l.position = (0.0, 44.75)
+    front_l.angle = 1.0935
+    front_r.position = (0.0, 44.75)
+    front_r.angle = 1.3335
+
     # save spawn positions for reset
+    skel.spawn = (torso.position.x, torso.position.y)
+    skel.spawn_torso_angle = torso.angle
     skel.spawn_foot_l = (foot_l.position.x, foot_l.position.y)
     skel.spawn_foot_r = (foot_r.position.x, foot_r.position.y)
     skel.spawn_tail = (tail.position.x, tail.position.y)
@@ -326,6 +356,8 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     skel.spawn_front_r_angle = front_r.angle
     skel.spawn_theta_l = skel.limb_l.theta_star
     skel.spawn_theta_r = skel.limb_r.theta_star
+    skel.spawn_d_l = skel.limb_l.d_star
+    skel.spawn_d_r = skel.limb_r.d_star
     skel.spawn_tail_theta = skel.tail_act.theta_star
     return skel
 
@@ -387,7 +419,7 @@ def apply_consignes(skel: Skeleton) -> None:
 def reset(skel: Skeleton) -> None:
     """Restore the spawn pose and zero velocities."""
     skel.torso.position = skel.spawn
-    skel.torso.angle = 0.0
+    skel.torso.angle = getattr(skel, "spawn_torso_angle", 0.0)
     skel.torso.velocity = (0, 0)
     skel.torso.angular_velocity = 0.0
     skel.facing = 1
@@ -413,6 +445,8 @@ def reset(skel: Skeleton) -> None:
         front.velocity = (0, 0)
         front.angular_velocity = 0.0
     skel.limb_l.theta_star = skel.spawn_theta_l
+    skel.limb_l.d_star = skel.spawn_d_l
     skel.limb_r.theta_star = skel.spawn_theta_r
+    skel.limb_r.d_star = skel.spawn_d_r
     skel.tail_act.theta_star = skel.spawn_tail_theta
     apply_consignes(skel)

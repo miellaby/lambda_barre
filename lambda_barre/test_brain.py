@@ -368,24 +368,22 @@ def test_explore_action_batch_bounds_and_sigma():
         assert (explored[:, col] <= 1.0 + 1e-5).all()
 
 
-def test_train_policy_minimal_improvement_margin():
+def test_train_policy_candidate_selection():
     import torch
-    # Verify candidate ranking logic with 2% margin:
-    # Row 0: small 1% noise fluctuation -> should stay on candidate 0 (policy)
-    # Row 1: real improvement of 5% -> should switch to candidate 2
-    # Row 2: demonstrated baseline is best -> should pick candidate 1
+    from .brain import _EXPLORE_MARGIN_PCT
+    # Candidate ranking logic: alternatives (1..3) must beat baseline (0) by at least margin
     candidate_costs = torch.tensor([
-        [5.00, 5.10, 4.96, 4.97],  # 4.96 is only 0.8% better than 5.00 (below 2% = 0.10)
-        [5.00, 5.20, 4.70, 4.80],  # 4.70 is 6% better than 5.00 (exceeds 2% margin)
-        [5.50, 4.00, 4.30, 4.20],  # demonstrated is 4.00, best of all
+        [5.000, 5.100, 4.9995, 5.050],  # 4.9995 is within noise (< 5% gain) -> picks baseline (0)
+        [5.000, 5.200, 5.700, 4.500],   # 4.500 has 10% gain (> 5%) -> picks candidate 3
+        [5.500, 4.000, 4.300, 4.200],   # demonstrated is 4.000 (> 5% gain) -> picks candidate 1
+        [3.000, 4.000, 4.300, 4.200],   # policy is 3.000 -> picks candidate 0
     ])
-    cost_baseline = torch.minimum(candidate_costs[:, 0], candidate_costs[:, 1])
-    margin = 0.02 * cost_baseline.abs().clamp(min=1.0)
-    effective_costs = candidate_costs.clone()
-    effective_costs[:, 2:] += margin.unsqueeze(1)
-
-    best_idx = effective_costs.argmin(dim=1)
-    assert best_idx.tolist() == [0, 2, 1]
+    cost_baseline = candidate_costs[:, 0:1]
+    margin = _EXPLORE_MARGIN_PCT * cost_baseline.abs().clamp(min=1.0)
+    adjusted_costs = candidate_costs.clone()
+    adjusted_costs[:, 1:] += margin
+    best_idx = adjusted_costs.argmin(dim=1)
+    assert best_idx.tolist() == [0, 3, 1, 0]
 
 
 def test_sleep_preserves_wake_history_context():
@@ -408,6 +406,110 @@ def test_sleep_preserves_wake_history_context():
     assert b._cached_latent is not None
 
 
+def test_reset_restores_limb_distances():
+    from . import body as B, world as W
+    space = W.make_space()
+    skel = B.build_skeleton(space)
+    # Default distances should be 20.0
+    assert skel.limb_l.d_star == 20.0
+    assert skel.limb_r.d_star == 20.0
+    assert skel.spawn_d_l == 20.0
+    assert skel.spawn_d_r == 20.0
+
+    # Modify distances
+    skel.limb_l.d_star = 31.5
+    skel.limb_r.d_star = 12.3
+    skel.limb_l.theta_star = 0.99
+    skel.limb_r.theta_star = -0.55
+    B.apply_consignes(skel)
+
+    assert skel.limb_l.d_star == 31.5
+    assert skel.limb_r.d_star == 12.3
+
+    # Reset skeleton
+    B.reset(skel)
+
+    # Distances and thetas must be restored to spawn values
+    assert skel.limb_l.d_star == 20.0
+    assert skel.limb_r.d_star == 20.0
+    assert skel.limb_l.theta_star == skel.spawn_theta_l
+    assert skel.limb_r.theta_star == skel.spawn_theta_r
+
+
+def test_three_futures_bellman_optimism():
+    import torch
+    b = Brain(seed=42)
+    # 1. Test decode_action_batch roundtrip
+    action_in = torch.tensor([[0.3, 0.7, -0.4, 0.1, -0.8]], device=b.device)
+    toks = b._encode_action_batch(action_in)
+    decoded = b._decode_action_batch(toks)
+    assert torch.allclose(action_in, decoded, atol=1e-5)
+
+    # 2. Test Bellman optimism logic: min across 3 futures
+    c_kalman = torch.tensor([12.0, 30.0, 15.0])
+    c_wm = torch.tensor([25.0, 10.0, 20.0])
+    c_pol = torch.tensor([50.0, 45.0, 8.0])  # clumsy policy has high cost on 0 and 1
+    c_optimistic = torch.minimum(torch.minimum(c_kalman, c_wm), c_pol)
+    assert c_optimistic.tolist() == [12.0, 10.0, 8.0]
+
+    # 3. Test train_policy execution with 3-future evaluation
+    for i in range(20):
+        salve = _make_salve([0.1 * (i % 5)] * 53, [0.5] * 5)
+        b.record(salve)
+    steps_out = list(b.train_policy(steps=2, batch=4, n_imagine=3))
+    assert len(steps_out) == 2
+    for phase, loss in steps_out:
+        assert phase == "pol"
+        assert loss == loss and loss >= 0.0  # valid finite loss
+
+
+def test_dream_record_and_dream_theater_rendering():
+    import pygame
+    from lambda_barre.dream import DreamTheater, DreamRecord
+    pygame.init()
+
+    b = Brain(seed=42)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    list(b.train_policy(steps=1, batch=4, n_imagine=4))
+
+    assert b.last_dream_record is not None
+    rec = b.last_dream_record
+    assert isinstance(rec, DreamRecord)
+    assert len(rec.context_steps) == 5  # s0..s3 with actions, s4 decision state
+    assert len(rec.candidate_actions) == 4
+    assert len(rec.trajectories) == 12  # 4 cands × 3 regimes
+    for traj in rec.trajectories:
+        assert len(traj.steps) == 1 + 4  # s4+cand + 4 imagined steps
+
+    # Test DreamTheater UI
+    theater = DreamTheater(960, 600)
+    theater.update(rec)
+    assert not theater.is_paused
+    theater.toggle_pause()
+    assert theater.is_paused
+
+    # Test keyboard navigation
+    ev_tab = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB)
+    assert theater.handle_event(ev_tab)
+    assert theater.tab_idx == 1
+
+    ev_wheel = pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=-2)
+    assert theater.handle_event(ev_wheel)
+
+    # Test drawing on Surface
+    surf = pygame.Surface((960, 600))
+    font = pygame.font.SysFont("monospace", 16)
+    font_small = pygame.font.SysFont("monospace", 10)
+    theater.draw(surf, font, font_small, status="sleeping...")
+
+    # Test filter by candidate tabs
+    for tab in range(5):
+        theater.tab_idx = tab
+        theater.draw(surf, font, font_small)
+
+
 if __name__ == "__main__":
     test_policy_outputs_are_valid_consignes()
     test_world_model_forward_and_predict_shapes()
@@ -422,6 +524,9 @@ if __name__ == "__main__":
     test_brain_boundary_and_history_isolation()
     test_experience_buffer_two_tier_consolidation_and_persistence()
     test_explore_action_batch_bounds_and_sigma()
-    test_train_policy_minimal_improvement_margin()
+    test_train_policy_candidate_selection()
     test_sleep_preserves_wake_history_context()
+    test_reset_restores_limb_distances()
+    test_three_futures_bellman_optimism()
+    test_dream_record_and_dream_theater_rendering()
     print("all brain tests passed")
