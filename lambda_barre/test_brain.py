@@ -283,9 +283,9 @@ def test_experience_buffer_clear():
 
 def test_brain_boundary_and_history_isolation():
     b = Brain(seed=42)
-    # Push salves into brain
-    for _ in range(15):
-        salve = _make_salve([0.1] * 53, [0.5] * 5)
+    # Push salves into brain (moving transitions)
+    for i in range(15):
+        salve = _make_salve([0.05 * i] * 53, [0.5] * 5)
         b.record(salve)
     assert len(b.buffer) == 15 - (b.buffer.seq_len) + 1
 
@@ -510,6 +510,99 @@ def test_dream_record_and_dream_theater_rendering():
         theater.draw(surf, font, font_small)
 
 
+def test_brain_record_stationary_pause_and_resume():
+    b = Brain(seed=42)
+    assert b.is_recording
+
+    # 1. Push 11 moving salves so sequence is sufficiently long (>= seq_len 11)
+    for i in range(11):
+        salve = _make_salve([0.05 * i] * 53, [0.1 * i] * 5)
+        recorded = b.record(salve)
+        assert recorded is True
+        assert b.is_recording is True
+    assert len(b.buffer._current) == 11
+
+    # 2. Push 5 identical static salves (matching the 11th salve)
+    static_salve = _make_salve([0.5] * 53, [1.0] * 5)
+    for _ in range(5):
+        recorded = b.record(static_salve)
+        assert recorded is True
+        assert b.is_recording is True
+    assert len(b.buffer._current) == 16
+
+    # 3. Push 6th static salve: reaches 6 static ticks with len >= 11 -> stops recording
+    recorded = b.record(static_salve)
+    assert recorded is True
+    assert b.is_recording is False
+    assert len(b.buffer._current) == 17
+
+    # 4. Push further static salves: must NOT be recorded
+    for _ in range(5):
+        recorded = b.record(static_salve)
+        assert recorded is False
+        assert b.is_recording is False
+        assert len(b.buffer._current) == 17  # size unchanged
+
+    # Context and current segment must NOT be discarded/boundary'd
+    assert len(b.buffer._segments) == 0
+    assert len(b.buffer._current) == 17
+
+    # 5. Tokens move again: recording must immediately resume into same full context
+    moved_salve = _make_salve([0.9] * 53, [0.5] * 5)
+    recorded = b.record(moved_salve)
+    assert recorded is True
+    assert b.is_recording is True
+    assert len(b.buffer._current) == 18
+    assert len(b.buffer._segments) == 0
+
+
+def test_brain_record_too_short_sequence_not_paused():
+    b = Brain(seed=42)
+    # Sequence starts with 3 moving salves (< seq_len 11)
+    for i in range(3):
+        b.record(_make_salve([0.1 * i] * 53, [0.5] * 5))
+    assert len(b.buffer._current) == 3
+
+    # Push 6 identical salves (static for 6 ticks, but len reaches only 9 < 11)
+    static_salve = _make_salve([0.2] * 53, [0.5] * 5)
+    for _ in range(6):
+        recorded = b.record(static_salve)
+        assert recorded is True
+        # Must NOT pause because the sequence in progress is not long enough yet
+        assert b.is_recording is True
+    assert len(b.buffer._current) == 9
+
+    # Push 2 more to reach seq_len = 11 (static_ticks is now 8 >= 6)
+    b.record(static_salve)
+    assert len(b.buffer._current) == 10
+    assert b.is_recording is True
+
+    b.record(static_salve)
+    assert len(b.buffer._current) == 11
+    # Now sequence is sufficiently long (11 >= 11) and static >= 6 -> pauses!
+    assert b.is_recording is False
+
+    # Next static salve is not recorded
+    assert b.record(static_salve) is False
+    assert len(b.buffer._current) == 11
+
+
+def test_brain_record_ignores_metabolic_drift():
+    b = Brain(seed=42)
+    # Sequence of 11 moving salves (0.05 * 10 = 0.5)
+    for i in range(11):
+        b.record(_make_salve([0.05 * i] * 53, [0.5] * 5))
+
+    # Static in animal, env, consignes, but courbature (slot 49) drifts every tick
+    for i in range(6):
+        ss = [0.5] * 53
+        ss[49] = 0.01 * (i + 1)  # courbature drift
+        b.record(_make_salve(ss, [0.5] * 5))
+
+    # Should pause after 6 ticks because metabolic drift is ignored
+    assert b.is_recording is False
+
+
 if __name__ == "__main__":
     test_policy_outputs_are_valid_consignes()
     test_world_model_forward_and_predict_shapes()
@@ -522,6 +615,9 @@ if __name__ == "__main__":
     test_experience_buffer_capacity_eviction()
     test_experience_buffer_clear()
     test_brain_boundary_and_history_isolation()
+    test_brain_record_stationary_pause_and_resume()
+    test_brain_record_too_short_sequence_not_paused()
+    test_brain_record_ignores_metabolic_drift()
     test_experience_buffer_two_tier_consolidation_and_persistence()
     test_explore_action_batch_bounds_and_sigma()
     test_train_policy_candidate_selection()

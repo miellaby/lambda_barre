@@ -101,6 +101,30 @@ for _p in range(_SEQ_LEN - 1):
 # Salve-within-type attention mask for the fixed training sequence.
 _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
 
+# Channels tracked for static detection:
+#   - animal: proprioception (tokens 0..3) and touch (tokens 8..9)
+#   - environnement: vision (tokens 4, 6), cursor/sound (tokens 5, 7), touch (tokens 8..9)
+#   - consignes: action (tokens 13..15)
+# Excludes interoception (token 10) and reward/cost accumulators (tokens 11, 12).
+_STATIC_SOURCES = {"proprio", "touch", "cursor", "vision", "action"}
+_STATIC_TOKENS = tuple(ch.idx for ch in _LAYOUT if ch.source in _STATIC_SOURCES)
+
+
+def _salve_moved(s1: list[list[float]], s2: list[list[float]],
+                 checked_tokens: tuple[int, ...] = _STATIC_TOKENS,
+                 tol: float = 1e-4) -> bool:
+    """Check whether any signal in animal, environment, or consigne tokens moved by >= tol."""
+    valid_tokens = [t for t in checked_tokens if t < len(s1) and t < len(s2)]
+    if not valid_tokens:
+        valid_tokens = list(range(min(len(s1), len(s2))))
+    for t in valid_tokens:
+        tok1 = s1[t]
+        tok2 = s2[t]
+        for k in range(min(len(tok1), len(tok2))):
+            if abs(tok1[k] - tok2[k]) >= tol:
+                return True
+    return False
+
 
 class ExperienceBuffer:
     """Two-tier experience memory: continuous linear session journal + persistent sequence replay pool.
@@ -352,6 +376,12 @@ class Brain:
         self._wm_time = 0.0
         self._pol_time = 0.0
         self._time_alpha = 0.1
+        # Experience recording control (pause when stationary)
+        self._recording = True
+        self._static_ticks = 0
+        self._last_salve: list[list[float]] | None = None
+        self._static_threshold = 6
+        self._static_tol = 1e-4
 
     # --- live loop -----------------------------------------------------------
     @torch.no_grad()
@@ -397,15 +427,57 @@ class Brain:
         a = action[0].tolist()
         return a[0], a[1], a[2], a[3], a[4]
 
-    def record(self, salve) -> None:
-        """Journal one transition into the experience buffer."""
-        self.buffer.push(salve)
+    @property
+    def is_recording(self) -> bool:
+        """Whether experience recording into the buffer is currently active."""
+        return self._recording
+
+    def record(self, salve) -> bool:
+        """Journal one transition into the experience buffer.
+
+        If the current sequence is long enough (>= buffer.seq_len) and the
+        tokens (animal, environment, consignes) do not move for 6 successive
+        ticks, recording is stopped. Recording resumes as soon as tokens move again.
+        The context and in-progress segment are preserved without clearing or boundary.
+        Returns True if the salve was recorded into the buffer, False if skipped.
+        """
+        if hasattr(salve, "tolist"):
+            salve = salve.tolist()
+
+        if self._last_salve is None:
+            moved = True
+        else:
+            moved = _salve_moved(salve, self._last_salve, tol=self._static_tol)
+
+        if moved:
+            self._static_ticks = 0
+        else:
+            self._static_ticks += 1
+
+        recorded = False
+        if self._recording:
+            self.buffer.push(salve)
+            recorded = True
+            if (len(self.buffer._current) >= self.buffer.seq_len
+                    and self._static_ticks >= self._static_threshold):
+                self._recording = False
+        else:
+            if moved:
+                self._recording = True
+                self.buffer.push(salve)
+                recorded = True
+
+        self._last_salve = salve
+        return recorded
 
     def clear_history(self) -> None:
         """Clear the wake context history, cached latent, and seal the buffer segment."""
         self._wake_history.clear()
         self._cached_latent = None
         self._cached_scalars = None
+        self._recording = True
+        self._static_ticks = 0
+        self._last_salve = None
         self.buffer.boundary()
 
     def boundary(self) -> None:
@@ -457,6 +529,9 @@ class Brain:
             self._cached_scalars = self._policy_scalars_batch(
                 torch.tensor(cur_state, dtype=torch.float32,
                              device=self.device).unsqueeze(0))
+        self._recording = True
+        self._static_ticks = 0
+        self._last_salve = None
 
     # --- sleep: world model training ----------------------------------------
     def _batch_tensors(self, sequences):

@@ -52,6 +52,8 @@ SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
         freeze_physics: bool = False, no_smooth: bool = False):
     tags = ["[BRAIN]" if auto else "[manual]"]
+    if brain is not None:
+        tags.append("[REC]" if brain.is_recording else "[REC PAUSED]")
     if freeze_physics:
         tags.append("[PHYS FROZEN]")
     if no_smooth:
