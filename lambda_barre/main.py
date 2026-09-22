@@ -68,7 +68,7 @@ def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
         dev = getattr(brain, "device_desc", str(brain.device))
         lines.append(f"dev {dev}")
         lines.append(
-            f"buf {len(brain.buffer)} (pool {brain.buffer.pool_size}, {brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f} ")
+            f"buf {len(brain.buffer)} (core {brain.buffer.coreset_size}, add {brain.buffer.addendum_size}, {brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f} ")
         lines.append(
             f"inf wm {brain._wm_time:.1f}ms pol {brain._pol_time:.1f}ms")
     if status:
@@ -134,7 +134,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     else:
         try:
             brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
-            status = f"brain restored (pool {brain.buffer.pool_size})"
+            status = f"brain restored (coreset {brain.buffer.coreset_size})"
         except Exception as e:
             print(f"[warning] Checkpoint load: {e}")
             status = "brain restored partially"
@@ -272,16 +272,32 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 drag_plat = None
 
         # consume one sleep step per frame to keep the UI responsive
-        if sleep_gen is not None and not dream_theater.is_paused:
+        should_step = (sleep_gen is not None) and (not dream_theater.is_paused or dream_theater.step_once)
+        if should_step:
+            dream_theater.step_once = False
             try:
                 label, value = next(sleep_gen)
-                if label == "wm":
+                if label == "prune":
+                    status = f"pruned {value['pruned']} to addendum (coreset {value['coreset']})"
+                elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
-                    if wm_total > 0:
-                        status = f"sleeping: wm {wm_step}/{wm_total} (loss {value:.2f})"
+                    if label == "wm_addendum":
+                        f_stats = getattr(brain, "last_filter_stats", None)
+                        if f_stats and f_stats.get("initial", 0) > 0:
+                            kept = f_stats["kept"]
+                            dropped = f_stats["dropped"]
+                            pct = f_stats.get("pct_dropped", 0.0)
+                            status = (f"sleeping: addendum {wm_step}/{wm_total} (loss {value:.2f}) "
+                                      f"[gardées: {kept} | retirées: {dropped} ({pct:.0f}%)]")
+                        else:
+                            status = f"sleeping: addendum {wm_step}/{wm_total} (loss {value:.2f})"
+                    elif label == "wm_coreset":
+                        status = f"sleeping: coreset {wm_step}/{wm_total} (loss {value:.2f})"
                     else:
-                        status = f"sleeping: wm {value:.2f}"
+                        status = f"sleeping: wm {wm_step}/{wm_total} (loss {value:.2f})"
+                elif label == "filter":
+                    status = f"filtered addendum: {value['initial']} -> {value['kept']} (dropped {value['dropped']})"
                 elif label == "pol":
                     status = f"sleeping: pol {value:.2f}"
                     if brain.last_dream_record is not None:
@@ -291,8 +307,10 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     sleep_gen = None
                     brain.save_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
                     print("[sleep]", stats)
-                    status = (f"slept: wm {stats['wm_loss']:.2f} "
-                              f"pol {stats['pol_loss']:.2f} ")
+                    f_stats = getattr(brain, "last_filter_stats", None)
+                    drop_info = f" [retirées: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
+                    status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{drop_info} "
+                              f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
             except StopIteration:
                 sleep_gen = None
 

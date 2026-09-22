@@ -261,6 +261,7 @@ class DreamTheater:
         self.target_scroll_y = 0
         self.tab_idx = 0  # 0: All 12 rows, 1: Cand 0, 2: Cand 1, 3: Cand 2, 4: Cand 3
         self.is_paused = False
+        self.step_once = False
         self.tab_names = ["All (12 Rows)", "0: Policy", "1: Replay", "2: Noise 15%", "3: Noise 30%"]
 
         # Geometry
@@ -280,9 +281,11 @@ class DreamTheater:
         self.scroll_y = 0
         self.target_scroll_y = 0
         self.tab_idx = 0
+        self.step_once = False
 
     def toggle_pause(self) -> bool:
         self.is_paused = not self.is_paused
+        self.step_once = False
         return self.is_paused
 
     def handle_event(self, ev: pygame.event.Event) -> bool:
@@ -293,6 +296,9 @@ class DreamTheater:
         elif ev.type == pygame.KEYDOWN:
             if ev.key == pygame.K_SPACE:
                 self.toggle_pause()
+                return True
+            elif ev.key == pygame.K_n and self.is_paused:
+                self.step_once = True
                 return True
             elif ev.key in (pygame.K_TAB, pygame.K_RIGHT):
                 self.tab_idx = (self.tab_idx + 1) % len(self.tab_names)
@@ -384,7 +390,7 @@ class DreamTheater:
         pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
 
         # Title and status
-        pause_txt = " [PAUSED — Space to resume]" if self.is_paused else " [Running — Space to pause]"
+        pause_txt = " [PAUSED - [n] for next step]" if self.is_paused else " [Running — Space to pause]"
         title_str = f"SLEEP DREAM THEATER  |  Step {rec.step_idx + 1}/{rec.total_steps}  |  Loss: {rec.loss:.4f}{pause_txt}"
         s_title = font.render(title_str, True, WINNER_BORDER if self.is_paused else TEXT_WHITE)
         screen.blit(s_title, (16, 6))
@@ -405,7 +411,8 @@ class DreamTheater:
             tx += tw + 8
 
         # Help hint on top-right
-        hint = font_small.render("Tab / 0-4: Filter | Wheel: Scroll | Space: Pause", True, TEXT_MUTED)
+        hint_txt = "Tab / 0-4: Filter | Wheel: Scroll | [n]: Next step | Space: Resume" if self.is_paused else "Tab / 0-4: Filter | Wheel: Scroll | Space: Pause"
+        hint = font_small.render(hint_txt, True, TEXT_MUTED)
         screen.blit(hint, (self.width - hint.get_width() - 16, 31))
 
         # 2. Rows content area

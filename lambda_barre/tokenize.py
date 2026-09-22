@@ -100,9 +100,9 @@ def _build_specs() -> dict[str, TokenSpec]:
     add("collision_tronc_cx",   "TC", 200.0,  True)
     add("collision_tronc_cy",   "TD", 200.0,  True)
 
-    # Interoception (2)
-    add("fatigue",     "FT", 1.0, False)
-    add("souffrance",  "SF", 1.0, False)
+    # Interoception (2) - signed delta in [-1.0, +1.0]
+    add("fatigue",     "FT", 1.0, True)
+    add("souffrance",  "SF", 1.0, True)
 
     # Reward (8)
     add("effort",      "EF", 1.0, False)
@@ -229,13 +229,13 @@ def _build_layout() -> list[ChannelSpec]:
         ChannelSpec(9, False, _M_SOMATO, (0.0, 0.0, 1.0, 0.0),
                     ["collision_tronc_x", "collision_tronc_y",
                      "collision_tronc_cx", "collision_tronc_cy"], "touch"),
-        ChannelSpec(10, False, _M_INTERO, (1.0, 1.0, 1.0, 1.0),
-                   ["fatigue", "souffrance"], "intero"),
-        ChannelSpec(11, False, _M_MOTIV, (0.0, 0.0, 0.0, 0.0),
+        ChannelSpec(10, False, _M_MOTIV, (0.0, 0.0, 0.0, 0.0),
                     ["effort", "douleur", "courbature", "instabilite",
                      "vertige"], "reward"),
-        ChannelSpec(12, False, _M_MOTIV, (1.0, 0.0, 0.0, 0.0),
+        ChannelSpec(11, False, _M_MOTIV, (1.0, 0.0, 0.0, 0.0),
                     ["confort"], "reward"),
+        ChannelSpec(12, False, _M_INTERO, (1.0, 1.0, 1.0, 1.0),
+                    ["fatigue", "souffrance"], "intero"),
         # --- motor (13..15) ---
         ChannelSpec(13, True, _M_ACTION, (0.0, 0.0, 0.0, 1.0),
                     ["membre_avant_theta", "membre_avant_d"], "action"),
@@ -252,22 +252,23 @@ _LAYOUT: list[ChannelSpec] = _build_layout()
 _N_SIGNALS: list[int] = [len(ch.signals) for ch in _LAYOUT]
 print(f"signal slots per token: {_N_SIGNALS}")
 
-# Index of the reward tokens within the state.
-_COST_IDX = 11        # "Coûts"  (effort, douleur, courbature, instabilite, vertige)
-_REWARD_IDX = 12      # "Récompense" (confort)
+# Index of the reward tokens and interoception within the state.
+_COST_IDX = 10        # "Coûts"  (effort, douleur, courbature, instabilite, vertige)
+_REWARD_IDX = 11      # "Récompense" (confort)
+_INTERO_IDX = 12      # "Intéroception" (delta fatigue, delta souffrance)
 
 # Signal-slot offset within a 25-dim token (type + modality + canal = 9).
 SIG_OFFSET = TYPE_DIM + MOD_DIM + CANAL_DIM   # 9
 
-# Keys of the 5 innate cost signals (token 11), in slot order.
+# Keys of the 5 innate cost signals (token 10), in slot order.
 _COST_KEYS = ("effort", "douleur", "courbature", "instabilite", "vertige")
 
 # Flat signal counts within a salve (for make_salve / construction).
 _STATE_FLAT_LEN = sum(_N_SIGNALS[:STATE_TOKENS])    # 53
 _ACTION_FLAT_LEN = sum(_N_SIGNALS[STATE_TOKENS:])   # 5
 
-# Number of non-reward sensory scalar slots fed to the policy (tokens 0..10).
-N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 47
+# Number of non-reward sensory scalar slots fed to the policy (tokens 0..9).
+N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 45
 
 # Per-token action-key → (skeleton attribute, field) lookup.
 _ACTION_LOOKUP = {
@@ -310,12 +311,12 @@ def action_tokens(salve: list[list[float]]) -> list[list[float]]:
 
 
 def policy_scalars(salve: list[list[float]]) -> list[float]:
-    """The 47 non-reward sensory signal values (tokens 0..10), in order.
+    """The 45 non-reward sensory signal values (tokens 0..9), in order.
 
     These are the normalized [0,1] floats the policy consumes alongside the
     world-model latent."""
     out: list[float] = []
-    for i in range(_COST_IDX):           # tokens 0..10 (exclude reward 11,12)
+    for i in range(_COST_IDX):           # tokens 0..9 (exclude reward 10,11 and intero 12)
         ch = _LAYOUT[i]
         token = salve[i]
         for k in range(len(ch.signals)):
@@ -324,7 +325,7 @@ def policy_scalars(salve: list[list[float]]) -> list[float]:
 
 
 def salve_cost(salve: list[list[float]]) -> float:
-    """Weighted innate cost from the reward channels (tokens 11 and 12).
+    """Weighted innate cost from the reward channels (tokens 10 and 11).
 
     cost = 1·effort + 4·douleur + 2·courbature + 2·instabilite
            + 3·vertige + 1·confort

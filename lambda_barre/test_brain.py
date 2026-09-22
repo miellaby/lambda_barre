@@ -36,7 +36,7 @@ def _make_salve(state_signals: list[float],
 def test_policy_outputs_are_valid_consignes():
     import torch
     p = Policy()
-    sv = torch.rand(4, 143)
+    sv = torch.rand(4, p.N_STATE)
     a = p(sv)
     assert a.shape == (4, 5)
     cons = a.tolist()
@@ -79,16 +79,16 @@ def test_salve_cost_sign():
     # salve_cost sums the 6 innate signals (effort, douleur, courbature,
     # instabilite, vertige, confort). confort is signed (negative = reward);
     # the 5 others are unsigned costs.
-    # Flat state-signal layout: token 11 (Coûts) holds effort, douleur,
-    # courbature, instabilite, vertige at indices 47..51; token 12 (Récompense)
-    # holds confort at index 52.
+    # Flat state-signal layout: token 10 (Coûts) holds effort, douleur,
+    # courbature, instabilite, vertige at indices 45..49; token 11 (Récompense)
+    # holds confort at index 50; token 12 (Intéroception) holds fatigue, souffrance at 51..52.
     # all-zero: confort=0 -> -1.0 (max reward) -> cost = -1.0 < 0
     salve = _make_salve([0.0] * 53, [0.5] * 5)
     assert T.salve_cost(salve) < 0.0
     # douleur=1.0 (->1.0), confort=0.5 (->0.0) -> cost = 4.0 > 0
     ss = [0.0] * 53
-    ss[48] = 1.0      # douleur slot
-    ss[52] = 0.5      # confort slot
+    ss[46] = 1.0      # douleur slot
+    ss[50] = 0.5      # confort slot
     salve = _make_salve(ss, [0.5] * 5)
     assert T.salve_cost(salve) > 0.0
 
@@ -489,6 +489,12 @@ def test_dream_record_and_dream_theater_rendering():
     assert not theater.is_paused
     theater.toggle_pause()
     assert theater.is_paused
+    assert not theater.step_once
+
+    # Test single-step key (N) when paused
+    ev_n = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_n)
+    assert theater.handle_event(ev_n)
+    assert theater.step_once
 
     # Test keyboard navigation
     ev_tab = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB)
@@ -593,14 +599,152 @@ def test_brain_record_ignores_metabolic_drift():
     for i in range(11):
         b.record(_make_salve([0.05 * i] * 53, [0.5] * 5))
 
-    # Static in animal, env, consignes, but courbature (slot 49) drifts every tick
+    # Static in animal, env, consignes, but courbature (slot 47) drifts every tick
     for i in range(6):
         ss = [0.5] * 53
-        ss[49] = 0.01 * (i + 1)  # courbature drift
+        ss[47] = 0.01 * (i + 1)  # courbature drift
         b.record(_make_salve(ss, [0.5] * 5))
 
     # Should pause after 6 ticks because metabolic drift is ignored
     assert b.is_recording is False
+
+
+def test_coreset_addendum_prune_commit():
+    buf = ExperienceBuffer(seq_len=5, capacity=200, pool_capacity=200, seed=42)
+    # Populate Coreset with 40 sequences directly
+    for i in range(40):
+        buf._coreset.append([[[float(i)] * 25] * 16 for _ in range(5)])
+
+    assert buf.coreset_size == 40
+    assert buf.addendum_size == 0
+    assert len(buf) == 40
+
+    # Prune 33% (default 33% of 40 = 13 sequences)
+    pruned = buf.prune_coreset()
+    assert pruned == 13
+    assert buf.coreset_size == 27
+    assert buf.addendum_size == 13
+    assert len(buf) == 40
+
+    # Filter addendum (keep only 1 sequence)
+    buf.filter_addendum([buf._addendum[0]])
+    assert buf.addendum_size == 1
+
+    # Commit addendum
+    committed = buf.commit_addendum()
+    assert committed == 1
+    assert buf.coreset_size == 28
+    assert buf.addendum_size == 0
+    assert len(buf) == 28
+
+
+def test_addendum_surprise_evaluation():
+    b = Brain(seed=42)
+    # Build a constant sequence
+    c_salve = _make_salve([0.2] * 53, [0.5] * 5)
+    seq_easy = [c_salve] * 11
+
+    # Build an erratic sequence with high cost (douleur = 1.0)
+    erratic_salve = _make_salve([0.9] * 53, [-0.8] * 5)
+    seq_hard = [c_salve] * 5 + [erratic_salve] * 6
+
+    surprises = b.evaluate_sequences_surprise([seq_easy, seq_hard])
+    assert len(surprises) == 2
+    assert all(s >= 0.0 for s in surprises)
+
+
+def test_naive_sequence_distances_and_clustering():
+    from .brain import pairwise_sequence_distances, complete_linkage_clustering, select_medoids
+    s1 = _make_salve([0.1] * 53, [0.2] * 5)
+    s2 = _make_salve([0.101] * 53, [0.2] * 5)  # very close to s1
+    s3 = _make_salve([0.8] * 53, [-0.5] * 5)  # distant
+
+    seq1 = [s1] * 11
+    seq2 = [s2] * 11
+    seq3 = [s3] * 11
+
+    D = pairwise_sequence_distances([seq1, seq2, seq3])
+    assert D.shape == (3, 3)
+    assert D[0, 0] == 0.0
+    assert D[0, 1] < 0.02   # seq1 and seq2 are near-identical
+    assert D[0, 2] > 0.30   # seq1 and seq3 are far apart
+
+    clusters = complete_linkage_clustering(D, eps=0.04)
+    assert len(clusters) == 2  # {seq1, seq2} and {seq3}
+    medoids = select_medoids(clusters, D)
+    assert len(medoids) == 2
+
+
+def test_experience_buffer_intra_addendum_deduplication():
+    buf = ExperienceBuffer(seq_len=5, seed=42)
+    s_dup = _make_salve([0.3] * 53, [0.1] * 5)
+    s_unique = _make_salve([0.9] * 53, [-0.7] * 5)
+
+    seq_dup = [s_dup] * 5
+    seq_uniq = [s_unique] * 5
+
+    # 10 identical sequences + 1 unique sequence
+    for _ in range(10):
+        buf._addendum.append(seq_dup)
+        buf._addendum_meta.append("wake")
+    buf._addendum.append(seq_uniq)
+    buf._addendum_meta.append("wake")
+
+    assert len(buf._addendum) == 11
+    n_dropped = buf.deduplicate_addendum(eps=0.04)
+    assert n_dropped == 9
+    assert len(buf._addendum) == 2
+
+
+def test_experience_buffer_cross_deduplication_and_memory_decay():
+    buf = ExperienceBuffer(seq_len=5, pool_capacity=3, seed=42)
+    s1 = _make_salve([0.1] * 53, [0.1] * 5)
+    s2 = _make_salve([0.5] * 53, [0.5] * 5)
+    s3 = _make_salve([0.9] * 53, [-0.9] * 5)
+
+    seq1 = [s1] * 5
+    seq2 = [s2] * 5
+    seq3 = [s3] * 5
+
+    # 1. Cold start: add seq1 and seq2 to Coreset
+    buf._addendum = [seq1, seq2]
+    res1 = buf.consolidate_addendum_into_coreset(eps=0.04, decay=0.0)
+    assert res1["added"] == 2
+    assert buf.coreset_size == 2
+    assert buf._coreset_vivacity == [1.0, 1.0]
+
+    # 2. Addendum contains a duplicate of seq1 and a novel seq3
+    s1_noisy = _make_salve([0.1005] * 53, [0.1] * 5)
+    seq1_noisy = [s1_noisy] * 5
+
+    # First decay Coreset by 0.20 -> vivacities become 0.80
+    buf._coreset_vivacity = [0.80, 0.80]
+
+    buf._addendum = [seq1_noisy, seq3]
+    # Consolidate with decay=0.01
+    res2 = buf.consolidate_addendum_into_coreset(eps=0.04, decay=0.01)
+
+    assert res2["refreshed"] == 1  # seq1 was refreshed
+    assert res2["added"] == 1      # seq3 was added
+    assert buf.coreset_size == 3
+
+    # seq1 vivacity was 1.0 - 0.01 = 0.99
+    # seq2 vivacity was 0.80 - 0.01 = 0.79
+    # seq3 vivacity was 1.0 - 0.01 = 0.99
+    assert abs(buf._coreset_vivacity[0] - 0.99) < 1e-3
+    assert abs(buf._coreset_vivacity[1] - 0.79) < 1e-3
+    assert abs(buf._coreset_vivacity[2] - 0.99) < 1e-3
+
+    # 3. Test capacity eviction: capacity is 3, add 1 more novel sequence
+    s4 = _make_salve([0.35] * 53, [0.0] * 5)
+    seq4 = [s4] * 5
+    buf._addendum = [seq4]
+    res3 = buf.consolidate_addendum_into_coreset(eps=0.04, decay=0.0)
+
+    assert buf.coreset_size == 3
+    assert res3["evicted"] == 1
+    # seq2 (lowest vivacity 0.79) was evicted!
+    assert seq2 not in buf._coreset
 
 
 if __name__ == "__main__":
@@ -608,12 +752,17 @@ if __name__ == "__main__":
     test_world_model_forward_and_predict_shapes()
     test_salve_cost_sign()
     test_act_returns_five_consignes()
+    test_naive_sequence_distances_and_clustering()
+    test_experience_buffer_intra_addendum_deduplication()
+    test_experience_buffer_cross_deduplication_and_memory_decay()
     test_sleep_trains_both_models_and_world_loss_decreases()
     test_brain_drives_real_sim_and_sleeps()
     test_experience_buffer_linear_recording_and_sliding_windows()
     test_experience_buffer_boundary_and_discontinuity_isolation()
     test_experience_buffer_capacity_eviction()
     test_experience_buffer_clear()
+    test_coreset_addendum_prune_commit()
+    test_addendum_surprise_evaluation()
     test_brain_boundary_and_history_isolation()
     test_brain_record_stationary_pause_and_resume()
     test_brain_record_too_short_sequence_not_paused()
@@ -626,3 +775,4 @@ if __name__ == "__main__":
     test_three_futures_bellman_optimism()
     test_dream_record_and_dream_theater_rendering()
     print("all brain tests passed")
+

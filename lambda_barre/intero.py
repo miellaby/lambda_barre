@@ -43,14 +43,16 @@ class Intero:
 
     def update(self, reward: dict, dt: float) -> dict:
         effort = reward.get("effort", 0.0)
-        douleur = reward.get("douleur", 0.0)
+        reward_neg = reward.get("reward_neg", 0.0)
+        reward_pos = abs(reward.get("reward_pos", 0.0))
 
         self._fatigue += FATIGUE_RISE * effort * dt
         self._fatigue -= FATIGUE_FALL * self._fatigue * dt
         self._fatigue = max(0.0, min(1.0, self._fatigue))
 
-        self._souffrance += SOUFFRANCE_RISE * douleur * dt
-        self._souffrance -= SOUFFRANCE_FALL * self._souffrance * dt
+        # reward_neg fait monter la souffrance, reward_pos et l'évaporation passive la font baisser
+        self._souffrance += SOUFFRANCE_RISE * reward_neg * dt
+        self._souffrance -= (SOUFFRANCE_FALL * self._souffrance + SOUFFRANCE_RISE * reward_pos) * dt
         self._souffrance = max(0.0, min(1.0, self._souffrance))
 
         return {

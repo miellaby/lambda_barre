@@ -37,7 +37,7 @@ from .dream import DreamStep, DreamTrajectory, DreamRecord, REGIME_NAMES
 from .models import build_salve_mask
 from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
-                       _COST_IDX, _REWARD_IDX, _COST_KEYS, _COST_WEIGHTS,
+                       _COST_IDX, _REWARD_IDX, _INTERO_IDX, _COST_KEYS, _COST_WEIGHTS,
                        _BY_KEY, _LAYOUT, _prefix,
                        state_tokens, action_tokens)
 
@@ -50,8 +50,8 @@ _N_CTX = 4                                                 # 4 real transitions 
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
-# trajectory-cost: 5 unsigned cost signals (token 11) + 1 signed confort
-# signal (token 12). Denormalize: unsigned -> t*scale, signed -> (2t-1)*scale.
+# trajectory-cost: 5 unsigned cost signals (token 10) + 1 signed confort
+# signal (token 11). Denormalize: unsigned -> t*scale, signed -> (2t-1)*scale.
 _COST_SCALES = torch.tensor([_BY_KEY[k].max_val for k in _COST_KEYS],
                             dtype=torch.float32)              # [5]
 _COST_SIGNED = torch.tensor([_BY_KEY[k].signed for k in _COST_KEYS],
@@ -61,14 +61,14 @@ _COST_W = torch.tensor([_COST_WEIGHTS[k] for k in _COST_KEYS],
 _CONFORT_SCALE = _BY_KEY["confort"].max_val
 _CONFORT_W = _COST_WEIGHTS["confort"]
 
-# Flat signal-grid indices for the 47 policy scalars: tokens 0..10, first
+# Flat signal-grid indices for the 45 policy scalars: tokens 0..9, first
 # _N_SIGNALS[i] slots each. Used to gather them in one op from a [B, 13, 16]
 # signal grid.
 _POL_SCALAR_IDX = []
-for _i in range(_COST_IDX):               # tokens 0..10
+for _i in range(_COST_IDX):               # tokens 0..9
     for _k in range(_N_SIGNALS[_i]):
         _POL_SCALAR_IDX.append(_i * N_SIGNAL + _k)
-assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 47
+assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 45
 # print(f"policy scalars: {_POL_SCALAR_IDX} (len={len(_POL_SCALAR_IDX)})")
 
 # Action encoding metadata: 5 consignes → (token-within-action-block, slot,
@@ -93,9 +93,14 @@ _ACT_TEMPLATE = torch.tensor(
 # Per-target-position valid-slot mask: position p predicts token p+1, whose
 # token index within a salve is (p+1) % 16 — only its first ``_N_SIGNALS[tidx]``
 # signal slots are real (the rest are zero-padded and excluded from the loss).
+# For Token 12 (interoception delta): intermediate salves (0..SEQ_STEPS-1) are
+# zero-padded and excluded from the loss; only the terminal salve
+# (position _SEQ_LEN - 2, predicting the final token 172) is trained.
 _target_valid = torch.zeros(_SEQ_LEN - 1, N_SIGNAL, dtype=torch.bool)
 for _p in range(_SEQ_LEN - 1):
     _tidx = (_p + 1) % SALVE_TOKENS
+    if _tidx == _INTERO_IDX and (_p + 1) < (_SEQ_LEN - 1):
+        continue
     _target_valid[_p, :_N_SIGNALS[_tidx]] = True
 
 # Salve-within-type attention mask for the fixed training sequence.
@@ -105,7 +110,7 @@ _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
 #   - animal: proprioception (tokens 0..3) and touch (tokens 8..9)
 #   - environnement: vision (tokens 4, 6), cursor/sound (tokens 5, 7), touch (tokens 8..9)
 #   - consignes: action (tokens 13..15)
-# Excludes interoception (token 10) and reward/cost accumulators (tokens 11, 12).
+# Excludes reward/cost accumulators (tokens 10, 11) and interoception (token 12).
 _STATIC_SOURCES = {"proprio", "touch", "cursor", "vision", "action"}
 _STATIC_TOKENS = tuple(ch.idx for ch in _LAYOUT if ch.source in _STATIC_SOURCES)
 
@@ -125,36 +130,131 @@ def _salve_moved(s1: list[list[float]], s2: list[list[float]],
                 return True
     return False
 
+# --- naive sequence distance & clustering across all channels -----------------
+def _sequence_signals_tensor(sequences: list[list[list[float]]],
+                             device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    """Flatten all signal slots across all tokens in each sequence into a [N, D] float tensor.
+    D = len(seq) * SALVE_TOKENS * N_SIGNAL (e.g. 11 * 16 * 16 = 2816).
+    Naive distance takes all channels into account."""
+    if not sequences:
+        return torch.empty(0, 0, device=device)
+    flat_list = []
+    for seq in sequences:
+        seq_sigs = []
+        for salve in seq:
+            for tok in salve:
+                seq_sigs.extend(tok[SIG_OFFSET:])
+        flat_list.append(seq_sigs)
+    return torch.tensor(flat_list, dtype=torch.float32, device=device)
+
+
+def pairwise_sequence_distances(sequences: list[list[list[float]]],
+                                device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    """Pairwise naive RMSE distance matrix [N, N] across all channels and tokens."""
+    X = _sequence_signals_tensor(sequences, device)
+    N, D = X.shape
+    if N <= 1 or D == 0:
+        return torch.zeros(N, N, device=device)
+    return torch.cdist(X, X) / (D ** 0.5)
+
+
+def cross_sequence_distances(seqs_a: list[list[list[float]]],
+                             seqs_b: list[list[list[float]]],
+                             device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    """Cross naive RMSE distance matrix [N_a, N_b] across all channels and tokens."""
+    Xa = _sequence_signals_tensor(seqs_a, device)
+    Xb = _sequence_signals_tensor(seqs_b, device)
+    if Xa.shape[0] == 0 or Xb.shape[0] == 0 or Xa.shape[1] == 0:
+        return torch.empty(Xa.shape[0], Xb.shape[0], device=device)
+    D = Xa.shape[1]
+    return torch.cdist(Xa, Xb) / (D ** 0.5)
+
+
+def complete_linkage_clustering(dist_matrix: torch.Tensor, eps: float) -> list[list[int]]:
+    """Complete linkage agglomerative clustering with threshold eps.
+    Guarantees that all members within a cluster have pairwise distance <= eps."""
+    n = dist_matrix.shape[0]
+    clusters = [[i] for i in range(n)]
+    if n <= 1:
+        return clusters
+
+    active = list(range(n))
+    cdist = dist_matrix.clone()
+
+    while len(active) > 1:
+        sub_dist = cdist[active][:, active]
+        diag_mask = torch.eye(len(active), dtype=torch.bool, device=dist_matrix.device)
+        sub_dist[diag_mask] = float("inf")
+        min_val, flat_idx = torch.min(sub_dist.view(-1), dim=0)
+        if min_val.item() > eps:
+            break
+
+        i_idx = flat_idx.item() // len(active)
+        j_idx = flat_idx.item() % len(active)
+        ci = active[i_idx]
+        cj = active[j_idx]
+
+        clusters[ci].extend(clusters[cj])
+        clusters[cj] = []
+
+        cdist[ci] = torch.maximum(cdist[ci], cdist[cj])
+        cdist[:, ci] = cdist[ci]
+
+        active.remove(cj)
+
+    return [c for c in clusters if c]
+
+
+def select_medoids(clusters: list[list[int]], dist_matrix: torch.Tensor) -> list[int]:
+    """Select the medoid (most central representative) for each cluster."""
+    medoids = []
+    for c in clusters:
+        if len(c) == 1:
+            medoids.append(c[0])
+        else:
+            sub_d = dist_matrix[c][:, c]
+            sum_d = sub_d.sum(dim=1)
+            best_idx = torch.argmin(sum_d).item()
+            medoids.append(c[best_idx])
+    return medoids
+
 
 class ExperienceBuffer:
-    """Two-tier experience memory: continuous linear session journal + persistent sequence replay pool.
+    """Two-tier experience memory: Coreset (long-term consolidated) + Addendum (wake session journal).
 
-    Tier 1 - Session Journal:
-        Transitions are recorded sequentially into contiguous segments of experience during wake time.
-        A segment represents an unbroken period of real-time physical simulation.
-        When a discontinuity event occurs (e.g. facing direction flip, environment
-        reset, teleportation), ``boundary()`` is called to seal the current segment
-        and begin a new clean segment. This guarantees that no training sequence
-        ever bridges across a discontinuity.
-
-    Tier 2 - Persistent Sequence Replay Pool:
-        Before or during sleep training, ``consolidate()`` extracts sliding-window
-        sequences of length ``seq_len`` (with stride) from the session journal into
-        a persistent replay pool (FIFO deque).
-        The linear session journal is cleared upon waking (via ``clear_journal()``),
-        while the replay pool persists across sleep cycles to prevent catastrophic
-        forgetting on short wake sessions.
+    Conforming to the Lambda barre specification:
+      - Wake session: transitions are journaled into linear segments.
+      - At sleep time:
+          1. extract_addendum() extracts all sliding-window sequences of length seq_len
+             from the wake session into _addendum.
+          2. prune_coreset(pct) randomly moves ~33% of _coreset sequences into _addendum
+             as active forgetting candidates.
+          3. filter_addendum() retains only surprising sequences evaluated by the World Model.
+          4. commit_addendum() merges the surviving sequences into _coreset.
     """
 
-    def __init__(self, seq_len: int = SEQ_STEPS + 1, capacity: int = 100_000,
-                 pool_capacity: int = 100_000, seed: int = 0):
+    def __init__(self, seq_len: int = SEQ_STEPS + 1, capacity: int = 1000,
+                 pool_capacity: int = 1000, seed: int = 0):
         self.seq_len = seq_len
         self.capacity = capacity
         self.pool_capacity = pool_capacity
         self._segments: deque[list[list[float]]] = deque()
         self._current: list[list[float]] = []
-        self._persistent_pool: deque[list[list[float]]] = deque(maxlen=pool_capacity)
+        self._coreset: list[list[list[float]]] = []
+        self._coreset_vivacity: list[float] = []
+        self._addendum: list[list[list[float]]] = []
+        self._addendum_meta: list[str] = []
         self._rng = random.Random(seed)
+
+    @property
+    def _persistent_pool(self) -> list[list[list[float]]]:
+        """Backward compatibility alias for _coreset."""
+        return self._coreset
+
+    @_persistent_pool.setter
+    def _persistent_pool(self, val) -> None:
+        self._coreset = list(val)[:self.pool_capacity]
+        self._coreset_vivacity = [1.0] * len(self._coreset)
 
     @property
     def _valid_segments(self) -> list[list[list[float]]]:
@@ -174,8 +274,18 @@ class ExperienceBuffer:
 
     @property
     def pool_size(self) -> int:
-        """Number of ready-to-train sequences stored in the persistent replay pool."""
-        return len(self._persistent_pool)
+        """Backward-compatible alias for coreset_size."""
+        return len(self._coreset)
+
+    @property
+    def coreset_size(self) -> int:
+        """Number of sequences stored in the long-term consolidated Coreset."""
+        return len(self._coreset)
+
+    @property
+    def addendum_size(self) -> int:
+        """Number of sequences currently in the Addendum (including extractable wake journal)."""
+        return len(self._addendum) + self.journal_len
 
     @property
     def journal_len(self) -> int:
@@ -186,8 +296,8 @@ class ExperienceBuffer:
         return total
 
     def __len__(self) -> int:
-        """Total number of sequences available for training (persistent pool + session journal)."""
-        return len(self._persistent_pool) + self.journal_len
+        """Total number of sequences available (coreset + addendum + session journal)."""
+        return len(self._coreset) + len(self._addendum) + self.journal_len
 
     def push(self, salve: list[list[float]]) -> None:
         """Append one transition salve to the current active segment."""
@@ -209,10 +319,9 @@ class ExperienceBuffer:
         """Alias for boundary()."""
         self.boundary()
 
-    def consolidate(self, stride: int = 1) -> int:
-        """Extract sequences of length ``seq_len`` from all valid segments
-        in the session journal and append them to the persistent replay pool.
-        Clears the extracted session segments from the journal so they are not re-processed.
+    def extract_addendum(self, stride: int = 1) -> int:
+        """Extract sliding-window sequences from all valid segments in the session
+        journal into the Addendum. Clears the session segments so they are not re-processed.
 
         Returns the number of new sequences added.
         """
@@ -223,40 +332,196 @@ class ExperienceBuffer:
             if n_windows <= 0:
                 continue
             for offset in range(0, n_windows, stride):
-                self._persistent_pool.append(seg[offset : offset + self.seq_len])
+                self._addendum.append(seg[offset : offset + self.seq_len])
+                self._addendum_meta.append("wake")
                 added += 1
             if (n_windows - 1) % stride != 0:
-                self._persistent_pool.append(seg[n_windows - 1 : n_windows - 1 + self.seq_len])
+                self._addendum.append(seg[n_windows - 1 : n_windows - 1 + self.seq_len])
+                self._addendum_meta.append("wake")
                 added += 1
         self._segments.clear()
         self._current.clear()
         return added
 
+    def prune_coreset(self, pct: float = 0.33) -> int:
+        """Move pct (default 33%) of sequences from Coreset into Addendum.
+        These become candidates for active forgetting.
+        Sequences with lower vivacity are selected in priority.
+        Returns the number of sequences moved.
+        """
+        if len(self._coreset) <= 1 or pct <= 0.0:
+            return 0
+        n_prune = max(1, int(len(self._coreset) * pct))
+        n_prune = min(n_prune, len(self._coreset) - 1)
+        while len(self._coreset_vivacity) < len(self._coreset):
+            self._coreset_vivacity.append(1.0)
+        # Order by vivacity ascending with random tie-breaker: coldest memories pruned first
+        order = sorted(range(len(self._coreset)), key=lambda i: (self._coreset_vivacity[i], self._rng.random()))
+        prune_indices = set(order[:n_prune])
+        new_coreset = []
+        new_viv = []
+        for i, seq in enumerate(self._coreset):
+            if i in prune_indices:
+                self._addendum.append(seq)
+                self._addendum_meta.append("coreset")
+            else:
+                new_coreset.append(seq)
+                new_viv.append(self._coreset_vivacity[i])
+        self._coreset = new_coreset
+        self._coreset_vivacity = new_viv
+        return n_prune
+
+    def deduplicate_addendum(self, eps: float = 0.04) -> int:
+        """Intra-Addendum deduplication via complete linkage clustering on naive RMSE distances.
+        Groups sequences at distance <= eps across all channels and tokens, and keeps only the medoid of each group.
+        Returns the number of duplicate sequences removed."""
+        if len(self._addendum) <= 1:
+            return 0
+        D = pairwise_sequence_distances(self._addendum)
+        clusters = complete_linkage_clustering(D, eps=eps)
+        medoid_indices = select_medoids(clusters, D)
+        n_dropped = len(self._addendum) - len(medoid_indices)
+        if n_dropped > 0:
+            self._addendum = [self._addendum[i] for i in medoid_indices]
+            if len(self._addendum_meta) >= len(medoid_indices):
+                self._addendum_meta = [self._addendum_meta[i] for i in medoid_indices]
+        return n_dropped
+
+    def consolidate_addendum_into_coreset(self, eps: float = 0.04, decay: float = 0.01,
+                                          dedup_intra: bool = True) -> dict:
+        """Cross-deduplicate Addendum against Coreset and update memory vivacity traces.
+
+        1. If dedup_intra is True, first removes redundant duplicates within Addendum.
+        2. Compares each surviving Addendum sequence against Coreset with naive distance.
+           - If dist < eps: Duplicate of existing memory -> refreshes Coreset memory vivacity to 1.0.
+           - If dist >= eps: Novel memory -> added to Coreset with vivacity 1.0.
+        3. Applies memory decay (-decay, default -0.01) across all Coreset vivacities.
+        4. Evicts lowest-vivacity memories if Coreset exceeds pool_capacity.
+        5. Clears Addendum.
+        """
+        n_intra_dropped = 0
+        if dedup_intra and len(self._addendum) > 1:
+            n_intra_dropped = self.deduplicate_addendum(eps=eps)
+
+        n_refreshed = 0
+        n_added = 0
+
+        while len(self._coreset_vivacity) < len(self._coreset):
+            self._coreset_vivacity.append(1.0)
+
+        if not self._coreset:
+            for seq in self._addendum:
+                self._coreset.append(seq)
+                self._coreset_vivacity.append(1.0)
+                n_added += 1
+        elif self._addendum:
+            cross_D = cross_sequence_distances(self._addendum, self._coreset)
+            min_dists, min_indices = torch.min(cross_D, dim=1)
+
+            for i, seq in enumerate(self._addendum):
+                d_min = min_dists[i].item()
+                idx_core = min_indices[i].item()
+                if d_min < eps:
+                    self._coreset_vivacity[idx_core] = 1.0
+                    n_refreshed += 1
+                else:
+                    self._coreset.append(seq)
+                    self._coreset_vivacity.append(1.0)
+                    n_added += 1
+
+        if decay > 0.0:
+            self._coreset_vivacity = [max(0.0, v - decay) for v in self._coreset_vivacity]
+
+        n_evicted = 0
+        if len(self._coreset) > self.pool_capacity:
+            excess = len(self._coreset) - self.pool_capacity
+            paired = sorted(zip(self._coreset_vivacity, self._coreset), key=lambda x: x[0], reverse=True)
+            kept = paired[:self.pool_capacity]
+            self._coreset_vivacity = [v for v, _ in kept]
+            self._coreset = [s for _, s in kept]
+            n_evicted = excess
+
+        self._addendum.clear()
+        self._addendum_meta.clear()
+
+        return {
+            "dedup_intra_dropped": n_intra_dropped,
+            "added": n_added,
+            "refreshed": n_refreshed,
+            "evicted": n_evicted,
+            "coreset_size": len(self._coreset),
+        }
+
+    def filter_addendum(self, kept: list[list[list[float]]],
+                        kept_meta: list[str] | None = None) -> None:
+        """Replace Addendum with only the retained sequences."""
+        self._addendum = list(kept)
+        if kept_meta is not None:
+            self._addendum_meta = list(kept_meta)
+        else:
+            self._addendum_meta = self._addendum_meta[:len(kept)]
+
+    def commit_addendum(self, dedup: bool = False, eps: float = 0.04, decay: float = 0.01) -> int:
+        """Merge all surviving Addendum sequences into Coreset, then clear Addendum.
+        If dedup=True, uses consolidate_addendum_into_coreset; otherwise uses direct extend.
+        Returns the number of sequences committed.
+        """
+        if dedup:
+            stats = self.consolidate_addendum_into_coreset(eps=eps, decay=decay)
+            return stats["added"]
+        n = len(self._addendum)
+        self._coreset.extend(self._addendum)
+        self._coreset_vivacity.extend([1.0] * n)
+        self._addendum.clear()
+        self._addendum_meta.clear()
+        return n
+
+    def consolidate(self, stride: int = 1) -> int:
+        """Backward-compatible extraction + immediate commit."""
+        added = self.extract_addendum(stride=stride)
+        self.commit_addendum()
+        return added
+
     def clear_journal(self) -> None:
-        """Discard active and archived segments in the session journal, preserving the persistent pool."""
+        """Discard active and archived segments in the session journal, preserving Coreset and Addendum."""
         self._segments.clear()
         self._current.clear()
 
     def clear(self) -> None:
-        """Discard all session segments AND the persistent replay pool."""
+        """Discard all session segments, Addendum, and Coreset."""
         self.clear_journal()
-        self._persistent_pool.clear()
+        self._coreset.clear()
+        self._coreset_vivacity.clear()
+        self._addendum.clear()
+        self._addendum_meta.clear()
 
     def save(self, path: str) -> None:
-        """Save the persistent replay pool and active segments to disk."""
+        """Save Coreset, Addendum, and active segments to disk."""
         torch.save({
-            "persistent_pool": list(self._persistent_pool),
+            "coreset": list(self._coreset),
+            "coreset_vivacity": list(self._coreset_vivacity),
+            "persistent_pool": list(self._coreset),
+            "addendum": list(self._addendum),
+            "addendum_meta": list(self._addendum_meta),
             "segments": list(self._segments),
             "current": self._current,
         }, path)
 
     def load(self, path: str) -> bool:
-        """Load persistent replay pool and segments from disk. Returns True if loaded."""
+        """Load Coreset, Addendum, and segments from disk. Returns True if loaded."""
         if os.path.exists(path):
             data = torch.load(path, weights_only=False)
-            self._persistent_pool = deque(data.get("persistent_pool", []), maxlen=self.pool_capacity)
+            pool = data.get("coreset", data.get("persistent_pool", []))
+            self._coreset = [list(seq) for seq in pool][:self.pool_capacity]
+            viv = data.get("coreset_vivacity", None)
+            if viv is not None and len(viv) == len(self._coreset):
+                self._coreset_vivacity = [float(v) for v in viv]
+            else:
+                self._coreset_vivacity = [1.0] * len(self._coreset)
+            self._addendum = list(data.get("addendum", []))
+            self._addendum_meta = list(data.get("addendum_meta", []))
             self._segments = deque(data.get("segments", []))
-            self._current = data.get("current", [])
+            self._current = list(data.get("current", []))
             return True
         return False
 
@@ -277,16 +542,31 @@ class ExperienceBuffer:
             trim = min(excess, removable)
             self._current = self._current[trim:]
 
+    def sample_coreset(self, batch: int) -> list[list[list[float]]]:
+        """Sample ``batch`` sequences from the Coreset."""
+        if not self._coreset:
+            return []
+        k = min(batch, len(self._coreset))
+        return self._rng.sample(list(self._coreset), k)
+
+    def sample_addendum(self, batch: int) -> list[list[list[float]]]:
+        """Sample ``batch`` sequences from the Addendum."""
+        if not self._addendum:
+            return []
+        k = min(batch, len(self._addendum))
+        return self._rng.sample(self._addendum, k)
+
     def sample(self, batch: int) -> list[list[list[float]]]:
         """Sample ``batch`` sequences of length ``seq_len``.
 
-        If the persistent pool has sequences, samples uniformly from it.
-        Otherwise, samples uniformly from valid sliding windows across all segments in the journal.
+        Prioritizes Coreset + Addendum if available.
+        Otherwise falls back to sliding windows in the journal.
         Returns [] if empty.
         """
-        if self._persistent_pool:
-            k = min(batch, len(self._persistent_pool))
-            return self._rng.sample(self._persistent_pool, k)
+        pool = list(self._coreset) + self._addendum
+        if pool:
+            k = min(batch, len(pool))
+            return self._rng.sample(pool, k)
 
         valid_segs = self._valid_segments
         if not valid_segs:
@@ -367,6 +647,9 @@ class Brain:
         self._cached_scalars = None  # [1, 47] — scalar state at last wake_tick
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
+        self.last_wm_coreset_loss = float("nan")
+        self.last_wm_addendum_loss = float("nan")
+        self.last_filter_stats: dict | None = None
         self.last_pol_loss = float("nan")
         self.last_dream_record: DreamRecord | None = None
         self.sleep_wm_epochs = 0
@@ -556,7 +839,41 @@ class Brain:
                         salve[STATE_TOKENS:SALVE_TOKENS], dtype=torch.float32, device=self.device)
                     pos += ACTION_TOKENS
             assert pos == _SEQ_LEN, f"Expected pos={_SEQ_LEN}, got {pos}"
+
+            # Zero-padding for intermediate Token 12 (interoception) in salves 0..SEQ_STEPS-1
+            for k in range(SEQ_STEPS):
+                p_intero = k * SALVE_TOKENS + _INTERO_IDX
+                vals[b, p_intero, SIG_OFFSET:] = 0.0
+
+            # Terminal Token 12 in salve SEQ_STEPS: compute delta between s_last and s_0
+            p_final = SEQ_STEPS * SALVE_TOKENS + _INTERO_IDX
+            s0_intero = seq[0][_INTERO_IDX]
+            s_last_intero = seq[-1][_INTERO_IDX]
+            f0, sf0 = s0_intero[SIG_OFFSET], s0_intero[SIG_OFFSET + 1]
+            f_last, sf_last = s_last_intero[SIG_OFFSET], s_last_intero[SIG_OFFSET + 1]
+            # Signed delta normalized to [0, 1]: (delta + 1.0) / 2.0
+            d_fat = max(0.0, min(1.0, (f_last - f0 + 1.0) / 2.0))
+            d_sf = max(0.0, min(1.0, (sf_last - sf0 + 1.0) / 2.0))
+            vals[b, p_final, SIG_OFFSET] = d_fat
+            vals[b, p_final, SIG_OFFSET + 1] = d_sf
+            vals[b, p_final, SIG_OFFSET + 2:] = 0.0
         return vals
+
+    def _train_wm_batch(self, sequences: list[list[list[float]]]) -> float:
+        """Run one training optimization step on a batch of transition sequences."""
+        vals = self._batch_tensors(sequences)             # [B, L, 25]
+        pred = self.world(vals, attn_mask=self.mask)      # [B, L, 16]
+        pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
+        tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
+        m = self.target_valid                            # [L-1, 16]
+        m_b = m.unsqueeze(0).expand_as(pred_signals)     # [B, L-1, 16]
+        sq = (pred_signals - tgt_signals) ** 2
+        loss = (sq * m_b).sum() / m_b.sum().clamp(min=1)
+        self.opt_wm.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
+        self.opt_wm.step()
+        return loss.item()
 
     def train_world(self, epochs: int = 512, batch: int = 32):
         """Train the world model. Generator: yields (label, value) after each
@@ -570,25 +887,65 @@ class Brain:
             sequences = self.buffer.sample(batch)
             if not sequences:
                 break
-            vals = self._batch_tensors(sequences)             # [B, L, 25]
-            cost_token = vals[0, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-            # print("target token 11:", cost_token)
-            # print("mask token 11:", self.target_valid[_COST_IDX - 1, :5])
-            pred = self.world(vals, attn_mask=self.mask)  # [B, L, 16]
-            # position p predicts token p+1's signal slots
-            pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
-            tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
-            m = self.target_valid                              # [L-1, 16]
-            m_b = m.unsqueeze(0).expand_as(pred_signals)        # [B, L-1, 16]
-            sq = (pred_signals - tgt_signals) ** 2
-            loss = (sq * m_b).sum() / m_b.sum().clamp(min=1)
-            self.opt_wm.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
-            self.opt_wm.step()
-            losses.append(loss.item())
-            yield "wm", loss.item()
+            loss_val = self._train_wm_batch(sequences)
+            losses.append(loss_val)
+            yield "wm", loss_val
         self.last_wm_loss = sum(losses) / len(losses) if losses else float("nan")
+
+    def evaluate_sequences_surprise(self, sequences: list[list[list[float]]], batch_size: int = 32) -> list[float]:
+        """Evaluate surprise scores for a list of sequences under the current World Model.
+
+        Surprise score combines:
+          1. Dynamical prediction error (MSE over valid sensor token positions).
+          2. Discrepancy between predicted and actual innate cost/reward over the trajectory.
+          Surprise = dyn_loss * (1.0 + mean_cost_divergence).
+        """
+        if not sequences:
+            return []
+        self.world.eval()
+        surprises: list[float] = []
+        n_cost = len(_COST_KEYS)
+        with torch.no_grad():
+            for i in range(0, len(sequences), batch_size):
+                chunk = sequences[i : i + batch_size]
+                B = len(chunk)
+                vals = self._batch_tensors(chunk)
+                pred = self.world(vals, attn_mask=self.mask)
+                pred_signals = pred[:, :-1, :]
+                tgt_signals = vals[:, 1:, SIG_OFFSET:]
+                m_b = self.target_valid.unsqueeze(0).expand_as(pred_signals)
+
+                sq = (pred_signals - tgt_signals) ** 2
+                valid_counts = m_b.sum(dim=[1, 2]).clamp(min=1)
+                dyn_loss = (sq * m_b).sum(dim=[1, 2]) / valid_counts  # [B]
+
+                cost_diff_sum = torch.zeros(B, device=self.device)
+                for k in range(1, SEQ_STEPS + 1):
+                    p_cost = k * SALVE_TOKENS + _COST_IDX - 1
+                    p_conf = k * SALVE_TOKENS + _REWARD_IDX - 1
+
+                    c_pred = pred_signals[:, p_cost, :n_cost]
+                    denorm_pred = torch.where(self._cost_signed,
+                                              (2 * c_pred - 1) * self._cost_scales,
+                                              c_pred * self._cost_scales)
+                    conf_pred = pred_signals[:, p_conf, 0]
+                    conf_phys_pred = (2 * conf_pred - 1) * _CONFORT_SCALE
+                    cost_pred = (denorm_pred * self._cost_w).sum(1) + _CONFORT_W * conf_phys_pred
+
+                    c_tgt = tgt_signals[:, p_cost, :n_cost]
+                    denorm_tgt = torch.where(self._cost_signed,
+                                             (2 * c_tgt - 1) * self._cost_scales,
+                                             c_tgt * self._cost_scales)
+                    conf_tgt = tgt_signals[:, p_conf, 0]
+                    conf_phys_tgt = (2 * conf_tgt - 1) * _CONFORT_SCALE
+                    cost_tgt = (denorm_tgt * self._cost_w).sum(1) + _CONFORT_W * conf_phys_tgt
+
+                    cost_diff_sum += (cost_pred - cost_tgt).abs()
+
+                mean_cost_diff = cost_diff_sum / SEQ_STEPS
+                seq_surprise = dyn_loss * (1.0 + mean_cost_diff)
+                surprises.extend(seq_surprise.tolist())
+        return surprises
 
     def _salve_cost_batch(self, gen: torch.Tensor) -> torch.Tensor:
         """Vectorized ``salve_cost`` over a batch of predicted states.
@@ -681,7 +1038,7 @@ class Brain:
 
     # --- sleep: policy training via real context + imagined rollout ----------
     def train_policy(self, steps: int = 16, batch: int = 32,
-                     gamma: float = 0.9, n_imagine: int = 6):
+                     gamma: float = 1.1, n_imagine: int = 6):
         """Policy training via candidate evaluation in WM imagination.
         Generator: yields (label, value) after each step."""
         if len(self.buffer) < 1:
@@ -956,30 +1313,199 @@ class Brain:
     # --- sleep entry point ---------------------------------------------------
     def sleep(self, wm_epochs: int = 128, wm_batch: int = 64,
               pol_steps: int = 64, pol_batch: int = 32,
-              pol_n_imagine: int = 6, clear_buffer: bool = True):
-        """One full sleep cycle. Generator: yields (phase, value) after each
-        training step so the caller can keep the UI responsive.
+              pol_n_imagine: int = 6, clear_buffer: bool = True,
+              prune_pct: float = 0.33, surprise_factor: float = 1.0,
+              pol_gamma: float = 1.1):
+        """One full sleep cycle with Coreset / Addendum and active forgetting.
 
-        Consolidates the active session journal into the persistent replay pool
-        before training, ensuring recent experience is rehearsed alongside
-        historical experience without catastrophic forgetting."""
+        Phases:
+          1. Consolidate wake session journal into Addendum (added_wake).
+          2. Prune ~33% of Coreset into Addendum as candidates for active forgetting.
+          3. Phase 1: Train World Model on the pruned Coreset (yielding 'wm_coreset').
+          4. Filter Addendum: evaluate surprise under updated WM (dynamics + cost divergence).
+             Discard familiar sequences; retain surprising sequences.
+          5. Phase 2: Train World Model on the surviving Addendum (yielding 'wm_addendum').
+          6. Policy training via imagined rollouts (yielding 'pol').
+          7. Consolidation: commit Addendum into Coreset, refresh wake latent, yield 'done'.
+        """
         self.mode = "sleep"
         self.last_dream_record = None
-        self.buffer.consolidate()
 
-        self.sleep_wm_epochs = wm_epochs
-        self.sleep_wm_step = 0
+        # 1. Extract recent wake session into Addendum
+        self.buffer.extract_addendum()
 
-        for label, value in self.train_world(wm_epochs, wm_batch):
+        # 1b. Intra-Addendum deduplication via naive distance across all channels
+        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04)
+        if n_intra_dropped > 0:
+            print(f"[sleep:intra-addendum] {n_intra_dropped} doublons redondants éliminés de l'Addendum.")
+
+        # 2. Prune candidates from Coreset into Addendum (active forgetting)
+        n_pruned = 0
+        if self.buffer.coreset_size > 1 and prune_pct > 0.0:
+            n_pruned = self.buffer.prune_coreset(prune_pct)
+
+        yield "prune", {
+            "pruned": n_pruned,
+            "coreset": self.buffer.coreset_size,
+            "addendum": self.buffer.addendum_size,
+        }
+
+        # 3. Epoch allocation between Coreset and Addendum
+        has_coreset = (self.buffer.coreset_size > 0)
+        has_addendum = (self.buffer.addendum_size > 0)
+
+        if not has_coreset and not has_addendum:
+            self.mode = "wake"
+            yield "done", {"wm_loss": float("nan"), "pol_loss": float("nan")}
+            return
+
+        if has_coreset:
+            if has_addendum:
+                epochs_core = max(1, int(wm_epochs * 0.7))
+                epochs_add = wm_epochs - epochs_core
+            else:
+                epochs_core = wm_epochs
+                epochs_add = 0
+        else:
+            epochs_core = 0
+            epochs_add = wm_epochs
+
+        # 4. Phase 1: Train World Model on Coreset
+        core_losses = []
+        if epochs_core > 0:
+            self.world.train()
+            self.sleep_wm_epochs = epochs_core
+            for ep in range(epochs_core):
+                self.sleep_wm_step = ep + 1
+                seqs = self.buffer.sample_coreset(wm_batch)
+                if not seqs:
+                    break
+                loss_val = self._train_wm_batch(seqs)
+                core_losses.append(loss_val)
+                yield "wm_coreset", loss_val
+        self.last_wm_coreset_loss = (sum(core_losses) / len(core_losses)) if core_losses else float("nan")
+
+        # 5. Filter Addendum using the updated WM
+        n_initial = self.buffer.addendum_size
+        n_kept = n_initial
+        n_dropped = 0
+        wake_kept = 0
+        wake_dropped = 0
+        core_kept = 0
+        core_dropped = 0
+        mean_kept = 0.0
+        mean_drop = 0.0
+        pct_drop = 0.0
+        threshold = 0.0
+
+        if self.buffer.addendum_size > 0:
+            if has_coreset and not math.isnan(self.last_wm_coreset_loss):
+                threshold = max(self.last_wm_coreset_loss * surprise_factor, 1e-4)
+                surprises = self.evaluate_sequences_surprise(self.buffer._addendum)
+                surviving = []
+                surviving_meta = []
+                kept_surprises = []
+                dropped_surprises = []
+
+                for i, (seq, s) in enumerate(zip(self.buffer._addendum, surprises)):
+                    origin = self.buffer._addendum_meta[i] if i < len(self.buffer._addendum_meta) else "wake"
+                    if s >= threshold:
+                        surviving.append(seq)
+                        surviving_meta.append(origin)
+                        kept_surprises.append(s)
+                        if origin == "coreset":
+                            core_kept += 1
+                        else:
+                            wake_kept += 1
+                    else:
+                        dropped_surprises.append(s)
+                        if origin == "coreset":
+                            core_dropped += 1
+                        else:
+                            wake_dropped += 1
+
+                n_kept = len(surviving)
+                n_dropped = n_initial - n_kept
+                pct_drop = (n_dropped / n_initial * 100.0) if n_initial > 0 else 0.0
+                mean_kept = (sum(kept_surprises) / len(kept_surprises)) if kept_surprises else 0.0
+                mean_drop = (sum(dropped_surprises) / len(dropped_surprises)) if dropped_surprises else 0.0
+
+                self.buffer.filter_addendum(surviving, surviving_meta)
+
+                # Console log (Option 2)
+                print("\n" + "=" * 62)
+                print(f"[sleep:filtrage addendum] Seuil de surprise: {threshold:.5f}")
+                print(f"  Total addendum: {n_initial} | Retirées: {n_dropped} ({pct_drop:.1f}%) | Retenues: {n_kept}")
+                if n_pruned > 0:
+                    print(f"  - 33% Coreset (oubli actif) : {core_dropped}/{n_pruned} oubliées ({core_kept} réinjectées)")
+                    print(f"  - Veille brute              : {wake_dropped}/{wake_dropped + wake_kept} éliminées ({wake_kept} retenues)")
+                print(f"  - Surprise moyenne : rejetées={mean_drop:.5f} | retenues={mean_kept:.5f}")
+                print("=" * 62 + "\n")
+            else:
+                # Cold start: keep everything in Addendum
+                n_kept = n_initial
+                n_dropped = 0
+                pct_drop = 0.0
+                print(f"[sleep:addendum] Démarrage initial: {n_initial} séquences conservées (pas de filtrage initial).")
+
+        self.last_filter_stats = {
+            "initial": n_initial,
+            "kept": n_kept,
+            "dropped": n_dropped,
+            "pct_dropped": pct_drop,
+            "wake_kept": wake_kept,
+            "wake_dropped": wake_dropped,
+            "core_kept": core_kept,
+            "core_dropped": core_dropped,
+            "mean_kept_surprise": mean_kept,
+            "mean_dropped_surprise": mean_drop,
+            "threshold": threshold,
+        }
+        yield "filter", self.last_filter_stats
+
+        # 6. Phase 2: Train World Model on surviving Addendum
+        add_losses = []
+        if self.buffer.addendum_size > 0 and epochs_add > 0:
+            self.world.train()
+            self.sleep_wm_epochs = epochs_add
+            for ep in range(epochs_add):
+                self.sleep_wm_step = ep + 1
+                seqs = self.buffer.sample_addendum(wm_batch)
+                if not seqs:
+                    break
+                loss_val = self._train_wm_batch(seqs)
+                add_losses.append(loss_val)
+                yield "wm_addendum", loss_val
+        self.last_wm_addendum_loss = (sum(add_losses) / len(add_losses)) if add_losses else float("nan")
+
+        all_wm_losses = core_losses + add_losses
+        self.last_wm_loss = (sum(all_wm_losses) / len(all_wm_losses)) if all_wm_losses else float("nan")
+
+        # 7. Train Policy (dream imagination)
+        for label, value in self.train_policy(pol_steps, pol_batch, gamma=pol_gamma, n_imagine=pol_n_imagine):
             yield label, value
-        for label, value in self.train_policy(pol_steps, pol_batch, n_imagine=pol_n_imagine):
-            yield label, value
-        # Refresh wake latent with newly trained WM weights to avoid wake shock
+
+        # 8. Consolidate Addendum into Coreset with cross-deduplication & memory decay
+        cons_stats = self.buffer.consolidate_addendum_into_coreset(eps=0.04, decay=0.01)
         self._refresh_wake_latent()
         self.mode = "wake"
+
+        print("\n" + "=" * 62)
+        print(f"[sleep:consolidation Coreset] Déduplication naïve (eps=0.04, decay=0.01) :")
+        print(f"  - Nouvelles mémoires ajoutées   : {cons_stats['added']}")
+        print(f"  - Mémoires existantes ravivées  : {cons_stats['refreshed']}")
+        print(f"  - Mémoires froides évincées     : {cons_stats['evicted']}")
+        print(f"  - Taille finale du Coreset      : {cons_stats['coreset_size']}")
+        print("=" * 62 + "\n")
+
         stats = {
             "wm_loss": self.last_wm_loss,
+            "wm_coreset_loss": self.last_wm_coreset_loss,
+            "wm_addendum_loss": self.last_wm_addendum_loss,
+            "filter": self.last_filter_stats,
+            "consolidation": cons_stats,
             "pol_loss": self.last_pol_loss,
+            "coreset_size": self.buffer.coreset_size,
         }
         yield "done", stats
 
@@ -1022,10 +1548,27 @@ class Brain:
         if os.path.exists(pol_path):
             sd = torch.load(pol_path, map_location=self.device, weights_only=True)
             if "policy" in sd:
-                self.policy.load_state_dict(sd["policy"])
+                p_sd = sd["policy"]
+                if "net.0.weight" in p_sd:
+                    cur_in = self.policy.net[0].in_features
+                    ckpt_in = p_sd["net.0.weight"].shape[1]
+                    if ckpt_in == cur_in + 2:
+                        # Adapt from 111 (45 phys + 2 intero + 64 latent) to 109 (45 phys + 64 latent)
+                        w = p_sd["net.0.weight"]
+                        p_sd["net.0.weight"] = torch.cat([w[:, :45], w[:, 47:]], dim=1)
+                try:
+                    self.policy.load_state_dict(p_sd)
+                except Exception as e:
+                    print(f"[warning] Policy load: {e}")
             if "latent_norm" in sd:
-                self.latent_norm.load_state_dict(sd["latent_norm"])
+                try:
+                    self.latent_norm.load_state_dict(sd["latent_norm"])
+                except Exception:
+                    pass
             if "opt_pol" in sd:
-                self.opt_pol.load_state_dict(sd["opt_pol"])
+                try:
+                    self.opt_pol.load_state_dict(sd["opt_pol"])
+                except Exception:
+                    pass
         if buf_path and os.path.exists(buf_path):
             self.buffer.load(buf_path)

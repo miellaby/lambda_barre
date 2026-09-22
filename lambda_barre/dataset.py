@@ -51,7 +51,7 @@ def generate_balance_dataset(
     intero = I.Intero()
     encoder = DenseEncoder()
 
-    buffer = ExperienceBuffer(capacity=100_000, pool_capacity=100_000, seed=seed)
+    buffer = ExperienceBuffer(capacity=1000, pool_capacity=1000, seed=seed)
 
     collected = 0
     falls = 0
