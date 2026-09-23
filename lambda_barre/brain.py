@@ -149,24 +149,34 @@ def _sequence_signals_tensor(sequences: list[list[list[float]]],
 
 
 def pairwise_sequence_distances(sequences: list[list[list[float]]],
-                                device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Pairwise naive RMSE distance matrix [N, N] across all channels and tokens."""
+                                device: torch.device = torch.device("cpu"),
+                                weights: torch.Tensor | None = None) -> torch.Tensor:
+    """Pairwise RMSE distance matrix [N, N] across all channels and tokens, optionally weighted by saliency."""
     X = _sequence_signals_tensor(sequences, device)
     N, D = X.shape
     if N <= 1 or D == 0:
         return torch.zeros(N, N, device=device)
+    if weights is not None:
+        w = weights.to(device=device, dtype=X.dtype).view(1, D)
+        X = X * torch.sqrt(w)
     return torch.cdist(X, X) / (D ** 0.5)
 
 
 def cross_sequence_distances(seqs_a: list[list[list[float]]],
                              seqs_b: list[list[list[float]]],
-                             device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Cross naive RMSE distance matrix [N_a, N_b] across all channels and tokens."""
+                             device: torch.device = torch.device("cpu"),
+                             weights: torch.Tensor | None = None) -> torch.Tensor:
+    """Cross RMSE distance matrix [N_a, N_b] across all channels and tokens, optionally weighted by saliency."""
     Xa = _sequence_signals_tensor(seqs_a, device)
     Xb = _sequence_signals_tensor(seqs_b, device)
     if Xa.shape[0] == 0 or Xb.shape[0] == 0 or Xa.shape[1] == 0:
         return torch.empty(Xa.shape[0], Xb.shape[0], device=device)
     D = Xa.shape[1]
+    if weights is not None:
+        w = weights.to(device=device, dtype=Xa.dtype).view(1, D)
+        w_sqrt = torch.sqrt(w)
+        Xa = Xa * w_sqrt
+        Xb = Xb * w_sqrt
     return torch.cdist(Xa, Xb) / (D ** 0.5)
 
 
@@ -371,13 +381,15 @@ class ExperienceBuffer:
         self._coreset_vivacity = new_viv
         return n_prune
 
-    def deduplicate_addendum(self, eps: float = 0.04) -> int:
-        """Intra-Addendum deduplication via complete linkage clustering on naive RMSE distances.
+    def deduplicate_addendum(self, eps: float = 0.04,
+                             weights: torch.Tensor | None = None) -> int:
+        """Intra-Addendum deduplication via complete linkage clustering on RMSE distances.
         Groups sequences at distance <= eps across all channels and tokens, and keeps only the medoid of each group.
+        Optionally uses saliency feature weights.
         Returns the number of duplicate sequences removed."""
         if len(self._addendum) <= 1:
             return 0
-        D = pairwise_sequence_distances(self._addendum)
+        D = pairwise_sequence_distances(self._addendum, weights=weights)
         clusters = complete_linkage_clustering(D, eps=eps)
         medoid_indices = select_medoids(clusters, D)
         n_dropped = len(self._addendum) - len(medoid_indices)
@@ -388,11 +400,12 @@ class ExperienceBuffer:
         return n_dropped
 
     def consolidate_addendum_into_coreset(self, eps: float = 0.04, decay: float = 0.01,
-                                          dedup_intra: bool = True) -> dict:
+                                          dedup_intra: bool = True,
+                                          weights: torch.Tensor | None = None) -> dict:
         """Cross-deduplicate Addendum against Coreset and update memory vivacity traces.
 
         1. If dedup_intra is True, first removes redundant duplicates within Addendum.
-        2. Compares each surviving Addendum sequence against Coreset with naive distance.
+        2. Compares each surviving Addendum sequence against Coreset with (optionally weighted) distance.
            - If dist < eps: Duplicate of existing memory -> refreshes Coreset memory vivacity to 1.0.
            - If dist >= eps: Novel memory -> added to Coreset with vivacity 1.0.
         3. Applies memory decay (-decay, default -0.01) across all Coreset vivacities.
@@ -401,7 +414,7 @@ class ExperienceBuffer:
         """
         n_intra_dropped = 0
         if dedup_intra and len(self._addendum) > 1:
-            n_intra_dropped = self.deduplicate_addendum(eps=eps)
+            n_intra_dropped = self.deduplicate_addendum(eps=eps, weights=weights)
 
         n_refreshed = 0
         n_added = 0
@@ -415,7 +428,7 @@ class ExperienceBuffer:
                 self._coreset_vivacity.append(1.0)
                 n_added += 1
         elif self._addendum:
-            cross_D = cross_sequence_distances(self._addendum, self._coreset)
+            cross_D = cross_sequence_distances(self._addendum, self._coreset, weights=weights)
             min_dists, min_indices = torch.min(cross_D, dim=1)
 
             for i, seq in enumerate(self._addendum):
@@ -461,13 +474,14 @@ class ExperienceBuffer:
         else:
             self._addendum_meta = self._addendum_meta[:len(kept)]
 
-    def commit_addendum(self, dedup: bool = False, eps: float = 0.04, decay: float = 0.01) -> int:
+    def commit_addendum(self, dedup: bool = False, eps: float = 0.04, decay: float = 0.01,
+                        weights: torch.Tensor | None = None) -> int:
         """Merge all surviving Addendum sequences into Coreset, then clear Addendum.
         If dedup=True, uses consolidate_addendum_into_coreset; otherwise uses direct extend.
         Returns the number of sequences committed.
         """
         if dedup:
-            stats = self.consolidate_addendum_into_coreset(eps=eps, decay=decay)
+            stats = self.consolidate_addendum_into_coreset(eps=eps, decay=decay, weights=weights)
             return stats["added"]
         n = len(self._addendum)
         self._coreset.extend(self._addendum)
@@ -951,6 +965,57 @@ class Brain:
                 surprises.extend(seq_surprise.tolist())
         return surprises
 
+    def compute_saliency_weights(self, sequences: list[list[list[float]]] | None = None,
+                                 batch_size: int = 32,
+                                 floor_pct: float = 0.05) -> torch.Tensor:
+        """Compute sequence feature sensitivity weights [2816] backpropagated from terminal EOS delta.
+
+        Uses the World Model's autograd gradients on the terminal interoception token
+        (position _SEQ_LEN - 2, predicting token 172: delta fatigue and delta pain).
+
+        Returns a 1D tensor of shape [2816] with mean == 1.0, suitable for weighted RMSE distance.
+        If buffer is empty and no sequences provided, returns uniform ones tensor.
+        """
+        D_TOTAL = (SEQ_STEPS + 1) * SALVE_TOKENS * N_SIGNAL  # 11 * 16 * 16 = 2816
+        if sequences is None:
+            sequences = self.buffer.sample(batch_size)
+            if not sequences and self.buffer.coreset_size > 0:
+                sequences = self.buffer.sample_coreset(batch_size)
+            if not sequences and self.buffer.addendum_size > 0:
+                sequences = self.buffer.sample_addendum(batch_size)
+        if not sequences:
+            return torch.ones(D_TOTAL, device=self.device)
+
+        seqs_sample = sequences[:batch_size]
+        self.world.eval()
+
+        vals = self._batch_tensors(seqs_sample).detach().requires_grad_(True)
+        pred = self.world(vals, attn_mask=self.mask)
+
+        # Target: terminal EOS delta predictions (position _SEQ_LEN - 2 predicts token 172)
+        # slot 0 = delta fatigue, slot 1 = delta souffrance
+        eos_delta = pred[:, _SEQ_LEN - 2, 0] + pred[:, _SEQ_LEN - 2, 1]
+
+        # Vectorized backward pass across all sample sequences
+        grad_out = torch.autograd.grad(eos_delta.sum(), vals)[0]  # [B, 173, 25]
+        signal_grads = grad_out[:, :, SIG_OFFSET:]                # [B, 173, 16]
+        mean_sens = signal_grads.abs().mean(dim=0)               # [173, 16]
+
+        # Assemble into full sequence layout [11, 16, 16] -> [2816]
+        # Salves 0..9 have 16 tokens each (10 * 16 = 160 tokens)
+        # Salve 10 has 13 state tokens (indices 160..173 in vals)
+        # Salve 10 trailing action tokens (indices 13..15) receive zero WM gradient
+        w_grid = torch.zeros(SEQ_STEPS + 1, SALVE_TOKENS, N_SIGNAL, device=self.device)
+        w_grid[:SEQ_STEPS, :, :] = mean_sens[:SEQ_STEPS * SALVE_TOKENS].view(SEQ_STEPS, SALVE_TOKENS, N_SIGNAL)
+        w_grid[SEQ_STEPS, :STATE_TOKENS, :] = mean_sens[SEQ_STEPS * SALVE_TOKENS : SEQ_STEPS * SALVE_TOKENS + STATE_TOKENS]
+
+        w_flat = w_grid.view(-1)  # [2816]
+        floor = floor_pct * w_flat.mean().clamp(min=1e-8)
+        w_floored = w_flat + floor
+        w_norm = w_floored / w_floored.mean().clamp(min=1e-8)
+
+        return w_norm.detach()
+
     def _salve_cost_batch(self, gen: torch.Tensor) -> torch.Tensor:
         """Vectorized ``salve_cost`` over a batch of predicted states.
 
@@ -1318,8 +1383,9 @@ class Brain:
         # 1. Extract recent wake session into Addendum
         self.buffer.extract_addendum()
 
-        # 1b. Intra-Addendum deduplication via naive distance across all channels
-        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04)
+        # 1b. Intra-Addendum deduplication via saliency-weighted distance
+        saliency_weights = self.compute_saliency_weights()
+        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04, weights=saliency_weights)
         if n_intra_dropped > 0:
             print(f"[sleep:intra-addendum] {n_intra_dropped} doublons redondants éliminés de l'Addendum.")
 
@@ -1469,15 +1535,19 @@ class Brain:
         for label, value in self.train_policy(pol_steps, pol_batch, gamma=pol_gamma, n_imagine=pol_n_imagine):
             yield label, value
 
-        # 8. Consolidate Addendum into Coreset with cross-deduplication & memory decay
-        cons_stats = self.buffer.consolidate_addendum_into_coreset(eps=0.04, decay=0.01)
+        # 8. Consolidate Addendum into Coreset with saliency-weighted deduplication & memory decay
+        saliency_weights = self.compute_saliency_weights()
+        cons_stats = self.buffer.consolidate_addendum_into_coreset(
+            eps=0.04, decay=0.01, weights=saliency_weights
+        )
         self._refresh_wake_latent()
         self.mode = "wake"
 
         print("\n" + "=" * 62)
-        print(f"[sleep:consolidation Coreset] Déduplication naïve (eps=0.04, decay=0.01) :")
+        print(f"[sleep:consolidation Coreset] Déduplication pondérée par sensibilité EOS (eps=0.04, decay=0.01) :")
         print(f"  - Nouvelles mémoires ajoutées   : {cons_stats['added']}")
         print(f"  - Mémoires existantes ravivées  : {cons_stats['refreshed']}")
+        print(f"  - Doublons intra-addendum jetés : {cons_stats['dedup_intra_dropped']}")
         print(f"  - Mémoires froides évincées     : {cons_stats['evicted']}")
         print(f"  - Taille finale du Coreset      : {cons_stats['coreset_size']}")
         print("=" * 62 + "\n")

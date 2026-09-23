@@ -816,7 +816,53 @@ def test_wm_theater_rollout_and_rendering():
     assert theater.seq_idx == 1
 
 
+def test_saliency_weighted_distances_and_consolidation():
+    import torch
+    from .brain import pairwise_sequence_distances, cross_sequence_distances, Brain, ExperienceBuffer
+    b = Brain(device="cpu")
+
+    # 1. Cold start / empty buffer returns ones
+    w_empty = b.compute_saliency_weights()
+    assert w_empty.shape == (2816,)
+    assert torch.allclose(w_empty, torch.ones(2816))
+
+    # 2. Distance equality when weights are ones
+    s1 = _make_salve([0.1] * 53, [0.2] * 5)
+    s2 = _make_salve([0.4] * 53, [-0.3] * 5)
+    seq1 = [s1] * 11
+    seq2 = [s2] * 11
+
+    D_none = pairwise_sequence_distances([seq1, seq2], weights=None)
+    D_ones = pairwise_sequence_distances([seq1, seq2], weights=torch.ones(2816))
+    assert torch.allclose(D_none, D_ones)
+
+    cross_none = cross_sequence_distances([seq1], [seq2], weights=None)
+    cross_ones = cross_sequence_distances([seq1], [seq2], weights=torch.ones(2816))
+    assert torch.allclose(cross_none, cross_ones)
+
+    # 3. Sensitivity weighting: populate buffer and compute weights
+    for _ in range(5):
+        for _ in range(12):
+            b.record(_make_salve([0.2] * 53, [0.1] * 5))
+        b.buffer.boundary()
+    b.buffer.extract_addendum()
+    b.buffer.commit_addendum()
+
+    weights = b.compute_saliency_weights(batch_size=4)
+    assert weights.shape == (2816,)
+    assert (weights >= 0.0).all()
+    assert abs(weights.mean().item() - 1.0) < 1e-4
+
+    # 4. ExperienceBuffer deduplication with weights
+    buf = ExperienceBuffer(seq_len=11, seed=42)
+    buf._addendum = [seq1, seq1, seq2]
+    n_drop = buf.deduplicate_addendum(eps=0.04, weights=weights)
+    assert n_drop == 1
+    assert len(buf._addendum) == 2
+
+
 if __name__ == "__main__":
+    test_saliency_weighted_distances_and_consolidation()
     test_policy_outputs_are_valid_consignes()
     test_world_model_forward_and_predict_shapes()
     test_salve_cost_sign()
