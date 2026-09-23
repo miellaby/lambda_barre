@@ -212,7 +212,25 @@ def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
         gy = max(by + 6, min(by + bh - 6, gy))
         pygame.draw.line(surface, (70, 85, 105), (bx + 4, gy), (bx + bw - 4, gy), 1)
 
-    # Action consignes (targets) if present
+    # Trunk contact point (token 9): red disc at the collision barycentre,
+    # radius proportional to the collision force magnitude. The barycentre
+    # (collision_tronc_cx/cy) is in the trunk-local egocentric frame — the
+    # same frame as rot() — so it maps directly onto the torso.
+    t9 = step.state_tokens[9] if len(step.state_tokens) > 9 else None
+    if t9 is not None:
+        fx = _denormalize(t9[SIG_OFFSET + 0], _BY_KEY["collision_tronc_x"])
+        fy = _denormalize(t9[SIG_OFFSET + 1], _BY_KEY["collision_tronc_y"])
+        mag = math.hypot(fx, fy)
+        if mag > 10.0:  # low floor to ignore phantom contacts
+            ccx = _denormalize(t9[SIG_OFFSET + 2], _BY_KEY["collision_tronc_cx"])
+            ccy = _denormalize(t9[SIG_OFFSET + 3], _BY_KEY["collision_tronc_cy"])
+            pt_contact = rot(ccx, ccy)
+            radius = max(2, int(2 + 5 * min(1.0, mag / 1500.0)))
+            pygame.draw.circle(surface, (220, 60, 60), pt_contact, radius)
+
+    # Action consignes (targets) if present.
+    # Symbols: plain circle = back limb target · circle + diameter = front
+    # limb target · X cross = tail target.
     if step.action is not None and cand_color is not None:
         tf, df_norm, tb, db_norm, tq = step.action
         df_phys = B.LIMB_MIN + df_norm * (B.LIMB_MAX - B.LIMB_MIN)
@@ -225,17 +243,30 @@ def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
         pt_tgt_f = rot(*tgt_f_loc)
         pt_tgt_b = rot(*tgt_b_loc)
 
-        # Front target handle
+        # Front target handle: circle + diagonal diameter
         pygame.draw.circle(surface, cand_color, pt_tgt_f, 4, 1)
-        # Back target handle
+        d = 4 * 0.7071  # half-diagonal of the r=4 circle
+        pygame.draw.line(surface, cand_color,
+                         (pt_tgt_f[0] - d, pt_tgt_f[1] - d),
+                         (pt_tgt_f[0] + d, pt_tgt_f[1] + d), 1)
+        # Back target handle: plain circle
         pygame.draw.circle(surface, cand_color, pt_tgt_b, 4, 1)
 
-        # Tail target handle (relative to torso neutral direction)
-        tail_tgt_rel = -math.pi / 2 + tq * math.pi
+        # Tail target handle (X cross). Tail consigne convention
+        # (facing-independent): queue_theta + = tail up over the back,
+        # - = down under the belly (at equilibrium queue_angle =
+        # -theta_star). Note the state queue_angle rotates the other way:
+        # + = toward the front, under the belly.
+        tail_tgt_rel = -math.pi / 2 - tq * math.pi
         tgt_tail_loc = (tail_len * math.sin(tail_tgt_rel),
                         -16 - tail_len * math.cos(tail_tgt_rel))
         pt_tgt_tail = rot(*tgt_tail_loc)
-        pygame.draw.circle(surface, cand_color, pt_tgt_tail, 3, 1)
+        pygame.draw.line(surface, cand_color,
+                         (pt_tgt_tail[0] - 3, pt_tgt_tail[1] - 3),
+                         (pt_tgt_tail[0] + 3, pt_tgt_tail[1] + 3), 1)
+        pygame.draw.line(surface, cand_color,
+                         (pt_tgt_tail[0] - 3, pt_tgt_tail[1] + 3),
+                         (pt_tgt_tail[0] + 3, pt_tgt_tail[1] - 3), 1)
 
     # Step label (top-left)
     lbl_text = step.label or highlight_label

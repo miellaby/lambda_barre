@@ -20,6 +20,7 @@ import argparse
 import math
 
 import pygame
+import torch
 
 from lambda_barre.models import THETA_RANGE
 
@@ -30,10 +31,10 @@ from . import ui as UI
 from . import proprio as S
 from . import extero as E
 from . import intero as I
-from .tokenize import DenseEncoder
+from .tokenize import DenseEncoder, salve_cost
 from .brain import Brain
 from .smoother import Smoother
-from .dream import DreamTheater
+from .dream import CAND_COLORS, DreamStep, DreamTheater, draw_thumbnail
 
 import os
 
@@ -77,8 +78,20 @@ def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
 
 
 def _keys_hint(font):
-    text = "R reset · G targets · B brain · S sleep · D dream · [-/+] speed"
+    text = "R reset · G overlays · B brain · S sleep · D dream · [-/+] speed"
     return font.render(text, True, R.HUD_C)
+
+
+def _wm_view_step(brain: Brain, salve: list) -> DreamStep:
+    """Egocentric subjective view of one WM-tick salve: the 13 reception
+    (state) tokens plus the 3 action tokens decoded back to the 5 consignes.
+    Same decoding path as the WM/Dream theaters, so the thumbnail shows
+    exactly what was recorded into the buffer."""
+    a_toks = torch.tensor(salve[13:16], dtype=torch.float32,
+                          device=brain.device).unsqueeze(0)
+    a_vals = brain._decode_action_batch(a_toks)[0].tolist()
+    return DreamStep(state_tokens=salve[:13], action=a_vals,
+                     step_cost=salve_cost(salve))
 
 
 def _platform_hit(space, world_pos):
@@ -147,11 +160,12 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         status = f"dataset bootstrapped ({len(brain.buffer)} seqs)"
     smoother = Smoother(tau=1.0)
     salves: list = []       # buffer of last 10 salves (for display, disabled)
+    wm_view: DreamStep | None = None  # egocentric thumbnail of the last WM tick (wake)
     WM_DT = 1.0 / 3.0       # world model cadence — 3 Hz
     POL_DT = 1.0 / 6.0      # policy cadence — 6 Hz
     wm_accum = WM_DT        # world model tick accumulator (1 Hz)   - starts full to produce a first salve on the first frame
     pol_accum = 0.0         # policy tick accumulator (6 Hz)
-    show_targets = True
+    show_overlays = True   # G: toggle targets, egocentric view, and token panel
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
     sleep_gen = None       # active sleep generator (None when not sleeping)
@@ -211,12 +225,14 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     smoother.reinit(sig_r, ts_r, cs_r, vs_r, isg_r, rs_r)
                     brain.clear_history()
                     salves.clear()
+                    wm_view = None
                     wm_accum = WM_DT
                     pol_accum = 0.0
                     prev_facing = skel.facing
                     status = "reset"
                 elif ev.key == pygame.K_g:
-                    show_targets = not show_targets
+                    show_overlays = not show_overlays
+                    status = "overlays on" if show_overlays else "overlays off"
                 elif ev.key == pygame.K_b:
                     auto = not auto
                     # brain.clear_history() # toggling brain on/off doesn't justify clearing history
@@ -317,7 +333,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         speed = SPEED_PRESETS[speed_idx] if not headless else 1.0
 
         def sim_step():
-            nonlocal prev_facing, wm_accum, pol_accum
+            nonlocal prev_facing, wm_accum, pol_accum, wm_view
             # manual mode; in brain (auto) mode the policy drives them instead.
             if auto:
                 controls.sync(skel)
@@ -351,6 +367,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     if len(salves) > 3:
                         salves.pop(0)
                     brain.record(salve)
+                    wm_view = _wm_view_step(brain, salve)
                     if auto:
                         brain.wake_tick(salve)
                         # 4. Immediately re-evaluate policy in the new reference frame
@@ -390,6 +407,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         salves.pop(0)
                     # even with the brain offline, we record the salve for the next sleep cycle
                     brain.record(salve)
+                    wm_view = _wm_view_step(brain, salve)
                     if auto:  # produces fresh latent for policy when brain online
                         brain.wake_tick(salve)
 
@@ -406,7 +424,6 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
                         d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
                         tail_t_phys = tail_t * THETA_RANGE
-
                         if facing == 1:
                             # limb_front = limb_r (right side: outward is right (+x), so theta_r = -theta_front)
                             # limb_back = limb_l (left side: outward is left (-x), so theta_l = +theta_back)
@@ -446,8 +463,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 pygame.display.flip()
             else:
                 mouse = pygame.mouse.get_pos()
-                R.draw(screen, skel, font, show_targets)
-                R.draw_tokens(screen, font_small, salves, encoder)
+                R.draw(screen, skel, font, show_overlays)
+                if show_overlays:
+                    R.draw_tokens(screen, font_small, salves, encoder)
                 R.draw_vision(screen, font, vision, skel)
                 h_proprio = R.draw_proprio(screen, font, signals, mouse)
                 h_touch = R.draw_touch(screen, font, touch_signals, mouse)
@@ -461,10 +479,17 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     s = font.render(hover_text, True, R.PROPRIO_LABEL_C)
                     screen.blit(s, ((R.WIDTH - s.get_width()) // 2, R.HEIGHT - 24))
                 controls.draw(screen, font)
-                for i, surf in enumerate(hud(font, skel, clock.get_fps(),
-                                             brain, auto, status, speed,
-                                             freeze_physics, no_smooth)):
+                hud_surfs = hud(font, skel, clock.get_fps(), brain, auto,
+                                status, speed, freeze_physics, no_smooth)
+                for i, surf in enumerate(hud_surfs):
                     screen.blit(surf, (12, 10 + i * 20))
+                if show_overlays and wm_view is not None:
+                    # egocentric subjective view (reception + action tokens) of
+                    # the last WM tick, refreshed at WM cadence (3 Hz)
+                    th_rect = pygame.Rect(12, 10 + len(hud_surfs) * 20 + 6, 92, 68)
+                    draw_thumbnail(screen, th_rect, wm_view, font_small,
+                                   facing=skel.facing, cand_color=CAND_COLORS[0],
+                                   highlight_label="s+a (wm)")
                 hint = _keys_hint(font)
                 screen.blit(hint, (R.WIDTH - hint.get_width() - 12, 10))
                 pygame.display.flip()

@@ -27,6 +27,16 @@ JOY_RADIUS = 64
 JOY_L_CENTRE = (96, 300)
 JOY_R_CENTRE = (R.WIDTH - 96, 300)
 
+# theta_star saturates at +/- JOY_THETA_MAX instead of wrapping at +/- pi.
+# The raw mouse angle is unwrapped by shortest-path deltas into
+# _m_unwrapped (a faithful continuous angle), and theta = clamp(_m_unwrapped).
+# Dragging across the top of the circle saturates the consigne (continuous),
+# and the excursion beyond the bound is tracked — on the way back the handle
+# rejoins the mouse exactly where it left it. The -pi/+pi jump of polar
+# coordinates can never appear in supervised (manual) experience.
+JOY_WRAP_MARGIN = math.radians(10.0)
+JOY_THETA_MAX = math.pi - JOY_WRAP_MARGIN
+
 # tail slider: horizontal track below the ground line
 TAIL_RANGE = math.pi / 2          # +/- 90° from the facing-default tail angle
 TAIL_TRACK_Y = 572
@@ -68,10 +78,20 @@ class Joystick:
                  theta: float, d: float, label: str):
         self.cx, self.cy = centre
         self.radius = radius
-        self.theta = theta
+        self.theta = _clamp(theta, -JOY_THETA_MAX, JOY_THETA_MAX)
         self.d = d
         self.label = label
         self.dragging = False
+        self._last_mouse_angle: float | None = None  # raw atan2 of the mouse
+        self._m_unwrapped: float = self.theta        # continuous mouse angle
+
+    def set_consigne(self, theta: float) -> None:
+        """Set the consigne directly (e.g. from the skeleton in brain mode),
+        clamped inside the allowed arc. Resets the mouse integration so the
+        next drag starts fresh from the handle position."""
+        self.theta = _clamp(theta, -JOY_THETA_MAX, JOY_THETA_MAX)
+        self._m_unwrapped = self.theta
+        self._last_mouse_angle = None
 
     # --- consigne <-> handle geometry ----------------------------------------
     def _handle_dist(self) -> float:
@@ -83,7 +103,7 @@ class Joystick:
         dy = r * math.cos(self.theta)
         return int(self.cx + dx), int(self.cy + dy)
 
-    def _set_from_point(self, mx: int, my: int) -> None:
+    def _set_from_point(self, mx: int, my: int, teleport: bool = False) -> None:
         dx = mx - self.cx
         dy = my - self.cy
         r = math.hypot(dx, dy)
@@ -92,7 +112,22 @@ class Joystick:
             dy *= self.radius / r
             r = self.radius
         if r > 0.5:
-            self.theta = math.atan2(-dx, dy)
+            m = math.atan2(-dx, dy)
+            if teleport or self._last_mouse_angle is None:
+                # fresh grab: start unwrapped tracking from the click
+                self._m_unwrapped = m
+            else:
+                # unwrap the mouse motion by shortest-path delta so the
+                # tracked angle is continuous across the +/-pi atan2 seam
+                delta = m - self._last_mouse_angle
+                delta = (delta + math.pi) % (2.0 * math.pi) - math.pi
+                self._m_unwrapped += delta
+            self._last_mouse_angle = m
+            # consigne = saturated mouse angle: continuous everywhere,
+            # pinned at the bound while the mouse is beyond it, and back
+            # exactly under the mouse as soon as it re-enters the arc
+            self.theta = _clamp(self._m_unwrapped,
+                                -JOY_THETA_MAX, JOY_THETA_MAX)
         # distance: centre = 0, rim = 1
         self.d = _clamp(r / self.radius, 0.0, 1.0)
 
@@ -103,7 +138,7 @@ class Joystick:
     def on_down(self, mx: int, my: int) -> bool:
         if self.hit(mx, my):
             self.dragging = True
-            self._set_from_point(mx, my)
+            self._set_from_point(mx, my, teleport=True)
             return True
         return False
 
@@ -263,13 +298,15 @@ class Controls:
         skel.tail_act.theta_star = self.tail.theta
 
     def sync(self, skel: "B.Skeleton") -> None:
-        """Copy skeleton consignes into the widgets (for display in brain mode)."""
-        self.joy_l.theta = skel.limb_l.theta_star
+        """Copy skeleton consignes into the widgets (for display in brain mode).
+        Clamped inside the allowed arc so switching back to manual can never
+        push an out-of-range theta into the skeleton."""
+        self.joy_l.set_consigne(skel.limb_l.theta_star)
         self.joy_l.d = (
             skel.limb_l.d_star - B.LIMB_MIN
         ) / (B.LIMB_MAX - B.LIMB_MIN)
 
-        self.joy_r.theta = skel.limb_r.theta_star
+        self.joy_r.set_consigne(skel.limb_r.theta_star)
         self.joy_r.d = (
             skel.limb_r.d_star - B.LIMB_MIN
         ) / (B.LIMB_MAX - B.LIMB_MIN)
