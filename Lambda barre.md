@@ -41,8 +41,9 @@ En Unicode, le symbole **λ̄** est obtenu avec λ \+ le caractère Unicode **CO
 
 Voici une proposition d'architecture du système de décision (production d'actions) et d'apprentissage artificiel continu.
 
+```
   Environnement
-   correction \+ / \- utilisateur
+   correction + / - utilisateur
        │
        ▼
 Observations ──► Encodeur ──► Modèle du monde
@@ -61,6 +62,7 @@ Observations ──► Encodeur ──► Modèle du monde
  Environnement / desktop pet
        │
        └──────────────► nouvelles observations
+```
 
 ### Le World Model
 
@@ -285,6 +287,7 @@ L'instinct **d'imitation** est un **renforcement** par le système plutôt que p
 
 Pour cela, le système calcule l'entropie informationnelle de la séquence sonore perçue pour en faire un signal d'apprentissage efficace du principe d'imitation.
 
+```
 séquence sonore produite par l'utilisateur
        ↓
 perception auditive
@@ -298,6 +301,7 @@ perception auditive de sa propre voix
 coût proportionnel à l'entropie informationnelle des sons récents obtenus
        ↓
 mise à jour
+```
 
 On a donc deux niveaux de récompenses :
 
@@ -316,36 +320,38 @@ On ne concatène pas tous les scalaires en un vecteur unique. Le système encode
 
 Par exemple, à un instant donné :
 
-\[PROPRIO\]
-  tronc\_angle
-  tronc\_vitesse
-  membre\_AV\_angle
+```
+[PROPRIO]
+  tronc_angle
+  tronc_vitesse
+  membre_AV_angle
   ...
 
-\[VISION\]
-  cellule\_1
-  cellule\_2
+[VISION]
+  cellule_1
+  cellule_2
   ...
-  cellule\_16
+  cellule_16
 
-\[AUDIO\]
-  source\_1
-  source\_2
-  ...
-
-\[TOUCH\]
-  patte\_AV
-  patte\_AR
+[AUDIO]
+  source_1
+  source_2
   ...
 
-\[INTERO\]
+[TOUCH]
+  patte_AV
+  patte_AR
+  ...
+
+[INTERO]
   faim
   fatigue
   ...
 
-\[ENV\]
+[ENV]
   curseur
-  mouvement\_fenêtres
+  mouvement_fenêtres
+```
 
 Le Transformer reçoit l'embedding de chaque groupe tel qu'il est produit par **un petit encodeur système**. Les groupes sont délimités par des tokens symboliques: PROPRIO, VISION, AUDIO, ...
 
@@ -364,17 +370,21 @@ On va distinguer les expériences anciennes et  les  expériences récente:
 
 De fait, pendant l'éveil, on journalise l'expérience vécue (séquences états-actions) :
 
+```
       perception → action → conséquence
                     ↓
       enregistrement des expériences vécues de la journée
+```
 
 Puis, pendant le sommeil, on entraîne les modèles avec une combinaison du corpus existant (*coreset*) et de l’addendum :
 
+```
          dataset complété avec les nouvelles expériences
                            ↓
                 replay × plusieurs epochs
                            ↓
             mise à jour des modèles
+```
 
 Enfin le coreset est complété avec les nouvelles expériences de façon **cumulative**.
 
@@ -447,13 +457,17 @@ C'est le même genre de problème que le chunking du RAG : **la bonne unité de 
 
 Par exemple, si λ̄ marche pendant 30 secondes sans événement notable :
 
+```
 marche → marche → marche → marche → ...
+```
 
 Il ne faut pas stocker ces 30 secondes.
 
 Mais si ensuite :
 
+```
 clic → λ̄ tourne la tête → avance → tombe
+```
 
 Cela constitue un épisode intéressant.
 
@@ -461,10 +475,11 @@ Le problème devient alors : **comment déterminer automatiquement les frontièr
 
 Une possibilité est de laisser le world model décider. Tant que :
 
-\[ L\_t \= \-\\log P(o\_{t+1},r\_t|o\_t,a\_t) \]
+$$L_t = -\log P(o_{t+1},r_t|o_t,a_t)$$
 
 reste faible, on est dans une situation qu'il comprend. Lorsqu'elle augmente fortement, on ouvre un épisode autour de cet événement :
 
+```
      erreur faible
 ───────────────┐
                │
@@ -475,9 +490,10 @@ reste faible, on est dans une situation qu'il comprend. Lorsqu'elle augmente for
                ▼
       ┌─────────────────┐
       │     épisode     │
-      │ avant \+ pendant │
-      │ \+ après         │
+      │ avant + pendant │
+      │ + après         │
       └─────────────────┘
+```
 
 Il faut conserver **un peu de contexte avant l'erreur**, sinon le modèle risque de voir uniquement la conséquence sans savoir ce qui l'a provoquée.
 
@@ -501,6 +517,7 @@ La **politique** répond à :
 
 Concrètement :
 
+```
                  état actuel
                       │
              ┌────────┴────────┐
@@ -508,7 +525,7 @@ Concrètement :
              ▼                 ▼
        WORLD MODEL          POLITIQUE
              │                 │
-       état \+ action           │
+       état + action           │
              │                 │
              ▼                 ▼
        conséquence            action
@@ -523,28 +540,33 @@ Concrètement :
                      │
                      ▼
                 nouvel état
+```
 
 Le world model est donc une sorte de **simulateur appris du monde**.
 
 Par exemple, il pourrait avoir appris :
 
-état \= debout, curseur à gauche
-action \= tourner la tête à gauche
+```
+état = debout, curseur à gauche
+action = tourner la tête à gauche
         ↓
 prédiction :
   tête tournée à gauche
   curseur maintenant dans le champ visuel
   coût moteur faible
+```
 
 La politique, elle, produit directement les commandes :
 
+```
 état actuel
     ↓
 politique
     ↓
-couple tête \= \+0.31
-couple queue \= \-0.04
-couple patte \= ...
+couple tête = +0.31
+couple queue = -0.04
+couple patte = ...
+```
 
 Pourquoi avoir les deux ? Parce que la politique peut apprendre par essais :
 
@@ -556,15 +578,19 @@ Le world model permet de faire des essais **dans sa tête**.
 
 Supposons que la politique envisage trois actions :
 
+```
 A : avancer
 B : reculer
 C : tourner
+```
 
 Le world model peut simuler :
 
+```
 A → collision, coût élevé
 B → aucun changement
 C → curseur visible, récompense probable
+```
 
 La politique choisit alors C, sans avoir besoin d'essayer réellement A et B.
 
@@ -572,20 +598,23 @@ C'est ce qu'on appelle du **model-based reinforcement learning**.
 
 Donc les trois fonctions sont distinctes :
 
+```
 WORLD MODEL
-état \+ action → conséquence prédite
+état + action → conséquence prédite
 
 REWARD MODEL / coûts
 conséquence → valeur
 
 POLICY
 état → action
+```
 
 Le world model prédit des conséquences sur des actions imaginaires, et la politique de choisir les actions qui donnent de bonnes conséquences **sans que λ̄ ait réellement effectué toutes ces actions**.
 
 Il y a en fait trois fonctions :
 
-                état \+ action
+```
+                état + action
                       │
                       ▼
                 WORLD MODEL
@@ -604,6 +633,7 @@ Il y a en fait trois fonctions :
                       │
                       ▼
                    action
+```
 
 La politique ne reçoit pas directement un « reward » pour apprendre. Elle apprend à produire des actions qui **minimisent le coût prédit par le world model**.
 
@@ -615,13 +645,14 @@ Box2d-like pour la physique: gravité, friction, contrainte. Les parties rigides
 
 Le joint d'un membre a deux commandes continues :
 
-\[ a\_i=(\\theta\_i,d\_i) \]
+$$a_i = (\theta_i, d_i)$$
 
 où (\\theta\_i) est l'angle et (d\_i) la distance au tronc. Le RDN produit directement ces valeurs, puis le moteur physique calcule les forces et mouvements résultants.
 
+```
 Python
  ├── Box2D / pymunk
- │      └── squelette \+ environnement
+ │      └── squelette + environnement
  │
  ├── PyTorch
  │      ├── policy
@@ -630,6 +661,7 @@ Python
  ├── dataset / replay
  │
  └── petite visualisation 2D
+```
 
 Une fenêtre montre le squelette et quelques éléments du bureau. Pas besoin de reproduire immédiatement le vrai desktop.
 
@@ -639,13 +671,13 @@ L'actuateur est une **commande de consigne**, et non une contrainte imposée.
 
 Par exemple, le réseau produit :
 
-\[ a\_i=(\\theta\_i^\*,d\_i^\*) \]
+$$a_i = (\theta_i^*, d_i^*)$$
 
 et l'actuateur transforme cela en force/couple :
 
-\[ \\tau\_\\theta \= k\_\\theta(\\theta^\*-\\theta)-c\_\\theta\\dot\\theta \]
+$$\tau_\theta = k_\theta(\theta^*-\theta) - c_\theta\dot\theta$$
 
-\[ F\_d \= k\_d(d^\*-d)-c\_d\\dot d \]
+$$F_d = k_d(d^*-d) - c_d\dot d$$
 
 Donc le réseau dit essentiellement :
 
@@ -673,8 +705,8 @@ L'environnement pourrait être extrêmement pauvre :
 
 La souris fournit seulement :
 
-position relative à la tête
-vitesse relative
+* position relative à la tête
+* vitesse relative
 
 L'objectif émergent serait simplement d'apprendre **à suivre le curseur.**
 
@@ -713,6 +745,7 @@ Le world model peut travailler à un cadence beaucoup plus lente que la politiqu
 
 Imaginons une cadence de 2s pour le world model. Pendant 2 secondes, le système collecte :
 
+```
 proprioception(t)
 actions(t)
 proprioception(t+100ms)
@@ -720,20 +753,23 @@ actions(t+100ms)
 
 ...
 proprioception(t+2s)
+```
 
 Le système produit un seul groupe de **tokens de transition** pour le world model :
 
+```
 état initial
-\+
++
 résumé des actions
-\+
++
 état final
-\+
++
 événements survenus
+```
 
 Le world model apprend alors :
 
-\[ (s\_t,; A\_{t:t+\\Delta}) \\rightarrow s\_{t+\\Delta} \]
+$$(s_t,; A_{t:t+\Delta}) \rightarrow s_{t+\Delta}$$
 
 où (A) n'est pas une action instantanée mais **un résumé de l'activité motrice pendant l'intervalle**.
 
@@ -749,28 +785,32 @@ Si λ̄ marche tranquillement :
 
 Mais si pendant cet intervalle :
 
+```
 marche
 marche
 marche
-\[CLIC\]
+[CLIC]
 tête tourne
-\[REWARD\]
+[REWARD]
+```
 
 alors les événements CLIC et REWARD doivent être conservés individuellement.
 
 On aurait donc une séquence du genre :
 
+```
 état
    ↓
-\[bloc moteur 1200 ms\]
+[bloc moteur 1200 ms]
    ↓
-\[CLICK\]
+[CLICK]
    ↓
-\[bloc moteur 800 ms\]
+[bloc moteur 800 ms]
    ↓
-\[REWARD \+1\]
+[REWARD +1]
    ↓
 état
+```
 
 Les mouvements ordinaires sont compressés, tandis que les événements significatifs deviennent des tokens individuels.
 
