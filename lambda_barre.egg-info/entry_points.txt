@@ -1,2 +1,0 @@
-[console_scripts]
-lambda-barre = lambda_barre.main:main
