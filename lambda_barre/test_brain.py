@@ -747,6 +747,75 @@ def test_experience_buffer_cross_deduplication_and_memory_decay():
     assert seq2 not in buf._coreset
 
 
+def test_wm_theater_rollout_and_rendering():
+    """Verify World Model Theater rollout generation and headless rendering."""
+    import pygame
+    from lambda_barre.brain import Brain, ExperienceBuffer
+    from lambda_barre.wm_theater import WMTheater, rollout_sequence
+
+    brain = Brain()
+    buf = ExperienceBuffer(seq_len=11, seed=42)
+
+    # Create 2 mock sequences of 11 salves (16 tokens each)
+    mock_seqs = []
+    for s_idx in range(2):
+        seq = []
+        for i in range(11):
+            salve = []
+            for t_idx in range(16):
+                tok = [0.0] * 25
+                if t_idx == 10:  # Cost token
+                    tok[9:14] = [0.1 * (i + 1), 0.05, 0.02, 0.01, 0.0]
+                salve.append(tok)
+            seq.append(salve)
+        mock_seqs.append(seq)
+
+    buf._coreset = mock_seqs
+    buf._coreset_vivacity = [1.0, 0.9]
+
+    # Test rollout_sequence logic
+    rec = rollout_sequence(brain, mock_seqs[0], 0, 2, 1.0)
+    assert rec.seq_idx == 0
+    assert len(rec.steps) == 11
+    # First 5 steps (s0..s4) are context only
+    for s_i in range(5):
+        assert rec.steps[s_i].pred_step is None
+        assert rec.steps[s_i].pred_costs is None
+        assert len(rec.steps[s_i].real_costs) == 5
+    # Steps 5..10 are predicted
+    for s_i in range(5, 11):
+        assert rec.steps[s_i].pred_step is not None
+        assert rec.steps[s_i].pred_costs is not None
+        assert len(rec.steps[s_i].pred_costs) == 5
+        assert rec.steps[s_i].posture_rmse is not None
+        assert rec.steps[s_i].cost_rmse is not None
+
+    # Test WMTheater GUI rendering in headless mode
+    theater = WMTheater(brain, buf, width=1140, height=700)
+    assert theater.num_seqs == 2
+    assert theater.seq_idx == 0
+
+    pygame.init()
+    surf = pygame.Surface((1140, 700))
+    font = pygame.font.SysFont("monospace", 13, bold=True)
+    font_small = pygame.font.SysFont("monospace", 11)
+    font_tiny = pygame.font.SysFont("monospace", 9)
+
+    theater.draw(surf, font, font_small, font_tiny)
+
+    theater.next_seq()
+    assert theater.seq_idx == 1
+    theater.draw(surf, font, font_small, font_tiny)
+
+    theater.prev_seq()
+    assert theater.seq_idx == 0
+
+    # Event handling
+    ev_next = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RIGHT)
+    theater.handle_event(ev_next)
+    assert theater.seq_idx == 1
+
+
 if __name__ == "__main__":
     test_policy_outputs_are_valid_consignes()
     test_world_model_forward_and_predict_shapes()
@@ -774,5 +843,7 @@ if __name__ == "__main__":
     test_reset_restores_limb_distances()
     test_three_futures_bellman_optimism()
     test_dream_record_and_dream_theater_rendering()
+    test_wm_theater_rollout_and_rendering()
     print("all brain tests passed")
+
 

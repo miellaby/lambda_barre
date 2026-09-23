@@ -50,7 +50,9 @@ def configure_hardware(device_preference: str | None = None) -> tuple[torch.devi
 
     env_dev = os.environ.get("LAMBDA_DEVICE")
     env_accel = os.environ.get("LAMBDA_ACCEL")
-    if device_preference is None:
+    if isinstance(device_preference, torch.device):
+        device_preference = device_preference.type
+    elif device_preference is None:
         if env_dev:
             device_preference = env_dev.lower().strip()
         elif env_accel and env_accel not in ("0", "false", "no"):
@@ -58,7 +60,7 @@ def configure_hardware(device_preference: str | None = None) -> tuple[torch.devi
         else:
             device_preference = "cpu"
 
-    pref = device_preference.lower().strip()
+    pref = str(device_preference).lower().strip()
 
     if pref in ("cuda", "auto"):
         if torch.cuda.is_available():

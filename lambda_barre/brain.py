@@ -777,12 +777,14 @@ class Brain:
         for s_toks, a_toks in self._wake_history:
             ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
                 s_toks, dtype=torch.float32, device=self.device)
+            ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
             pos += STATE_TOKENS
             ctx[0, pos:pos + ACTION_TOKENS] = torch.tensor(
                 a_toks, dtype=torch.float32, device=self.device)
             pos += ACTION_TOKENS
         ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
             cur_state, dtype=torch.float32, device=self.device)
+        ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
         return ctx
 
     def _refresh_wake_latent(self) -> None:
@@ -799,12 +801,14 @@ class Brain:
         for s_toks, a_toks in self._wake_history[:-1]:
             ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
                 s_toks, dtype=torch.float32, device=self.device)
+            ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
             pos += STATE_TOKENS
             ctx[0, pos:pos + ACTION_TOKENS] = torch.tensor(
                 a_toks, dtype=torch.float32, device=self.device)
             pos += ACTION_TOKENS
         ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
             cur_state, dtype=torch.float32, device=self.device)
+        ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
         self.world.eval()
         with torch.no_grad():
             self.world(ctx)
@@ -1057,38 +1061,10 @@ class Brain:
 
             # build real context: [s0, a0, s1, ..., a3, s4]
             ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
-            ctx = torch.zeros(B, ctx_len, DENSE_DIM, device=device)
-            real_actions = torch.zeros(B, 5, device=device)
-            for b, seq in enumerate(sequences):
-                pos = 0
-                for i in range(n_ctx):
-                    salve = seq[i]
-                    assert len(salve) == SALVE_TOKENS
-                    s = salve[:STATE_TOKENS]
-                    a = salve[STATE_TOKENS:SALVE_TOKENS]
-                    ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
-                        s, dtype=torch.float32, device=device)
-                    pos += STATE_TOKENS
-                    ctx[b, pos:pos + ACTION_TOKENS] = torch.tensor(
-                        a, dtype=torch.float32, device=device)
-                    pos += ACTION_TOKENS
-                # s4 (the state the policy acts on)
-                s4 = seq[n_ctx][:STATE_TOKENS]
-                ctx[b, pos:pos + STATE_TOKENS] = torch.tensor(
-                    s4, dtype=torch.float32, device=device)
-
-                # Demonstrated action taken at step n_ctx (tokens 13..15)
-                a_toks = seq[n_ctx][STATE_TOKENS:SALVE_TOKENS]
-                tf_norm = a_toks[0][SIG_OFFSET]
-                df_norm = a_toks[0][SIG_OFFSET + 1]
-                tb_norm = a_toks[1][SIG_OFFSET]
-                db_norm = a_toks[1][SIG_OFFSET + 1]
-                tq_norm = a_toks[2][SIG_OFFSET]
-                real_actions[b] = torch.tensor([
-                    2.0 * tf_norm - 1.0, df_norm,
-                    2.0 * tb_norm - 1.0, db_norm,
-                    2.0 * tq_norm - 1.0,
-                ], device=device)
+            vals = self._batch_tensors(sequences)
+            ctx = vals[:, :ctx_len, :].clone()
+            real_actions = self._decode_action_batch(
+                vals[:, n_ctx * SALVE_TOKENS + STATE_TOKENS : (n_ctx + 1) * SALVE_TOKENS, :])
 
             # 1. world model forward on real context → intermediate latent
             ctx_mask = build_salve_mask(ctx_len, device)
@@ -1142,7 +1118,9 @@ class Brain:
                 with torch.no_grad():
                     s5 = self.world.predict_next_state(cand_ctx_0)
                 c0 = self._salve_cost_batch(s5)
-                ctx_s5 = torch.cat([cand_ctx_0, s5], dim=1)
+                s5_zeroed = s5.clone()
+                s5_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
+                ctx_s5 = torch.cat([cand_ctx_0, s5_zeroed], dim=1)
 
                 if n_imagine <= 1:
                     candidate_costs.append(c0)
@@ -1172,7 +1150,9 @@ class Brain:
                     sc = self._salve_cost_batch(gen)
                     cost_kalman = cost_kalman + (gamma ** k) * sc
                     f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=cur_a[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
-                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    gen_zeroed = gen.clone()
+                    gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
+                    cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
                     cur_state_toks = gen[0].tolist()
                     cur_cost_val = sc[0].item()
                 f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
@@ -1193,7 +1173,9 @@ class Brain:
                     cost_wm = cost_wm + (gamma ** k) * sc
                     a_dec = self._decode_action_batch(next_a_toks)[0].tolist()
                     f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=a_dec, step_cost=cur_cost_val, label=f"s{4+k}"))
-                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    gen_zeroed = gen.clone()
+                    gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
+                    cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
                     cur_state_toks = gen[0].tolist()
                     cur_cost_val = sc[0].item()
                 f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
@@ -1222,7 +1204,9 @@ class Brain:
                     sc = self._salve_cost_batch(gen)
                     cost_pol = cost_pol + (gamma ** k) * sc
                     f3_steps.append(DreamStep(state_tokens=cur_state_toks, action=next_action[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
-                    cur_ctx = torch.cat([cand_ctx, gen], dim=1)
+                    gen_zeroed = gen.clone()
+                    gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
+                    cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
                     cur_state = gen
                     cur_state_toks = gen[0].tolist()
                     cur_cost_val = sc[0].item()
