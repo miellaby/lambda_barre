@@ -861,8 +861,46 @@ def test_saliency_weighted_distances_and_consolidation():
     assert len(buf._addendum) == 2
 
 
+def test_saliency_weights_gated_by_wm_coreset_loss():
+    import math
+    from .brain import Brain, _WM_SALIENCY_MAX_LOSS
+    b = Brain(device="cpu")
+
+    # Cold start: WM never trained on Coreset (NaN loss) -> no saliency
+    assert math.isnan(b.last_wm_coreset_loss)
+    assert b.trusted_saliency_weights() is None
+
+    # WM trained but not converged (loss >= 0.02) -> no saliency
+    b.last_wm_coreset_loss = _WM_SALIENCY_MAX_LOSS
+    assert b.trusted_saliency_weights() is None
+    b.last_wm_coreset_loss = 0.5
+    assert b.trusted_saliency_weights() is None
+
+    # WM converged on Coreset (loss < 0.02) -> saliency weights returned
+    b.last_wm_coreset_loss = 0.019
+    w = b.trusted_saliency_weights()
+    assert w is not None
+    assert w.shape == (2816,)
+    assert abs(w.mean().item() - 1.0) < 1e-4
+
+    # Buffer with data: gate still returns valid weights when trusted
+    for _ in range(5):
+        for _ in range(12):
+            b.record(_make_salve([0.2] * 53, [0.1] * 5))
+        b.buffer.boundary()
+    b.buffer.extract_addendum()
+    b.buffer.commit_addendum()
+    b.last_wm_coreset_loss = 0.001
+    w2 = b.trusted_saliency_weights(batch_size=4)
+    assert w2 is not None
+    assert (w2 >= 0.0).all()
+    b.last_wm_coreset_loss = 0.03
+    assert b.trusted_saliency_weights() is None
+
+
 if __name__ == "__main__":
     test_saliency_weighted_distances_and_consolidation()
+    test_saliency_weights_gated_by_wm_coreset_loss()
     test_policy_outputs_are_valid_consignes()
     test_world_model_forward_and_predict_shapes()
     test_salve_cost_sign()

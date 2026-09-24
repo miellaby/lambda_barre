@@ -48,6 +48,7 @@ SEQ_STEPS = 10
 _SEQ_LEN = SEQ_STEPS * SALVE_TOKENS + STATE_TOKENS          # 173
 _N_CTX = 4                                                 # 4 real transitions used as context (s0..s3, a0..a3, s4)
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
+_WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
 # trajectory-cost: 5 unsigned cost signals (token 10) + 1 signed confort
@@ -1016,6 +1017,21 @@ class Brain:
 
         return w_norm.detach()
 
+    def trusted_saliency_weights(self, **kwargs) -> torch.Tensor | None:
+        """EOS-saliency weights, or None when the World Model is not trusted yet.
+
+        The saliency-weighted distance is only meaningful if the World Model has
+        actually converged on the Coreset: gradients of an untrained WM carry no
+        reliable sensitivity information. Returns the saliency weights only when
+        the last World Model training on the Coset (``last_wm_coreset_loss``)
+        exists (not NaN) and is below ``_WM_SALIENCY_MAX_LOSS`` (0.02); otherwise
+        returns None, i.e. the naive uniform RMSE distance is used.
+        """
+        loss = self.last_wm_coreset_loss
+        if math.isnan(loss) or loss >= _WM_SALIENCY_MAX_LOSS:
+            return None
+        return self.compute_saliency_weights(**kwargs)
+
     def _salve_cost_batch(self, gen: torch.Tensor) -> torch.Tensor:
         """Vectorized ``salve_cost`` over a batch of predicted states.
 
@@ -1383,8 +1399,9 @@ class Brain:
         # 1. Extract recent wake session into Addendum
         self.buffer.extract_addendum()
 
-        # 1b. Intra-Addendum deduplication via saliency-weighted distance
-        saliency_weights = self.compute_saliency_weights()
+        # 1b. Intra-Addendum deduplication via EOS-saliency distance if the
+        # WM converged on the Coreset (last training), naive distance otherwise
+        saliency_weights = self.trusted_saliency_weights()
         n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04, weights=saliency_weights)
         if n_intra_dropped > 0:
             print(f"[sleep:intra-addendum] {n_intra_dropped} doublons redondants éliminés de l'Addendum.")
@@ -1535,8 +1552,10 @@ class Brain:
         for label, value in self.train_policy(pol_steps, pol_batch, gamma=pol_gamma, n_imagine=pol_n_imagine):
             yield label, value
 
-        # 8. Consolidate Addendum into Coreset with saliency-weighted deduplication & memory decay
-        saliency_weights = self.compute_saliency_weights()
+        # 8. Consolidate Addendum into Coreset with deduplication & memory decay.
+        # EOS-saliency distance only if the WM just converged on the Coreset,
+        # naive distance otherwise.
+        saliency_weights = self.trusted_saliency_weights()
         cons_stats = self.buffer.consolidate_addendum_into_coreset(
             eps=0.04, decay=0.01, weights=saliency_weights
         )
@@ -1544,7 +1563,10 @@ class Brain:
         self.mode = "wake"
 
         print("\n" + "=" * 62)
-        print(f"[sleep:consolidation Coreset] Déduplication pondérée par sensibilité EOS (eps=0.04, decay=0.01) :")
+        dist_mode = ("pondérée par sensibilité EOS "
+                     f"(wm_coreset_loss={self.last_wm_coreset_loss:.5f})") \
+            if saliency_weights is not None else "naïve (WM non convergé sur le Coreset)"
+        print(f"[sleep:consolidation Coreset] Déduplication {dist_mode} (eps=0.04, decay=0.01) :")
         print(f"  - Nouvelles mémoires ajoutées   : {cons_stats['added']}")
         print(f"  - Mémoires existantes ravivées  : {cons_stats['refreshed']}")
         print(f"  - Doublons intra-addendum jetés : {cons_stats['dedup_intra_dropped']}")
