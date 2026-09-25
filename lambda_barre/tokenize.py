@@ -250,7 +250,7 @@ _LAYOUT: list[ChannelSpec] = _build_layout()
 
 # Number of valid (non-padded) signal slots per token index.
 _N_SIGNALS: list[int] = [len(ch.signals) for ch in _LAYOUT]
-print(f"signal slots per token: {_N_SIGNALS}")
+# print(f"signal slots per token: {_N_SIGNALS}")
 
 # Index of the reward tokens and interoception within the state.
 _COST_IDX = 10        # "Coûts"  (effort, douleur, courbature, instabilite, vertige)

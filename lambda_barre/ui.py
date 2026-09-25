@@ -165,13 +165,13 @@ class Joystick:
         pygame.draw.circle(screen, JOY_HANDLE_C, (hx, hy), 12)
         pygame.draw.circle(screen, JOY_HANDLE_RING_C, (hx, hy), 12, 2)
         # label
-        surf = font.render(self.label, True, JOY_LABEL_C)
+        surf = font.render(self.label, R.FONT_AA, JOY_LABEL_C)
         screen.blit(surf, (self.cx - surf.get_width() // 2,
                            self.cy - self.radius - 22))
         # readout
         deg = math.degrees(self.theta)
         info = f"{deg:+5.0f}°  d{self.d:4.1f}"
-        s2 = font.render(info, True, JOY_LABEL_C)
+        s2 = font.render(info, R.FONT_AA, JOY_LABEL_C)
         screen.blit(s2, (self.cx - s2.get_width() // 2,
                          self.cy + self.radius + 6))
 
@@ -237,11 +237,11 @@ class Slider:
         pygame.draw.circle(screen, SLIDER_HANDLE_RING_C,
                            (hx, self.y), TAIL_HANDLE_R, 2)
         # label + readout
-        lbl = font.render(self.label, True, SLIDER_LABEL_C)
+        lbl = font.render(self.label, R.FONT_AA, SLIDER_LABEL_C)
         screen.blit(lbl, (self.x1, self.y - 28))
         deg = math.degrees(self.theta)
         info = f"{deg:+5.0f}°"
-        s2 = font.render(info, True, SLIDER_LABEL_C)
+        s2 = font.render(info, R.FONT_AA, SLIDER_LABEL_C)
         screen.blit(s2, (self.x2 - s2.get_width(), self.y - 28))
 
 

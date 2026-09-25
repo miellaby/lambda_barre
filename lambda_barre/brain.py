@@ -354,10 +354,16 @@ class ExperienceBuffer:
         self._current.clear()
         return added
 
-    def prune_coreset(self, pct: float = 0.33) -> int:
+    def prune_coreset(self, pct: float = 0.33, beta: float = 2.0) -> int:
         """Move pct (default 33%) of sequences from Coreset into Addendum.
         These become candidates for active forgetting.
-        Sequences with lower vivacity are selected in priority.
+
+        Uses stochastic sampling without replacement (Efraimidis-Spirakis)
+        biased towards memories with lower vivacity:
+          weight w_i = exp(-beta * vivacity_i)
+        Lower vivacity yields higher probability, while still allowing any memory
+        to be stochastically revisited.
+
         Returns the number of sequences moved.
         """
         if len(self._coreset) <= 1 or pct <= 0.0:
@@ -366,8 +372,13 @@ class ExperienceBuffer:
         n_prune = min(n_prune, len(self._coreset) - 1)
         while len(self._coreset_vivacity) < len(self._coreset):
             self._coreset_vivacity.append(1.0)
-        # Order by vivacity ascending with random tie-breaker: coldest memories pruned first
-        order = sorted(range(len(self._coreset)), key=lambda i: (self._coreset_vivacity[i], self._rng.random()))
+        # Weighted stochastic keys: key_i = -ln(u_i) / w_i with u_i ~ U(0, 1).
+        # Smallest keys correspond to selected items without replacement.
+        keys = [
+            -math.log(max(1e-12, self._rng.random())) / math.exp(-beta * v)
+            for v in self._coreset_vivacity
+        ]
+        order = sorted(range(len(self._coreset)), key=lambda i: keys[i])
         prune_indices = set(order[:n_prune])
         new_coreset = []
         new_viv = []
@@ -400,48 +411,77 @@ class ExperienceBuffer:
                 self._addendum_meta = [self._addendum_meta[i] for i in medoid_indices]
         return n_dropped
 
+    def deduplicate_against_coreset(self, eps: float = 0.04,
+                                    weights: torch.Tensor | None = None) -> dict:
+        """Cross-deduplicate Addendum against Coreset and refresh vivacity of existing memories.
+
+        Sequences in Addendum that are within distance < eps of an existing Coreset memory
+        are dropped from Addendum, while the corresponding Coreset memory has its vivacity
+        refreshed to 1.0. Surviving Addendum sequences are kept.
+        """
+        if not self._coreset or not self._addendum:
+            return {"dropped": 0, "refreshed": 0, "surviving": len(self._addendum)}
+
+        while len(self._coreset_vivacity) < len(self._coreset):
+            self._coreset_vivacity.append(1.0)
+
+        cross_D = cross_sequence_distances(self._addendum, self._coreset, weights=weights)
+        min_dists, min_indices = torch.min(cross_D, dim=1)
+
+        surviving = []
+        surviving_meta = []
+        n_dropped = 0
+        n_refreshed = 0
+
+        for i, seq in enumerate(self._addendum):
+            d_min = min_dists[i].item()
+            idx_core = min_indices[i].item()
+            if d_min < eps:
+                self._coreset_vivacity[idx_core] = 1.0
+                n_refreshed += 1
+                n_dropped += 1
+            else:
+                surviving.append(seq)
+                if i < len(self._addendum_meta):
+                    surviving_meta.append(self._addendum_meta[i])
+                else:
+                    surviving_meta.append("wake")
+
+        self._addendum = surviving
+        self._addendum_meta = surviving_meta
+
+        return {
+            "dropped": n_dropped,
+            "refreshed": n_refreshed,
+            "surviving": len(self._addendum),
+        }
+
     def consolidate_addendum_into_coreset(self, eps: float = 0.04, decay: float = 0.01,
                                           dedup_intra: bool = True,
                                           weights: torch.Tensor | None = None) -> dict:
-        """Cross-deduplicate Addendum against Coreset and update memory vivacity traces.
+        """Commit surviving Addendum sequences into Coreset with decay and eviction.
 
-        1. If dedup_intra is True, first removes redundant duplicates within Addendum.
-        2. Compares each surviving Addendum sequence against Coreset with (optionally weighted) distance.
-           - If dist < eps: Duplicate of existing memory -> refreshes Coreset memory vivacity to 1.0.
-           - If dist >= eps: Novel memory -> added to Coreset with vivacity 1.0.
-        3. Applies memory decay (-decay, default -0.01) across all Coreset vivacities.
-        4. Evicts lowest-vivacity memories if Coreset exceeds pool_capacity.
-        5. Clears Addendum.
+        If dedup_intra is True, removes redundant duplicates within Addendum.
+        Deduplicates against Coreset if not already done, appends survivors,
+        applies memory decay across Coreset vivacities, and evicts lowest-vivacity
+        memories if exceeding pool_capacity.
         """
         n_intra_dropped = 0
         if dedup_intra and len(self._addendum) > 1:
             n_intra_dropped = self.deduplicate_addendum(eps=eps, weights=weights)
 
-        n_refreshed = 0
-        n_added = 0
+        cross_res = self.deduplicate_against_coreset(eps=eps, weights=weights)
+        n_cross_dropped = cross_res["dropped"]
+        n_refreshed = cross_res["refreshed"]
 
         while len(self._coreset_vivacity) < len(self._coreset):
             self._coreset_vivacity.append(1.0)
 
-        if not self._coreset:
-            for seq in self._addendum:
-                self._coreset.append(seq)
-                self._coreset_vivacity.append(1.0)
-                n_added += 1
-        elif self._addendum:
-            cross_D = cross_sequence_distances(self._addendum, self._coreset, weights=weights)
-            min_dists, min_indices = torch.min(cross_D, dim=1)
-
-            for i, seq in enumerate(self._addendum):
-                d_min = min_dists[i].item()
-                idx_core = min_indices[i].item()
-                if d_min < eps:
-                    self._coreset_vivacity[idx_core] = 1.0
-                    n_refreshed += 1
-                else:
-                    self._coreset.append(seq)
-                    self._coreset_vivacity.append(1.0)
-                    n_added += 1
+        n_added = 0
+        for seq in self._addendum:
+            self._coreset.append(seq)
+            self._coreset_vivacity.append(1.0)
+            n_added += 1
 
         if decay > 0.0:
             self._coreset_vivacity = [max(0.0, v - decay) for v in self._coreset_vivacity]
@@ -460,6 +500,7 @@ class ExperienceBuffer:
 
         return {
             "dedup_intra_dropped": n_intra_dropped,
+            "dedup_cross_dropped": n_cross_dropped,
             "added": n_added,
             "refreshed": n_refreshed,
             "evicted": n_evicted,
@@ -605,6 +646,43 @@ class ExperienceBuffer:
             samples.append(seq)
         return samples
 
+    def sample_for_policy(self, batch: int, beta: float = 2.0,
+                          fatigue_weight: float = 0.25) -> list[list[list[float]]]:
+        """Sample ``batch`` sequences prioritized by suffering and fatigue reduction.
+
+        Higher probability is given to sequences where suffering (and secondarily fatigue)
+        decreased across the sequence window (delta = end - start < 0).
+        Uses weighted stochastic sampling without replacement (Efraimidis-Spirakis).
+        """
+        pool = list(self._coreset) + self._addendum
+        if not pool:
+            pool = self.sample(batch)
+            if not pool or len(pool) <= batch:
+                return pool
+
+        k = min(batch, len(pool))
+        weights = []
+        for seq in pool:
+            if len(seq) >= 2 and len(seq[0]) > _INTERO_IDX and len(seq[0][_INTERO_IDX]) > SIG_OFFSET + 1:
+                s0_int = seq[0][_INTERO_IDX]
+                send_int = seq[-1][_INTERO_IDX]
+                d_fat = send_int[SIG_OFFSET] - s0_int[SIG_OFFSET]
+                d_sf = send_int[SIG_OFFSET + 1] - s0_int[SIG_OFFSET + 1]
+                relief = -d_sf - fatigue_weight * d_fat
+            else:
+                relief = 0.0
+            relief_clamped = max(-1.0, min(1.0, relief))
+            weights.append(math.exp(beta * relief_clamped))
+
+        # Efraimidis-Spirakis weighted sampling without replacement
+        keys = [
+            -math.log(max(1e-12, self._rng.random())) / w
+            for w in weights
+        ]
+        order = sorted(range(len(pool)), key=lambda i: keys[i])
+        return [pool[i] for i in order[:k]]
+
+
 
 class Brain:
     """Holds both networks, drives the live loop, and runs sleep training.
@@ -667,6 +745,7 @@ class Brain:
         self.last_filter_stats: dict | None = None
         self.last_pol_loss = float("nan")
         self.last_dream_record: DreamRecord | None = None
+        self.sleep_cycle_stats: dict = {}
         self.sleep_wm_epochs = 0
         self.sleep_wm_step = 0
         self.mode = "wake"
@@ -1123,7 +1202,8 @@ class Brain:
 
     # --- sleep: policy training via real context + imagined rollout ----------
     def train_policy(self, steps: int = 16, batch: int = 32,
-                     gamma: float = 1.1, n_imagine: int = 6):
+                     gamma: float = 1.1, n_imagine: int = 6,
+                     prioritize_relief: bool = True):
         """Policy training via candidate evaluation in WM imagination.
         Generator: yields (label, value) after each step."""
         if len(self.buffer) < 1:
@@ -1134,9 +1214,11 @@ class Brain:
         # n_imagine = 6 steps: 2.0s forward horizon at 3 Hz
         losses = []
         for step in range(steps):
-            sequences = self.buffer.sample(batch)
+            sequences = (self.buffer.sample_for_policy(batch)
+                         if prioritize_relief else self.buffer.sample(batch))
             if not sequences:
                 break
+
             B = len(sequences)
             device = self.device
 
@@ -1380,41 +1462,77 @@ class Brain:
               pol_steps: int = 64, pol_batch: int = 32,
               pol_n_imagine: int = 6, clear_buffer: bool = True,
               prune_pct: float = 0.33, surprise_factor: float = 1.0,
-              pol_gamma: float = 1.1):
+              pol_gamma: float = 1.1,
+              wm_target_loss: float | None = 0.01,
+              wm_coreset_target_loss: float | None = None):
         """One full sleep cycle with Coreset / Addendum and active forgetting.
 
         Phases:
           1. Consolidate wake session journal into Addendum (added_wake).
           2. Prune ~33% of Coreset into Addendum as candidates for active forgetting.
-          3. Phase 1: Train World Model on the pruned Coreset (yielding 'wm_coreset').
+          3. Phase 1: Train World Model on the pruned Coreset (yielding 'wm_coreset')
+             until quota is validated AND loss <= wm_target_loss.
           4. Filter Addendum: evaluate surprise under updated WM (dynamics + cost divergence).
              Discard familiar sequences; retain surprising sequences.
-          5. Phase 2: Train World Model on the surviving Addendum (yielding 'wm_addendum').
+          5. Phase 2: Train World Model on the surviving Addendum (yielding 'wm_addendum')
+             until quota is validated AND loss <= wm_target_loss.
           6. Policy training via imagined rollouts (yielding 'pol').
           7. Consolidation: commit Addendum into Coreset, refresh wake latent, yield 'done'.
         """
+        if wm_coreset_target_loss is not None:
+            wm_target_loss = wm_coreset_target_loss
         self.mode = "sleep"
         self.last_dream_record = None
 
-        # 1. Extract recent wake session into Addendum
-        self.buffer.extract_addendum()
+        # Coreset avant sommeil
+        coreset_before = self.buffer.coreset_size
 
-        # 1b. Intra-Addendum deduplication via EOS-saliency distance if the
-        # WM converged on the Coreset (last training), naive distance otherwise
-        saliency_weights = self.trusted_saliency_weights()
-        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04, weights=saliency_weights)
-        if n_intra_dropped > 0:
-            print(f"[sleep:intra-addendum] {n_intra_dropped} doublons redondants éliminés de l'Addendum.")
+        # 1. Extraction des nouvelles expériences de la session de veille
+        n_wake = self.buffer.extract_addendum()
 
-        # 2. Prune candidates from Coreset into Addendum (active forgetting)
+        # 2. Souvenirs remis en jeu (oubli actif : 33% du Coreset)
         n_pruned = 0
         if self.buffer.coreset_size > 1 and prune_pct > 0.0:
             n_pruned = self.buffer.prune_coreset(prune_pct)
+
+        addendum_initial = self.buffer.addendum_size
+
+        # 3. Déduplication géométrique :
+        # 3a. Intra-Addendum
+        saliency_weights = self.trusted_saliency_weights()
+        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04, weights=saliency_weights)
+        if n_intra_dropped > 0:
+            print(f"[sleep:intra-addendum] {n_intra_dropped} redundant duplicates eliminated from Addendum.")
+
+        # 3b. Addendum vs Coreset
+        cross_res = self.buffer.deduplicate_against_coreset(eps=0.04, weights=saliency_weights)
+        n_cross_dropped = cross_res["dropped"]
+        n_cross_refreshed = cross_res["refreshed"]
+        if n_cross_dropped > 0:
+            print(f"[sleep:cross-coreset] {n_cross_dropped} Coreset duplicates eliminated from Addendum ({n_cross_refreshed} refreshed).")
+
+        self.sleep_cycle_stats = {
+            "coreset_before": coreset_before,
+            "wake": n_wake,
+            "pruned": n_pruned,
+            "addendum_initial": addendum_initial,
+            "dedup_intra": n_intra_dropped,
+            "dedup_coreset": n_cross_dropped,
+            "refreshed": n_cross_refreshed,
+            "filter_dropped": None,
+            "filter_kept": None,
+            "coreset_after": None,
+        }
 
         yield "prune", {
             "pruned": n_pruned,
             "coreset": self.buffer.coreset_size,
             "addendum": self.buffer.addendum_size,
+            "coreset_before": coreset_before,
+            "wake": n_wake,
+            "dedup_intra": n_intra_dropped,
+            "dedup_coreset": n_cross_dropped,
+            "refreshed": n_cross_refreshed,
         }
 
         # 3. Epoch allocation between Coreset and Addendum
@@ -1439,18 +1557,31 @@ class Brain:
 
         # 4. Phase 1: Train World Model on Coreset
         core_losses = []
-        if epochs_core > 0:
+        if epochs_core > 0 or (has_coreset and wm_target_loss is not None):
             self.world.train()
             self.sleep_wm_epochs = epochs_core
-            for ep in range(epochs_core):
-                self.sleep_wm_step = ep + 1
+            ep = 0
+            while True:
+                ep += 1
+                self.sleep_wm_step = ep
+                if ep > self.sleep_wm_epochs:
+                    self.sleep_wm_epochs = ep
                 seqs = self.buffer.sample_coreset(wm_batch)
                 if not seqs:
                     break
                 loss_val = self._train_wm_batch(seqs)
                 core_losses.append(loss_val)
                 yield "wm_coreset", loss_val
-        self.last_wm_coreset_loss = (sum(core_losses) / len(core_losses)) if core_losses else float("nan")
+
+                # Stopping criterion: must have completed the quota AND reached target loss
+                quota_done = (ep >= epochs_core)
+                target_done = (wm_target_loss is None) or (loss_val <= wm_target_loss)
+                if quota_done and target_done:
+                    if ep > epochs_core:
+                        print(f"[sleep:wm_coreset] Target loss {wm_target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
+                    break
+        recent_losses = core_losses[-min(len(core_losses), 5):]
+        self.last_wm_coreset_loss = (sum(recent_losses) / len(recent_losses)) if recent_losses else float("nan")
 
         # 5. Filter Addendum using the updated WM
         n_initial = self.buffer.addendum_size
@@ -1528,22 +1659,40 @@ class Brain:
             "mean_dropped_surprise": mean_drop,
             "threshold": threshold,
         }
+        if hasattr(self, "sleep_cycle_stats"):
+            self.sleep_cycle_stats["filter_dropped"] = n_dropped
+            self.sleep_cycle_stats["filter_kept"] = n_kept
+            expected_final = min(self.buffer.pool_capacity, self.buffer.coreset_size + n_kept)
+            self.sleep_cycle_stats["coreset_after"] = expected_final
         yield "filter", self.last_filter_stats
 
         # 6. Phase 2: Train World Model on surviving Addendum
         add_losses = []
-        if self.buffer.addendum_size > 0 and epochs_add > 0:
+        if self.buffer.addendum_size > 0 and (epochs_add > 0 or wm_target_loss is not None):
             self.world.train()
             self.sleep_wm_epochs = epochs_add
-            for ep in range(epochs_add):
-                self.sleep_wm_step = ep + 1
+            ep = 0
+            while True:
+                ep += 1
+                self.sleep_wm_step = ep
+                if ep > self.sleep_wm_epochs:
+                    self.sleep_wm_epochs = ep
                 seqs = self.buffer.sample_addendum(wm_batch)
                 if not seqs:
                     break
                 loss_val = self._train_wm_batch(seqs)
                 add_losses.append(loss_val)
                 yield "wm_addendum", loss_val
-        self.last_wm_addendum_loss = (sum(add_losses) / len(add_losses)) if add_losses else float("nan")
+
+                # Stopping criterion: must have completed the quota AND reached target loss
+                quota_done = (ep >= epochs_add)
+                target_done = (wm_target_loss is None) or (loss_val <= wm_target_loss)
+                if quota_done and target_done:
+                    if ep > epochs_add:
+                        print(f"[sleep:wm_addendum] Target loss {wm_target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
+                    break
+        recent_add_losses = add_losses[-min(len(add_losses), 5):]
+        self.last_wm_addendum_loss = (sum(recent_add_losses) / len(recent_add_losses)) if recent_add_losses else float("nan")
 
         all_wm_losses = core_losses + add_losses
         self.last_wm_loss = (sum(all_wm_losses) / len(all_wm_losses)) if all_wm_losses else float("nan")
@@ -1552,26 +1701,32 @@ class Brain:
         for label, value in self.train_policy(pol_steps, pol_batch, gamma=pol_gamma, n_imagine=pol_n_imagine):
             yield label, value
 
-        # 8. Consolidate Addendum into Coreset with deduplication & memory decay.
-        # EOS-saliency distance only if the WM just converged on the Coreset,
-        # naive distance otherwise.
+        # 8. Consolidate surviving Addendum into Coreset with memory decay.
         saliency_weights = self.trusted_saliency_weights()
         cons_stats = self.buffer.consolidate_addendum_into_coreset(
-            eps=0.04, decay=0.01, weights=saliency_weights
+            eps=0.04, decay=0.01, dedup_intra=False, weights=saliency_weights
         )
+        cons_stats["refreshed"] = n_cross_refreshed + cons_stats.get("refreshed", 0)
+        cons_stats["dedup_cross_dropped"] = n_cross_dropped
+        cons_stats["dedup_intra_dropped"] = n_intra_dropped
+        if hasattr(self, "sleep_cycle_stats"):
+            self.sleep_cycle_stats["coreset_after"] = self.buffer.coreset_size
+            self.sleep_cycle_stats["added"] = cons_stats["added"]
+            self.sleep_cycle_stats["evicted"] = cons_stats["evicted"]
+
         self._refresh_wake_latent()
         self.mode = "wake"
 
         print("\n" + "=" * 62)
-        dist_mode = ("pondérée par sensibilité EOS "
-                     f"(wm_coreset_loss={self.last_wm_coreset_loss:.5f})") \
-            if saliency_weights is not None else "naïve (WM non convergé sur le Coreset)"
-        print(f"[sleep:consolidation Coreset] Déduplication {dist_mode} (eps=0.04, decay=0.01) :")
-        print(f"  - Nouvelles mémoires ajoutées   : {cons_stats['added']}")
-        print(f"  - Mémoires existantes ravivées  : {cons_stats['refreshed']}")
-        print(f"  - Doublons intra-addendum jetés : {cons_stats['dedup_intra_dropped']}")
-        print(f"  - Mémoires froides évincées     : {cons_stats['evicted']}")
-        print(f"  - Taille finale du Coreset      : {cons_stats['coreset_size']}")
+        print("[sleep:cycle summary] :")
+        print(f"  - Coreset before sleep          : {coreset_before}")
+        print(f"  - New experiences               : +{n_wake}")
+        print(f"  - Memories revisited (pruned)   : +{n_pruned}")
+        print(f"  - Raw addendum                  : {addendum_initial}")
+        print(f"  - Intra-addendum duplicates     : -{n_intra_dropped}")
+        print(f"  - Addendum/coreset duplicates   : -{n_cross_dropped} ({n_cross_refreshed} refreshed)")
+        print(f"  - Familiar sequences dropped    : -{n_dropped}")
+        print(f"  - Coreset after sleep           : {self.buffer.coreset_size} (+{cons_stats['added']} added, -{cons_stats['evicted']} evicted)")
         print("=" * 62 + "\n")
 
         stats = {
@@ -1580,6 +1735,7 @@ class Brain:
             "wm_addendum_loss": self.last_wm_addendum_loss,
             "filter": self.last_filter_stats,
             "consolidation": cons_stats,
+            "cycle": getattr(self, "sleep_cycle_stats", {}),
             "pol_loss": self.last_pol_loss,
             "coreset_size": self.buffer.coreset_size,
         }

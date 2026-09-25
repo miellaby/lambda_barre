@@ -95,9 +95,9 @@ class Cursor:
 
     def __init__(self, skel: "B.Skeleton"):
         self._skel = skel
-        self._accum = 0.0
-        self._t = 0.0
         self._sample_dt = 1.0 / self.SAMPLE_HZ
+        self._accum = self._sample_dt
+        self._t = 0.0
         self._prev_mouse_world: tuple[float, float] | None = None
         # IIR cps per frequency cell
         self._cps = [0.0] * self.N_FREQ
@@ -130,45 +130,57 @@ class Cursor:
 
     def reset(self) -> None:
         """Call after B.reset(skel) to clear velocity and sound history."""
-        self._accum = 0.0
+        self._accum = self._sample_dt
         self._t = 0.0
         self._prev_mouse_world = None
         self._cps = [0.0] * self.N_FREQ
         self._signals = {k: 0.0 for k in self._signals}
 
     def update(self, skel: "B.Skeleton",
-               mouse_screen: tuple[float, float],
-               frame_dt: float) -> dict:
+               target: tuple[float, float] | pymunk.Body,
+               frame_dt: float,
+               world_coords: bool = False) -> dict:
         """Advance the sensor by frame_dt. Recomputes at 30 Hz; returns the
-        last computed signals otherwise."""
+        last computed signals otherwise.
+
+        ``target`` can be a pymunk.Body (such as the red balloon mobile), a
+        world coordinate tuple (x, y) if world_coords=True, or a screen
+        coordinate tuple (sx, sy) if world_coords=False.
+        """
         self._accum += frame_dt
         self._t += frame_dt
         if self._accum < self._sample_dt:
             return self._signals
 
         self._accum -= self._sample_dt
-        self._compute(skel, mouse_screen)
+        self._compute(skel, target, world_coords=world_coords)
         return self._signals
 
     def _compute(self, skel: "B.Skeleton",
-                 mouse_screen: tuple[float, float]) -> None:
+                 target: tuple[float, float] | pymunk.Body,
+                 world_coords: bool = False) -> None:
         facing = skel.facing
         head = B.head_world(skel)
 
-        mouse_world = R.s2w(*mouse_screen)
+        if isinstance(target, pymunk.Body):
+            target_world = (target.position.x, target.position.y)
+        elif world_coords:
+            target_world = target
+        else:
+            target_world = R.s2w(*target)
 
-        dx = facing * (mouse_world[0] - head.x)
-        dy = mouse_world[1] - head.y
+        dx = facing * (target_world[0] - head.x)
+        dy = target_world[1] - head.y
         r = math.hypot(dx, dy)
         direction = math.atan2(dy, dx)
         prox = self.CURSOR_MAX_R / (self.CURSOR_MAX_R + r) if r > 0 else 1.0
 
         if self._prev_mouse_world is not None:
-            vx = (mouse_world[0] - self._prev_mouse_world[0]) / self._sample_dt
-            vy = (mouse_world[1] - self._prev_mouse_world[1]) / self._sample_dt
+            vx = (target_world[0] - self._prev_mouse_world[0]) / self._sample_dt
+            vy = (target_world[1] - self._prev_mouse_world[1]) / self._sample_dt
         else:
             vx = vy = 0.0
-        self._prev_mouse_world = mouse_world
+        self._prev_mouse_world = target_world
 
         # IIR decay + intensity = cps * prox, normalised
         self._signals = {

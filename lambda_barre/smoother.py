@@ -24,7 +24,8 @@ import math
 from .tokenize import _BY_KEY, DenseEncoder
 
 # Time constant of the IIR filter (seconds). At 60 Hz, alpha = dt / (tau + dt).
-TAU = 1.0 / 3.0
+# Calibrated for t_90% = 0.33s (1/3 s) -> tau = 0.33 / ln(10) ≈ 0.1433s, half-life ≈ 100 ms (~6 frames).
+TAU = 0.33 / math.log(10.0)
 
 # Keys of all sensor signals the smoother tracks (everything except actions,
 # which are read directly from the skeleton at tick time).

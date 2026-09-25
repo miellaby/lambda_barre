@@ -101,7 +101,7 @@ def test_sleep_trains_both_models_and_world_loss_decreases():
     # learnable: predict the next state ≈ the current state.
     for _ in range(160):
         ss = [random.random() for _ in range(53)]
-        ss[52] = 0.0  # confort=0 -> -1.0 (max reward)
+        ss[50] = 0.0  # confort=0 -> -1.0 (max reward, slot 50)
         salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
         b.record(salve)
     assert len(b.buffer) >= 1  # at least one complete 10-step sequence
@@ -898,7 +898,153 @@ def test_saliency_weights_gated_by_wm_coreset_loss():
     assert b.trusted_saliency_weights() is None
 
 
+def test_sleep_wm_coreset_stopping_condition():
+    b = Brain(seed=42)
+    for _ in range(160):
+        ss = [0.1] * 53
+        salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
+        b.record(salve)
+    b.buffer.extract_addendum()
+    b.buffer.consolidate_addendum_into_coreset()
+
+    # Case 1: Target loss is already satisfied (10.0) -> completes full quota (4 epochs)
+    steps_core = 0
+    for label, val in b.sleep(wm_epochs=4, wm_batch=16, pol_steps=1, pol_batch=8,
+                              wm_coreset_target_loss=10.0, prune_pct=0.0):
+        if label == "wm_coreset":
+            steps_core += 1
+    assert steps_core == 4, f"Expected 4 steps to complete quota, got {steps_core}"
+
+    # Case 2: Quota is small (1 epoch), but target loss is ambitious (0.05)
+    # The loop MUST continue past epoch 1 in overtime until loss <= 0.05
+    steps_overtime = 0
+    final_loss = 1.0
+    for label, val in b.sleep(wm_epochs=1, wm_batch=16, pol_steps=1, pol_batch=8,
+                              wm_target_loss=0.05, prune_pct=0.0):
+        if label == "wm_coreset":
+            steps_overtime += 1
+            final_loss = val
+    assert steps_overtime > 1, f"Expected overtime steps (>1), got {steps_overtime}"
+    assert final_loss <= 0.05, f"Expected final loss <= 0.05, got {final_loss}"
+
+    # Case 3: Addendum overtime training
+    # Record new wake experiences into addendum
+    for _ in range(80):
+        ss = [0.2] * 53
+        salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
+        b.record(salve)
+    steps_add_overtime = 0
+    final_add_loss = 1.0
+    for label, val in b.sleep(wm_epochs=1, wm_batch=16, pol_steps=1, pol_batch=8,
+                              wm_target_loss=0.05, prune_pct=0.0, surprise_factor=0.0):
+        if label == "wm_addendum":
+            steps_add_overtime += 1
+            final_add_loss = val
+    if steps_add_overtime > 0:
+        assert final_add_loss <= 0.05, f"Expected final addendum loss <= 0.05, got {final_add_loss}"
+
+
+def test_ball_physics_gravity_and_sensors():
+    from . import body as B, world as W, extero as E
+    space = W.make_space()
+    skel = B.build_skeleton(space)
+    assert hasattr(space, "ball") and space.ball is not None
+    assert hasattr(space, "ball_shape") and space.ball_shape is not None
+
+    # 1. Gravity: ball y decreases under free fall when dropped in the air
+    space.ball.position = (100.0, 200.0)
+    space.ball.velocity = (0.0, 0.0)
+    y0 = space.ball.position.y
+    for _ in range(10):
+        space.step(1.0 / 60.0)
+    assert space.ball.position.y < y0, "Ball should fall under gravity"
+
+
+    # 2. Reset ball
+    W.reset_ball(space)
+    assert abs(space.ball.position.x - W.BALL_SPAWN[0]) < 1e-4
+    assert abs(space.ball.position.y - W.BALL_SPAWN[1]) < 1e-4
+    assert space.ball.velocity.length < 1e-4
+
+    # 3. Cursor sensor tracks ball position
+    cursor = E.Cursor(skel)
+    cs = cursor.update(skel, space.ball, 1.0 / 60.0)
+    assert "curseur_dir" in cs and "curseur_prox" in cs
+    assert "curseur_vx" in cs and "curseur_vy" in cs
+    assert cs["curseur_prox"] > 0.0
+
+    # 4. Vision detects the ball in field of view
+    vision = E.Vision(skel, space)
+    head = B.head_world(skel)
+    space.ball.position = (head.x + 30, head.y)
+    space.reindex_shape(space.ball_shape)
+    vs = vision.update(skel, 1.0 / 6.0)
+    vis_cells = [v for k, v in vs.items() if k.startswith("vis_c")]
+    assert any(v >= 0.85 for v in vis_cells), f"Vision should see the ball: {vis_cells}"
+
+    # 5. Bounce: dropping ball on ground produces upward rebound velocity (vy > 0)
+    space.ball.position = (100.0, 100.0)
+    space.ball.velocity = (0.0, 0.0)
+    bounced = False
+    for _ in range(60):
+        space.step(1.0 / 60.0)
+        if space.ball.velocity.y > 50.0:
+            bounced = True
+            break
+    assert bounced, "Ball should bounce off the ground with positive upward velocity"
+
+    # 6. Rolling friction: ball rolling on ground decelerates and comes to rest
+    space.ball.position = (500.0, 20.0)
+    space.ball.velocity = (150.0, 0.0)
+    for _ in range(180 * 3):
+        W.step(space, skel, 1.0 / 180.0)
+    assert abs(space.ball.velocity.x) < 1.0, f"Ball should stop rolling, got vx={space.ball.velocity.x}"
+
+
+def test_sample_for_policy_prioritizes_relief():
+    from .brain import ExperienceBuffer
+    from .tokenize import _INTERO_IDX, SIG_OFFSET
+    buf = ExperienceBuffer(seq_len=11, seed=42)
+
+    def make_seq(f0, sf0, f_end, sf_end):
+        tok0 = [0.0] * 25
+        tok0[SIG_OFFSET] = f0
+        tok0[SIG_OFFSET + 1] = sf0
+        tok_end = [0.0] * 25
+        tok_end[SIG_OFFSET] = f_end
+        tok_end[SIG_OFFSET + 1] = sf_end
+        s0 = [[0.0] * 25 for _ in range(16)]
+        s0[_INTERO_IDX] = tok0
+        s_end = [[0.0] * 25 for _ in range(13)]
+        s_end[_INTERO_IDX] = tok_end
+        return [s0] + [[[0.0] * 25 for _ in range(16)] for _ in range(9)] + [s_end]
+
+    seq_relief = make_seq(0.5, 0.8, 0.3, 0.2)
+    seq_neutral = make_seq(0.2, 0.2, 0.2, 0.2)
+    seq_pain = make_seq(0.1, 0.1, 0.4, 0.8)
+
+    buf._addendum = [seq_relief, seq_neutral, seq_pain]
+    counts = {0: 0, 1: 0, 2: 0}
+    for _ in range(600):
+        sampled = buf.sample_for_policy(batch=1, beta=2.0)
+        assert len(sampled) == 1
+        if sampled[0] is seq_relief:
+            counts[0] += 1
+        elif sampled[0] is seq_neutral:
+            counts[1] += 1
+        elif sampled[0] is seq_pain:
+            counts[2] += 1
+
+    assert counts[0] > counts[1], f"Relief ({counts[0]}) should be sampled more than neutral ({counts[1]})"
+    assert counts[1] > counts[2], f"Neutral ({counts[1]}) should be sampled more than pain ({counts[2]})"
+    assert counts[0] > 3 * counts[2], f"Relief ({counts[0]}) should dominate pain ({counts[2]})"
+
+
 if __name__ == "__main__":
+    test_sample_for_policy_prioritizes_relief()
+    test_ball_physics_gravity_and_sensors()
+
+    test_sleep_wm_coreset_stopping_condition()
     test_saliency_weighted_distances_and_consolidation()
     test_saliency_weights_gated_by_wm_coreset_loss()
     test_policy_outputs_are_valid_consignes()

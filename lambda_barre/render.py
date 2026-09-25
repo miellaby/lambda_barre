@@ -21,6 +21,8 @@ HEAD_C = (246, 210, 120)
 EAR_C = (236, 196, 110)
 HUD_C = (200, 206, 220)
 TARGET_C = (110, 200, 255)
+FONT_NAME = "dejavusansmono,ubuntumono,liberationmono,monospace"
+FONT_AA = False
 
 # proprio panel
 PROPRIO_LABEL_C = (160, 166, 180)
@@ -39,7 +41,8 @@ def s2w(sx: float, sy: float) -> tuple[float, float]:
     return sx - ORIGIN_X, GROUND_SCREEN_Y - sy
 
 
-def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True) -> None:
+def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True,
+         mouse_pos: tuple[int, int] | None = None) -> None:
     screen.fill(BG)
     # ground line
     pygame.draw.line(screen, GROUND_C, w2s(-WIDTH, 0), w2s(WIDTH, 0), 4)
@@ -63,6 +66,26 @@ def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True) -> None:
         pygame.draw.rect(screen, (70, 74, 88), rect)
         pygame.draw.circle(screen, (70, 74, 88), (x0, cy), r)
         pygame.draw.circle(screen, (70, 74, 88), (x1, cy), r)
+
+    # Red ball mobile (simple physical ball)
+    ball = getattr(skel.space, "ball", None)
+    if ball is not None:
+        bx, by = w2s(ball.position.x, ball.position.y)
+        ball_shape = getattr(skel.space, "ball_shape", None)
+        r = int(ball_shape.radius if ball_shape is not None else 16)
+        # Ball body
+        pygame.draw.circle(screen, (235, 52, 52), (bx, by), r)
+        pygame.draw.circle(screen, (180, 25, 25), (bx, by), r, 2)
+        # Specular gloss highlight (top-left)
+        hl_x = bx - r // 3
+        hl_y = by - r // 3
+        hl_r = max(2, r // 4)
+        pygame.draw.circle(screen, (255, 175, 175), (hl_x, hl_y), hl_r)
+        # Pickability hover indicator ring
+        if mouse_pos is not None:
+            mx, my = mouse_pos
+            if math.hypot(mx - bx, my - by) <= r + 14:
+                pygame.draw.circle(screen, (255, 220, 180), (bx, by), r + 4, 1)
 
     torso = skel.torso
     # torso triangle — mirror x when facing left so the asymmetric apex
@@ -215,7 +238,7 @@ def draw_proprio(screen, font, signals: dict,
         border_c = (140, 150, 170) if hover == i else (60, 66, 82)
         pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
         # 2-letter label centred
-        s = font.render(code, True, PROPRIO_LABEL_C)
+        s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
         screen.blit(s, (bx + (PROPRIO_BLOCK - s.get_width()) // 2,
                         y + (PROPRIO_BLOCK - s.get_height()) // 2))
 
@@ -273,7 +296,7 @@ def draw_cursor(screen, font, signals: dict,
         pygame.draw.rect(screen, fill, rect, border_radius=4)
         border_c = (140, 150, 170) if hover == i else (60, 66, 82)
         pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
-        s = font.render(code, True, PROPRIO_LABEL_C)
+        s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
         screen.blit(s, (bx + (CURSOR_BLOCK - s.get_width()) // 2,
                         y + (CURSOR_BLOCK - s.get_height()) // 2))
 
@@ -377,7 +400,7 @@ def draw_touch(screen, font, signals: dict,
         pygame.draw.rect(screen, fill, rect, border_radius=4)
         border_c = (140, 150, 170) if hover == i else (60, 66, 82)
         pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
-        s = font.render(code, True, PROPRIO_LABEL_C)
+        s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
         screen.blit(s, (bx + (TOUCH_BLOCK - s.get_width()) // 2,
                         y + (TOUCH_BLOCK - s.get_height()) // 2))
 
@@ -428,7 +451,7 @@ def draw_flux(screen, font, signals: dict,
         pygame.draw.rect(screen, fill, rect, border_radius=4)
         border_c = (140, 150, 170) if hover == i else (60, 66, 82)
         pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
-        s = font.render(code, True, PROPRIO_LABEL_C)
+        s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
         screen.blit(s, (bx + (FLUX_BLOCK - s.get_width()) // 2,
                         y + (FLUX_BLOCK - s.get_height()) // 2))
 
@@ -475,7 +498,7 @@ def draw_reward(screen, font, signals: dict, intero_signals: dict,
     pygame.draw.rect(screen, fill_pos, r_pos, border_radius=4)
     pygame.draw.rect(screen, (140, 150, 170) if hover_pos else (60, 66, 82),
                      r_pos, 2, border_radius=4)
-    s = font.render("+", True, PROPRIO_LABEL_C)
+    s = font.render("+", FONT_AA, PROPRIO_LABEL_C)
     screen.blit(s, (r_pos.x + (REWARD_BLOCK - s.get_width()) // 2,
                     r_pos.y + (REWARD_BLOCK - s.get_height()) // 2))
 
@@ -489,7 +512,7 @@ def draw_reward(screen, font, signals: dict, intero_signals: dict,
     pygame.draw.rect(screen, fill_neg, r_neg, border_radius=4)
     pygame.draw.rect(screen, (140, 150, 170) if hover_neg else (60, 66, 82),
                      r_neg, 2, border_radius=4)
-    s = font.render("-", True, PROPRIO_LABEL_C)
+    s = font.render("-", FONT_AA, PROPRIO_LABEL_C)
     screen.blit(s, (r_neg.x + (REWARD_BLOCK - s.get_width()) // 2,
                     r_neg.y + (REWARD_BLOCK - s.get_height()) // 2))
 
@@ -506,7 +529,7 @@ def draw_reward(screen, font, signals: dict, intero_signals: dict,
         pygame.draw.rect(screen, fill, rect, border_radius=4)
         pygame.draw.rect(screen, (140, 150, 170) if hover_intero == i
                         else (60, 66, 82), rect, 2, border_radius=4)
-        s = font.render(code, True, PROPRIO_LABEL_C)
+        s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
         screen.blit(s, (bx + (REWARD_BLOCK - s.get_width()) // 2,
                         y + (REWARD_BLOCK - s.get_height()) // 2))
 
@@ -571,9 +594,9 @@ def draw_tokens(screen, font_small, salves: list,
         x = TOKEN_PANEL_X + col * (TOKEN_COL_W + 4)
         y = TOKEN_PANEL_Y + row * TOKEN_LINE_H
         if ltype == 2:
-            s = font_small.render(text, True, TOKEN_SALVE_SEP_C)
+            s = font_small.render(text, FONT_AA, TOKEN_SALVE_SEP_C)
         elif ltype == 1:
-            s = font_small.render(text, True, TOKEN_SEP_C)
+            s = font_small.render(text, FONT_AA, TOKEN_SEP_C)
         else:
-            s = font_small.render(text, True, TOKEN_TEXT_C)
+            s = font_small.render(text, FONT_AA, TOKEN_TEXT_C)
         screen.blit(s, (x, y))

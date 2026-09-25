@@ -292,15 +292,16 @@ class Policy(nn.Module):
 
     N_ACT = 5
 
-    def __init__(self, n_state: int = N_POLICY_STATE + 96, hidden: int = 128):
+    def __init__(self, n_state: int = N_POLICY_STATE + 96, hidden: int = 256):
         super().__init__()
         self.N_STATE = n_state
         self.net = nn.Sequential(
-            nn.Linear(n_state, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(n_state, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
         )
         self.mean_head = nn.Linear(hidden, self.N_ACT)
+
 
     def forward(self, state_vec: torch.Tensor) -> torch.Tensor:
         """state_vec: [B, 143] float. Returns action consignes [B, 5]

@@ -52,6 +52,8 @@ COST_LABELS = ["EF", "DO", "CO", "IN", "VE"]
 CONTEXT_BG = (22, 25, 33)
 CONTEXT_BORDER = (45, 52, 68)
 PRED_BORDER = (100, 180, 255)
+FONT_NAME = "dejavusansmono,ubuntumono,liberationmono,monospace"
+FONT_AA = False
 
 
 @dataclass
@@ -216,12 +218,12 @@ def draw_cost_histogram(surface: pygame.Surface, rect: pygame.Rect,
 
     # Header label
     if title:
-        s_title = font_tiny.render(title, True, TEXT_MUTED)
+        s_title = font_tiny.render(title, FONT_AA, TEXT_MUTED)
         surface.blit(s_title, (rx + 4, ry + 2))
 
     # Total cost sum
     total_val = sum(costs)
-    s_tot = font_tiny.render(f"Σ {total_val:.2f}", True, TEXT_WHITE if total_val > 0.05 else TEXT_MUTED)
+    s_tot = font_tiny.render(f"Σ {total_val:.2f}", FONT_AA, TEXT_WHITE if total_val > 0.05 else TEXT_MUTED)
     surface.blit(s_tot, (rx + rw - s_tot.get_width() - 4, ry + 2))
 
     # 5 Bars layout
@@ -250,7 +252,7 @@ def draw_cost_histogram(surface: pygame.Surface, rect: pygame.Rect,
 
         # Bar label
         lbl = COST_LABELS[i]
-        s_lbl = font_tiny.render(lbl, True, TEXT_MUTED)
+        s_lbl = font_tiny.render(lbl, FONT_AA, TEXT_MUTED)
         surface.blit(s_lbl, (bx + (bar_w - s_lbl.get_width()) // 2, base_y + 2))
 
 
@@ -290,9 +292,9 @@ def draw_token_popin(surface: pygame.Surface, encoder: DenseEncoder,
     pygame.draw.rect(surface, (90, 160, 255), pop_rect, 2, border_radius=6)
 
     # Header bar
-    s_title = font_small.render(title, True, (255, 215, 80))
+    s_title = font_small.render(title, FONT_AA, (255, 215, 80))
     surface.blit(s_title, (px + 10, py + 6))
-    s_cnt = font_tiny.render(f"{len(salve)} tokens", True, TEXT_MUTED)
+    s_cnt = font_tiny.render(f"{len(salve)} tokens", FONT_AA, TEXT_MUTED)
     surface.blit(s_cnt, (px + pop_w - s_cnt.get_width() - 10, py + 8))
 
     pygame.draw.line(surface, (45, 55, 75), (px + 8, py + 26), (px + pop_w - 8, py + 26), 1)
@@ -326,10 +328,10 @@ def draw_token_popin(surface: pygame.Surface, encoder: DenseEncoder,
         ty = base_y + row * line_h
 
         tag_c = (255, 205, 90) if kind == "A" else (100, 200, 255)
-        s_tag = font_tiny.render(tag, True, tag_c)
+        s_tag = font_tiny.render(tag, FONT_AA, tag_c)
         surface.blit(s_tag, (tx, ty))
 
-        s_body = font_tiny.render(body, True, (215, 222, 235))
+        s_body = font_tiny.render(body, FONT_AA, (215, 222, 235))
         surface.blit(s_body, (tx + s_tag.get_width() + 4, ty))
 
 
@@ -395,7 +397,10 @@ class WMTheater:
     def handle_event(self, ev: pygame.event.Event) -> bool:
         """Handle keyboard and mouse events. Returns True if handled."""
         if ev.type == pygame.KEYDOWN:
-            if ev.key in (pygame.K_LEFT, pygame.K_a):
+            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
+                pygame.display.toggle_fullscreen()
+                return True
+            elif ev.key in (pygame.K_LEFT, pygame.K_a):
                 self.prev_seq()
                 return True
             elif ev.key in (pygame.K_RIGHT, pygame.K_d):
@@ -461,7 +466,7 @@ class WMTheater:
         screen.fill(DREAM_BG)
 
         if self.num_seqs == 0:
-            msg = font.render("Coreset is empty — no sequences to display.", True, TEXT_WHITE)
+            msg = font.render("Coreset is empty — no sequences to display.", FONT_AA, TEXT_WHITE)
             screen.blit(msg, (self.width // 2 - msg.get_width() // 2, self.height // 2))
             return
 
@@ -479,13 +484,13 @@ class WMTheater:
             f"Rollout Posture RMSE: {rec.overall_posture_rmse:.3f}  |  "
             f"Cost RMSE: {rec.overall_cost_rmse:.3f}"
         )
-        s_title = font.render(title_str, True, TEXT_WHITE)
+        s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
         screen.blit(s_title, (16, 12))
 
         # Prev button
         pygame.draw.rect(screen, (34, 40, 54), self.btn_prev, border_radius=4)
         pygame.draw.rect(screen, CARD_BORDER, self.btn_prev, 1, border_radius=4)
-        s_prev = font_small.render("< Prev [←]", True, TEXT_WHITE)
+        s_prev = font_small.render("< Prev [←]", FONT_AA, TEXT_WHITE)
         screen.blit(s_prev, (self.btn_prev.x + (self.btn_prev.width - s_prev.get_width()) // 2,
                              self.btn_prev.y + 6))
 
@@ -509,21 +514,21 @@ class WMTheater:
         # Next button
         pygame.draw.rect(screen, (34, 40, 54), self.btn_next, border_radius=4)
         pygame.draw.rect(screen, CARD_BORDER, self.btn_next, 1, border_radius=4)
-        s_next = font_small.render("Next [→] >", True, TEXT_WHITE)
+        s_next = font_small.render("Next [→] >", FONT_AA, TEXT_WHITE)
         screen.blit(s_next, (self.btn_next.x + (self.btn_next.width - s_next.get_width()) // 2,
                              self.btn_next.y + 6))
 
         # Random button
         pygame.draw.rect(screen, (34, 40, 54), self.btn_rand, border_radius=4)
         pygame.draw.rect(screen, CARD_BORDER, self.btn_rand, 1, border_radius=4)
-        s_rand = font_small.render("Random [R]", True, TEXT_ACCENT)
+        s_rand = font_small.render("Random [R]", FONT_AA, TEXT_ACCENT)
         screen.blit(s_rand, (self.btn_rand.x + (self.btn_rand.width - s_rand.get_width()) // 2,
                              self.btn_rand.y + 6))
 
         # 2. Section 1: Ground Truth Sequence (Coreset)
         sec1_y = header_h + 12
-        s_sec1 = font.render("GROUND TRUTH (Coreset)  —  Posture réelle & Coûts instantanés (s0 → s10)",
-                             True, TEXT_WHITE)
+        s_sec1 = font.render("GROUND TRUTH (Coreset)  —  Real Posture & Instantaneous Costs (s0 → s10)",
+                             FONT_AA, TEXT_WHITE)
         screen.blit(s_sec1, (self.margin_x, sec1_y))
 
         row1_y = sec1_y + 24
@@ -540,7 +545,7 @@ class WMTheater:
             is_hovered = card_rect.collidepoint(mouse_pos)
             if is_hovered:
                 lbl_text = f"s{i}+a{i}" if i < 10 else "s10 (EOS)"
-                hover_card_info = (f"SALVE RÉELLE {lbl_text}", step_data.real_salve, card_rect)
+                hover_card_info = (f"REAL SALVE {lbl_text}", step_data.real_salve, card_rect)
 
             bg = CONTEXT_BG if is_context else CARD_BG
             if is_hovered:
@@ -554,7 +559,7 @@ class WMTheater:
             # Card Header label
             lbl_text = f"s{i}+a{i}" if i < 10 else "s10 (EOS)"
             c_hdr = TEXT_ACCENT if is_context else TEXT_WHITE
-            s_hdr = font_small.render(lbl_text, True, c_hdr)
+            s_hdr = font_small.render(lbl_text, FONT_AA, c_hdr)
             screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row1_y + 4))
 
             # Animal thumbnail
@@ -566,13 +571,13 @@ class WMTheater:
             # Instantaneous Costs Mini-Histogram
             cost_rect = pygame.Rect(cx + 4, row1_y + 96, self.col_w - 8, 142)
             draw_cost_histogram(screen, cost_rect, step_data.real_costs, font_tiny,
-                                title="Réel", is_predicted=False)
+                                title="Real", is_predicted=False)
 
         # 3. Section 2: World Model Inférence (Rollout après s4a4)
         sec2_y = row1_y + card_h + 14
         s_sec2 = font.render(
-            "PRÉDICTION WORLD MODEL  —  Conditionnement réel [s0..s4a4]  →  Rollout autorégressif [s5^..s10^]",
-            True, WINNER_BORDER)
+            "WORLD MODEL PREDICTION  —  Real Context [s0..s4a4]  →  Autoregressive Rollout [s5^..s10^]",
+            FONT_AA, WINNER_BORDER)
         screen.blit(s_sec2, (self.margin_x, sec2_y))
 
         row2_y = sec2_y + 24
@@ -586,14 +591,14 @@ class WMTheater:
 
             if is_context:
                 if is_hovered:
-                    hover_card_info = (f"SALVE CONTEXTE s{i}", step_data.real_salve, card_rect)
+                    hover_card_info = (f"CONTEXT SALVE s{i}", step_data.real_salve, card_rect)
 
                 # Dimmed context reminder card
                 border_c = (140, 210, 255) if is_hovered else CONTEXT_BORDER
                 pygame.draw.rect(screen, CONTEXT_BG, card_rect, border_radius=4)
                 pygame.draw.rect(screen, border_c, card_rect, 2 if is_hovered else 1, border_radius=4)
 
-                s_hdr = font_small.render(f"[Contexte s{i}]", True, TEXT_MUTED)
+                s_hdr = font_small.render(f"[Context s{i}]", FONT_AA, TEXT_MUTED)
                 screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
 
                 # Context animal thumbnail (dimmed)
@@ -604,19 +609,19 @@ class WMTheater:
                 # Context costs mini-histogram
                 cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 142)
                 draw_cost_histogram(screen, cost_rect, step_data.real_costs, font_tiny,
-                                    title="Contexte", is_predicted=False)
+                                    title="Context", is_predicted=False)
 
             else:
                 lbl_text = f"s{i}^+a{i}" if i < 10 else "s10^ (EOS)"
                 if is_hovered:
-                    hover_card_info = (f"SALVE PRÉDITE {lbl_text}", step_data.pred_salve or [], card_rect)
+                    hover_card_info = (f"PREDICTED SALVE {lbl_text}", step_data.pred_salve or [], card_rect)
 
                 # Predicted step card
                 border_c = WINNER_BORDER if is_hovered else PRED_BORDER
                 pygame.draw.rect(screen, (24, 30, 42), card_rect, border_radius=4)
                 pygame.draw.rect(screen, border_c, card_rect, 2 if is_hovered else 1, border_radius=4)
 
-                s_hdr = font_small.render(lbl_text, True, WINNER_BORDER)
+                s_hdr = font_small.render(lbl_text, FONT_AA, WINNER_BORDER)
                 screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
 
                 # Predicted animal thumbnail
@@ -629,32 +634,32 @@ class WMTheater:
                 # Predicted costs mini-histogram
                 cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 116)
                 draw_cost_histogram(screen, cost_rect, step_data.pred_costs or [0.0]*5, font_tiny,
-                                    title="Prédit", is_predicted=True)
+                                    title="Pred", is_predicted=True)
 
                 # Error metrics badge at the bottom of the card
                 p_err = step_data.posture_rmse or 0.0
                 c_err = step_data.cost_rmse or 0.0
 
                 c_color = (110, 230, 140) if p_err < 0.04 else ((255, 210, 70) if p_err < 0.08 else (240, 100, 100))
-                s_err1 = font_tiny.render(f"Δpost: {p_err:.3f}", True, c_color)
-                s_err2 = font_tiny.render(f"Δcoût: {c_err:.3f}", True, TEXT_WHITE)
+                s_err1 = font_tiny.render(f"Δpost: {p_err:.3f}", FONT_AA, c_color)
+                s_err2 = font_tiny.render(f"Δcost: {c_err:.3f}", FONT_AA, TEXT_WHITE)
                 screen.blit(s_err1, (cx + 6, row2_y + 214))
                 screen.blit(s_err2, (cx + 6, row2_y + 228))
 
         # 4. Footer & Legend
         footer_y = self.height - 24
-        hints = "Navigation : [← / →] Séquence préc/suiv  |  [R] Aléatoire  |  Survol : Détail tokens  |  [Échap / Q] Quitter"
-        s_hints = font_small.render(hints, True, TEXT_MUTED)
+        hints = "Navigation: [← / →] Prev/Next seq  |  [R] Random  |  Hover: Token details  |  [Esc / Q] Quit"
+        s_hints = font_small.render(hints, FONT_AA, TEXT_MUTED)
         screen.blit(s_hints, (self.margin_x, footer_y))
 
         # Costs legend
         leg_x = self.width - self.margin_x - 360
-        s_leg_title = font_tiny.render("Coûts :", True, TEXT_MUTED)
+        s_leg_title = font_tiny.render("Coûts :", FONT_AA, TEXT_MUTED)
         screen.blit(s_leg_title, (leg_x, footer_y + 1))
         cur_lx = leg_x + 40
         for code, c in zip(COST_LABELS, COST_COLORS):
             pygame.draw.rect(screen, c, (cur_lx, footer_y + 3, 8, 8), border_radius=1)
-            s_c = font_tiny.render(code, True, TEXT_WHITE)
+            s_c = font_tiny.render(code, FONT_AA, TEXT_WHITE)
             screen.blit(s_c, (cur_lx + 11, footer_y + 1))
             cur_lx += 42
 
@@ -669,17 +674,32 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
                 wm_path: str = "wm_ckpt.pt",
                 initial_index: int = 0,
                 device: str = "cpu") -> None:
-    """Entry point for running the WM Theater GUI."""
+    os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
+    try:
+        import ctypes
+        ctypes.CDLL("libSDL2-2.0.so.0").SDL_SetHint(b"SDL_HINT_RENDER_SCALE_QUALITY", b"1")
+    except Exception:
+        pass
     pygame.init()
     pygame.display.set_caption("World Model Theater — Diagnostic de Convergence")
 
     width, height = 1140, 700
-    screen = pygame.display.set_mode((width, height))
+    flags = pygame.SCALED | pygame.RESIZABLE
+    screen = pygame.display.set_mode((width, height), flags)
+    # try:
+    #     import warnings
+    #     with warnings.catch_warnings():
+    #         warnings.simplefilter("ignore", DeprecationWarning)
+    #         win = pygame.Window.from_display_module()
+    #         win.size = (width, height)
+    #         win.position = pygame.WINDOWPOS_CENTERED
+    # except Exception:
+    #     pass
     clock = pygame.time.Clock()
 
-    font = pygame.font.SysFont("monospace", 13, bold=True)
-    font_small = pygame.font.SysFont("monospace", 11)
-    font_tiny = pygame.font.SysFont("monospace", 9)
+    font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
+    font_small = pygame.font.SysFont(FONT_NAME, 11)
+    font_tiny = pygame.font.SysFont(FONT_NAME, 10)
 
     brain = Brain(device=device)
     if os.path.exists(wm_path):
@@ -704,6 +724,9 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
+            elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
+                pygame.display.toggle_fullscreen()
+                continue
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break

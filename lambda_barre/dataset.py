@@ -119,6 +119,7 @@ def generate_balance_dataset(
             B.reset(skel)
             proprio.reset()
             reward.reset()
+            W.reset_ball(space)
             cursor.reset()
             vision.reset()
             touch.reset()
@@ -130,7 +131,7 @@ def generate_balance_dataset(
         ts = touch.update(skel, dt)
         rs = reward.update(skel, sig, ts, dt)
         isg = intero.update(rs, dt)
-        cs = cursor.update(skel, (400, 300), dt)
+        cs = cursor.update(skel, getattr(space, "ball", (400, 300)), dt)
         vs = vision.update(skel, dt)
 
         accum += dt

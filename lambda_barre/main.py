@@ -69,17 +69,17 @@ def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
         dev = getattr(brain, "device_desc", str(brain.device))
         lines.append(f"dev {dev}")
         lines.append(
-            f"buf {len(brain.buffer)} (core {brain.buffer.coreset_size}, add {brain.buffer.addendum_size}, {brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f} ")
+            f"core {brain.buffer.coreset_size} · add {brain.buffer.addendum_size} ({brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f}")
         lines.append(
             f"inf wm {brain._wm_time:.1f}ms pol {brain._pol_time:.1f}ms")
     if status:
         lines.append(status)
-    return [font.render(t, True, R.HUD_C) for t in lines]
+    return [font.render(t, False, R.HUD_C) for t in lines]
 
 
 def _keys_hint(font):
     text = "R reset · G overlays · B brain · S sleep · D dream · [-/+] speed"
-    return font.render(text, True, R.HUD_C)
+    return font.render(text, False, R.HUD_C)
 
 
 def _wm_view_step(brain: Brain, salve: list) -> DreamStep:
@@ -114,14 +114,31 @@ def _platform_hit(space, world_pos):
 def run(headless: bool = False, steps: int = 0, reset: bool = False,
         device: str | None = None, bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_epochs: int = 512,
-        freeze_physics: bool = False, no_smooth: bool = False) -> None:
+        freeze_physics: bool = False, no_smooth: bool = False,
+        wm_target_loss: float = 0.01) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
+    try:
+        import ctypes
+        ctypes.CDLL("libSDL2-2.0.so.0").SDL_SetHint(b"SDL_HINT_RENDER_SCALE_QUALITY", b"1")
+    except Exception:
+        pass
     pygame.init()
-    flags = pygame.SCALED
+    flags = pygame.SCALED | pygame.RESIZABLE
     screen = pygame.display.set_mode((R.WIDTH, R.HEIGHT), flags) if not headless else None
-    font = pygame.font.SysFont("monospace", 16) if screen else None
-    font_small = pygame.font.SysFont("monospace", 10) if screen else None
+    # if screen is not None:
+    #     try:
+    #         import warnings
+    #         with warnings.catch_warnings():
+    #             warnings.simplefilter("ignore", DeprecationWarning)
+    #             win = pygame.Window.from_display_module()
+    #             win.size = (R.WIDTH, R.HEIGHT)
+    #             win.position = pygame.WINDOWPOS_CENTERED
+    #     except Exception:
+    #         pass
+    font = pygame.font.SysFont(R.FONT_NAME, 13) if screen else None
+    font_small = pygame.font.SysFont(R.FONT_NAME, 11) if screen else None
     clock = pygame.time.Clock()
     pygame.display.set_caption("lambda barre — Stage 1")
 
@@ -158,7 +175,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         brain.buffer = generate_balance_dataset(target_transitions=bootstrap_dataset)
         brain.buffer.save(_BUF_CKPT)
         status = f"dataset bootstrapped ({len(brain.buffer)} seqs)"
-    smoother = Smoother(tau=1.0)
+    smoother = Smoother()
     salves: list = []       # buffer of last 10 salves (for display, disabled)
     wm_view: DreamStep | None = None  # egocentric thumbnail of the last WM tick (wake)
     WM_DT = 1.0 / 3.0       # world model cadence — 3 Hz
@@ -168,6 +185,10 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     show_overlays = True   # G: toggle targets, egocentric view, and token panel
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
+    drag_ball = False      # whether red balloon is being left-dragged
+    drag_ball_offset = (0.0, 0.0)
+    drag_ball_prev_pos = None
+    drag_ball_vel = (0.0, 0.0)
     sleep_gen = None       # active sleep generator (None when not sleeping)
     dream_theater = DreamTheater(R.WIDTH, R.HEIGHT)
     show_dream = False     # manual inspection of last dream trajectory
@@ -181,7 +202,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     touch_signals = touch.update(skel, 1.0 / 60.0)
     reward_signals = reward.update(skel, signals, touch_signals, 1.0 / 60.0)
     intero_signals = intero.update(reward_signals, 1.0 / 60.0)
-    cursor_signals = cursor.update(skel, (400, 300), 1.0 / 60.0)
+    cursor_signals = cursor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
     vision_signals = vision.update(skel, 1.0 / 60.0)
     smoother.reinit(signals, touch_signals, cursor_signals, vision_signals, intero_signals, reward_signals)
 
@@ -193,6 +214,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
+            elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
+                pygame.display.toggle_fullscreen()
+                status = "fullscreen on" if pygame.display.is_fullscreen() else "fullscreen off"
             elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 if show_dream and sleep_gen is None:
                     show_dream = False
@@ -208,6 +232,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_r:
                     B.reset(skel)
+                    W.reset_ball(space)
                     controls = UI.Controls(skel)
                     proprio.reset()
                     reward.reset()
@@ -220,7 +245,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     ts_r = touch.update(skel, 1.0 / 60.0)
                     rs_r = reward.update(skel, sig_r, ts_r, 1.0 / 60.0)
                     isg_r = intero.update(rs_r, 1.0 / 60.0)
-                    cs_r = cursor.update(skel, (400, 300), 1.0 / 60.0)
+                    cs_r = cursor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
                     vs_r = vision.update(skel, 1.0 / 60.0)
                     smoother.reinit(sig_r, ts_r, cs_r, vs_r, isg_r, rs_r)
                     brain.clear_history()
@@ -250,7 +275,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         dream_theater.clear()
                         brain.last_dream_record = None
                         dream_theater.is_paused = False
-                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps)
+                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps, wm_target_loss=wm_target_loss)
                         status = "sleeping..."
                     else:
                         status = "need a complete sequence to sleep"
@@ -267,6 +292,17 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     cursor.on_key(ev.scancode)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 controls.on_down(*ev.pos)
+                wpos = R.s2w(*ev.pos)
+                ball = getattr(space, "ball", None)
+                if ball is not None:
+                    dist_to_ball = math.hypot(wpos[0] - ball.position.x, wpos[1] - ball.position.y)
+                    ball_r = getattr(space, "ball_shape", None).radius if hasattr(space, "ball_shape") else 16.0
+                    if dist_to_ball <= ball_r + 14.0:
+                        drag_ball = True
+                        drag_ball_offset = (wpos[0] - ball.position.x, wpos[1] - ball.position.y)
+                        drag_ball_prev_pos = (ball.position.x, ball.position.y)
+                        drag_ball_vel = (0.0, 0.0)
+                        ball.velocity = (0.0, 0.0)
                 cursor.on_click()
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3:
                 wpos = R.s2w(*ev.pos)
@@ -277,13 +313,31 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                                    wpos[1] - hit[0].position.y)
             elif ev.type == pygame.MOUSEMOTION:
                 controls.on_motion(*ev.pos)
+                wpos = R.s2w(*ev.pos)
                 if drag_plat is not None:
-                    wpos = R.s2w(*ev.pos)
                     drag_plat[0].position = (wpos[0] - drag_offset[0],
                                              wpos[1] - drag_offset[1])
                     space.reindex_shape(drag_plat[1])
+                if drag_ball and hasattr(space, "ball") and space.ball is not None:
+                    target_x = wpos[0] - drag_ball_offset[0]
+                    target_y = wpos[1] - drag_ball_offset[1]
+                    if drag_ball_prev_pos is not None:
+                        dt = 1.0 / 60.0
+                        vx = (target_x - drag_ball_prev_pos[0]) / dt
+                        vy = (target_y - drag_ball_prev_pos[1]) / dt
+                        drag_ball_vel = (vx * 0.9, vy * 0.9)
+                    space.ball.position = (target_x, target_y)
+                    space.ball.velocity = drag_ball_vel
+                    drag_ball_prev_pos = (target_x, target_y)
+                    if hasattr(space, "ball_shape"):
+                        space.reindex_shape(space.ball_shape)
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 controls.on_up()
+                if drag_ball and hasattr(space, "ball") and space.ball is not None:
+                    space.ball.velocity = drag_ball_vel
+                drag_ball = False
+                drag_ball_prev_pos = None
+                drag_ball_vel = (0.0, 0.0)
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 3:
                 drag_plat = None
 
@@ -294,26 +348,20 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
             try:
                 label, value = next(sleep_gen)
                 if label == "prune":
-                    status = f"pruned {value['pruned']} to addendum (coreset {value['coreset']})"
+                    d_intra = value.get('dedup_intra', 0)
+                    d_core = value.get('dedup_coreset', 0)
+                    status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
                     if label == "wm_addendum":
-                        f_stats = getattr(brain, "last_filter_stats", None)
-                        if f_stats and f_stats.get("initial", 0) > 0:
-                            kept = f_stats["kept"]
-                            dropped = f_stats["dropped"]
-                            pct = f_stats.get("pct_dropped", 0.0)
-                            status = (f"sleeping: addendum {wm_step}/{wm_total} (loss {value:.2f}) "
-                                      f"[gardées: {kept} | retirées: {dropped} ({pct:.0f}%)]")
-                        else:
-                            status = f"sleeping: addendum {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning addendum {wm_step}/{wm_total} (loss {value:.2f})"
                     elif label == "wm_coreset":
-                        status = f"sleeping: coreset {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning coreset {wm_step}/{wm_total} (loss {value:.2f})"
                     else:
-                        status = f"sleeping: wm {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning wm {wm_step}/{wm_total} (loss {value:.2f})"
                 elif label == "filter":
-                    status = f"filtered addendum: {value['initial']} -> {value['kept']} (dropped {value['dropped']})"
+                    status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
                 elif label == "pol":
                     status = f"sleeping: pol {value:.2f}"
                     if brain.last_dream_record is not None:
@@ -324,7 +372,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     brain.save_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
                     print("[sleep]", stats)
                     f_stats = getattr(brain, "last_filter_stats", None)
-                    drop_info = f" [retirées: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
+                    drop_info = f" [dropped: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
                     status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{drop_info} "
                               f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
             except StopIteration:
@@ -333,7 +381,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         speed = SPEED_PRESETS[speed_idx] if not headless else 1.0
 
         def sim_step():
-            nonlocal prev_facing, wm_accum, pol_accum, wm_view
+            nonlocal prev_facing, wm_accum, pol_accum, wm_view, drag_ball_vel
             # manual mode; in brain (auto) mode the policy drives them instead.
             if auto:
                 controls.sync(skel)
@@ -345,12 +393,17 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
             if not freeze_physics:
                 for _ in range(3):
                     W.step(space, skel, 1.0 / 180.0)
+                if drag_ball and hasattr(space, "ball") and space.ball is not None:
+                    if drag_ball_prev_pos is not None:
+                        space.ball.position = drag_ball_prev_pos
+                    space.ball.velocity = drag_ball_vel
+                    drag_ball_vel = (drag_ball_vel[0] * 0.5, drag_ball_vel[1] * 0.5)
             sig = proprio.update(skel, 1.0 / 60.0)
             ts = touch.update(skel, 1.0 / 60.0)
             rs = reward.update(skel, sig, ts, 1.0 / 60.0)
             isg = intero.update(rs, 1.0 / 60.0)
-            mouse_pos = pygame.mouse.get_pos() if screen else (400, 300)
-            cs = cursor.update(skel, mouse_pos, 1.0 / 60.0)
+            ball_target = getattr(space, "ball", None)
+            cs = cursor.update(skel, ball_target if ball_target is not None else (400, 300), 1.0 / 60.0)
             vs = vision.update(skel, 1.0 / 60.0)
 
             # detect instantaneous facing direction flip (frame of reference change)
@@ -459,11 +512,11 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
 
         if screen is not None:
             if sleep_gen is not None or show_dream:
-                dream_theater.draw(screen, font, font_small, status=status)
+                dream_theater.draw(screen, font, font_small, status=status, brain=brain)
                 pygame.display.flip()
             else:
                 mouse = pygame.mouse.get_pos()
-                R.draw(screen, skel, font, show_overlays)
+                R.draw(screen, skel, font, show_overlays, mouse_pos=mouse)
                 if show_overlays:
                     R.draw_tokens(screen, font_small, salves, encoder)
                 R.draw_vision(screen, font, vision, skel)
@@ -476,7 +529,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 hover_text = (h_proprio or h_touch or h_flux or h_cursor
                              or h_reward)
                 if hover_text:
-                    s = font.render(hover_text, True, R.PROPRIO_LABEL_C)
+                    s = font.render(hover_text, False, R.PROPRIO_LABEL_C)
                     screen.blit(s, ((R.WIDTH - s.get_width()) // 2, R.HEIGHT - 24))
                 controls.draw(screen, font)
                 hud_surfs = hud(font, skel, clock.get_fps(), brain, auto,
@@ -519,6 +572,8 @@ def main() -> None:
                    help="policy training steps per sleep cycle (default: 32)")
     p.add_argument("--wm-epochs", type=int, default=512,
                    help="world model training epochs per sleep cycle (default: 512)")
+    p.add_argument("--wm-target-loss", type=float, default=0.01,
+                   help="target loss for World Model coreset training (default: 0.01)")
     p.add_argument("--freeze-physics", action="store_true",
                    help="freeze physics simulation (for debugging token recordings)")
     p.add_argument("--no-smooth", action="store_true",
@@ -531,7 +586,8 @@ def main() -> None:
         run(headless=args.headless, steps=args.steps, reset=args.reset, device=dev,
             bootstrap_dataset=args.bootstrap_dataset, pol_steps=args.pol_steps,
             wm_epochs=args.wm_epochs,
-            freeze_physics=args.freeze_physics, no_smooth=args.no_smooth)
+            freeze_physics=args.freeze_physics, no_smooth=args.no_smooth,
+            wm_target_loss=args.wm_target_loss)
     except KeyboardInterrupt:
         pygame.quit()
 

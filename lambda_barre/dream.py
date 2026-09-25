@@ -27,6 +27,7 @@ TEXT_WHITE = (230, 235, 245)
 TEXT_MUTED = (140, 148, 165)
 TEXT_ACCENT = (110, 200, 255)
 GROUND_LINE_C = (60, 66, 82)
+FONT_AA = False
 
 CAND_COLORS = [
     (90, 190, 255),   # Cand 0: Policy (Cyan)
@@ -271,13 +272,13 @@ def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
     # Step label (top-left)
     lbl_text = step.label or highlight_label
     if lbl_text:
-        s_lbl = font_small.render(lbl_text, True, TEXT_MUTED)
+        s_lbl = font_small.render(lbl_text, FONT_AA, TEXT_MUTED)
         surface.blit(s_lbl, (bx + 4, by + 2))
 
     # Cost text (bottom-right)
     if step.step_cost != 0.0:
         c_text = f"{step.step_cost:.2f}"
-        s_cost = font_small.render(c_text, True, (210, 150, 150))
+        s_cost = font_small.render(c_text, FONT_AA, (210, 150, 150))
         surface.blit(s_cost, (bx + bw - s_cost.get_width() - 4, by + bh - 13))
 
 
@@ -366,19 +367,20 @@ class DreamTheater:
         return False
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font,
-             font_small: pygame.font.Font, status: str = "") -> None:
+             font_small: pygame.font.Font, status: str = "",
+             brain=None) -> None:
         """Render the complete Dream Theater storyboard."""
         screen.fill(DREAM_BG)
 
         if self.record is None:
-            # Clean Phase 1 (World Model training) screen
+            # World Model training screen (no "Phase 1")
             pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h))
             pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
-            title_str = "SLEEP MODE  |  Phase 1: World Model Training"
-            s_title = font.render(title_str, True, TEXT_WHITE)
+            title_str = "World Model Training"
+            s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
             screen.blit(s_title, (16, 16))
 
-            cw, ch = 540, 140
+            cw, ch = 560, 236
             cx = (self.width - cw) // 2
             cy = (self.height - ch) // 2
             card_rect = pygame.Rect(cx, cy, cw, ch)
@@ -386,29 +388,51 @@ class DreamTheater:
             pygame.draw.rect(screen, CARD_BORDER, card_rect, 1, border_radius=8)
 
             msg = status if status else "World Model optimization in progress..."
-            txt = font.render(msg, True, TEXT_WHITE)
-            screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 24))
+            txt = font.render(msg, FONT_AA, TEXT_WHITE)
+            screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 14))
 
             import re
-            m = re.search(r"wm (\d+)/(\d+)", msg)
+            m = re.search(r"(\d+)/(\d+)", msg)
             if m:
                 step, total = int(m.group(1)), int(m.group(2))
                 pct = min(1.0, max(0.0, step / max(1, total)))
-                pb_w, pb_h = cw - 60, 8
+                pb_w, pb_h = cw - 60, 6
                 pb_x = cx + 30
-                pb_y = cy + 54
-                pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=4)
-                pygame.draw.rect(screen, (70, 140, 230), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=4)
+                pb_y = cy + 36
+                pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=3)
+                pygame.draw.rect(screen, (70, 140, 230), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=3)
 
-            hint = font_small.render(
-                "Consolidating experience and learning next-state transitions before policy imagination.",
-                True, TEXT_MUTED)
-            screen.blit(hint, (cx + (cw - hint.get_width()) // 2, cy + 76))
+            # Replicate console print lines in the GUI
+            print_lines: list[tuple[str, tuple[int, int, int]]] = []
+            if brain is not None:
+                cycle = getattr(brain, "sleep_cycle_stats", {})
+                c_before = cycle.get("coreset_before", getattr(brain.buffer, "coreset_size", 0))
+                n_wake = cycle.get("wake", 0)
+                n_prune = cycle.get("pruned", 0)
+                add_raw = cycle.get("addendum_initial", n_wake + n_prune)
+                d_intra = cycle.get("dedup_intra", 0)
+                d_cross = cycle.get("dedup_coreset", 0)
+                n_refresh = cycle.get("refreshed", 0)
+                f_dropped = cycle.get("filter_dropped", None)
+                c_after = cycle.get("coreset_after", None)
 
-            hint2 = font_small.render(
-                "Policy candidates (Phase 2) will appear as soon as imagination begins.",
-                True, TEXT_MUTED)
-            screen.blit(hint2, (cx + (cw - hint2.get_width()) // 2, cy + 98))
+                c_after_str = str(c_after) if c_after is not None else f"{brain.buffer.coreset_size} (in progress)"
+                f_drop_str = f"-{f_dropped}" if f_dropped is not None else "-- (in progress)"
+
+                print_lines.append((f"  - Coreset before sleep           : {c_before}", TEXT_WHITE))
+                print_lines.append((f"  - New experiences                : +{n_wake}", TEXT_ACCENT))
+                print_lines.append((f"  - Memories revisited (forgetting): +{n_prune}", TEXT_ACCENT))
+                print_lines.append((f"  - Raw addendum                   : {add_raw}", TEXT_WHITE))
+                print_lines.append((f"  - Intra-addendum duplicates      : -{d_intra}", TEXT_MUTED))
+                print_lines.append((f"  - Addendum/coreset duplicates    : -{d_cross} ({n_refresh} refreshed)", TEXT_MUTED))
+                print_lines.append((f"  - Familiar sequences dropped     : {f_drop_str}", TEXT_MUTED))
+                print_lines.append((f"  - Coreset after sleep            : {c_after_str}", WINNER_BORDER if c_after is not None else TEXT_WHITE))
+            else:
+                print_lines.append(("  - Waiting for sleep cycle to start...", TEXT_MUTED))
+
+            for idx, (s_line, s_col) in enumerate(print_lines):
+                s_rend = font_small.render(s_line, FONT_AA, s_col)
+                screen.blit(s_rend, (cx + 36, cy + 52 + idx * 21))
             return
 
         rec = self.record
@@ -422,8 +446,8 @@ class DreamTheater:
 
         # Title and status
         pause_txt = " [PAUSED - [n] for next step]" if self.is_paused else " [Running — Space to pause]"
-        title_str = f"SLEEP DREAM THEATER  |  Step {rec.step_idx + 1}/{rec.total_steps}  |  Loss: {rec.loss:.4f}{pause_txt}"
-        s_title = font.render(title_str, True, WINNER_BORDER if self.is_paused else TEXT_WHITE)
+        title_str = f"DREAM THEATER  |  Step {rec.step_idx + 1}/{rec.total_steps}  |  Loss: {rec.loss:.4f}{pause_txt}"
+        s_title = font.render(title_str, FONT_AA, WINNER_BORDER if self.is_paused else TEXT_WHITE)
         screen.blit(s_title, (16, 6))
 
         # Tabs
@@ -437,13 +461,13 @@ class DreamTheater:
             pygame.draw.rect(screen, tab_bg, rect_tab, border_radius=3)
             pygame.draw.rect(screen, tab_border, rect_tab, 1, border_radius=3)
             c_name = CAND_COLORS[i - 1] if i > 0 else TEXT_WHITE
-            s_tab = font_small.render(name, True, c_name if is_active else TEXT_MUTED)
+            s_tab = font_small.render(name, FONT_AA, c_name if is_active else TEXT_MUTED)
             screen.blit(s_tab, (tx + (tw - s_tab.get_width()) // 2, 31))
             tx += tw + 8
 
         # Help hint on top-right
         hint_txt = "Tab / 0-4: Filter | Wheel: Scroll | [n]: Next step | Space: Resume" if self.is_paused else "Tab / 0-4: Filter | Wheel: Scroll | Space: Pause"
-        hint = font_small.render(hint_txt, True, TEXT_MUTED)
+        hint = font_small.render(hint_txt, FONT_AA, TEXT_MUTED)
         screen.blit(hint, (self.width - hint.get_width() - 16, 31))
 
         # 2. Rows content area
@@ -455,7 +479,7 @@ class DreamTheater:
         pygame.draw.rect(screen, (60, 68, 88), row_rect, 1, border_radius=4)
 
         # Context row label
-        s_cxt = font_small.render("PAST REAL CONTEXT (s0 → s4)", True, TEXT_ACCENT)
+        s_cxt = font_small.render("PAST REAL CONTEXT (s0 → s4)", FONT_AA, TEXT_ACCENT)
         screen.blit(s_cxt, (20, content_y + 4))
 
         # Context thumbnails
@@ -490,7 +514,7 @@ class DreamTheater:
                 header_text = f"CANDIDATE {cand_names[c_idx]}"
                 if is_win_cand:
                     header_text += "  ★ WINNER (SELECTED FOR LEARNING)"
-                s_grp = font.render(header_text, True, WINNER_BORDER if is_win_cand else cand_color)
+                s_grp = font.render(header_text, FONT_AA, WINNER_BORDER if is_win_cand else cand_color)
                 screen.blit(s_grp, (16, content_y))
                 content_y += 24
 
@@ -506,18 +530,18 @@ class DreamTheater:
 
             # Left row info: Regime name + Cost
             r_name = traj.regime_name
-            s_reg = font_small.render(r_name, True, TEXT_WHITE)
+            s_reg = font_small.render(r_name, FONT_AA, TEXT_WHITE)
             screen.blit(s_reg, (20, content_y + 12))
 
             cost_str = f"Cost: {traj.total_cost:.2f}"
-            s_cost = font_small.render(cost_str, True, WINNER_BORDER if is_win else (BEST_BORDER if is_best else TEXT_MUTED))
+            s_cost = font_small.render(cost_str, FONT_AA, WINNER_BORDER if is_win else (BEST_BORDER if is_best else TEXT_MUTED))
             screen.blit(s_cost, (20, content_y + 30))
 
             if is_win:
-                s_win = font_small.render("🏆 WINNER", True, WINNER_BORDER)
+                s_win = font_small.render("🏆 WINNER", FONT_AA, WINNER_BORDER)
                 screen.blit(s_win, (20, content_y + 48))
             elif is_best:
-                s_best = font_small.render("★ Best Regime", True, BEST_BORDER)
+                s_best = font_small.render("★ Best Regime", FONT_AA, BEST_BORDER)
                 screen.blit(s_best, (20, content_y + 48))
 
             # Render thumbnails along the row: [s4+a4] [s5+a5] [s6+a6] ...
