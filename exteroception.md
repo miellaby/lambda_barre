@@ -90,24 +90,22 @@ Le barycentre de la zone changée est calculé géométriquement, puis égocentr
 Cela restitue un flux optique grossier : « quelque chose de gros bouge à
 gauche/droite ».
 
-## Curseur de la souris
+## Mobile physique (ballon / balle)
 
-Position (polaire) et vitesse du curseur, dans le référentiel de la tête :
+L'environnement physique Pymunk intègre un corps mobile dynamique (balle / ballon rouge, $r = 16\text{ px}$, masse $0.5\text{ kg}$) soumis à la gravité (`GRAVITY = -900 px/s²`), au rebond (`restitution = 0.75`) et au frottement de roulement, manipulable à la souris (saisie, lancer).
 
-- `curseur_dir` : `atan2(facing * dy, facing * dx)` — angle égocentré (devant
-  = 0, [-π, +π]).
-- `curseur_prox` : `max_r / (max_r + r)` — proximité, décroît avec la distance
-  mais de plus en plus lentement (proche = 1, loin = ~0).
-- `curseur_vx` : `facing * mouse_vx` — vitesse horizontale égocentrée
-- `curseur_vy` : `mouse_vy` — vitesse verticale
+Les signaux du capteur mesurent la position et la vitesse de ce mobile dans le référentiel de la tête :
 
-La position est encodée en polaire : direction + proximité. La proximité
-décroît avec la distance mais s'aplatit (décroissance rapide près, lente
-loin), simulant une résolution fovéale. La vitesse reste cartésienne.
+- `curseur_dir` : `atan2(facing * dy, facing * dx)` — angle égocentré vers le ballon (devant = 0, [-π, +π]).
+- `curseur_prox` : `max_r / (max_r + r)` — proximité du ballon, décroît avec la distance mais s'aplatit (proche = 1, loin = ~0), simulant une résolution fovéale.
+- `curseur_vx` : `facing * ball_vx` — vitesse horizontale égocentrée du ballon.
+- `curseur_vy` : `ball_vy` — vitesse verticale du ballon.
+
+La position est encodée en polaire (direction + proximité) et la vitesse reste cartésienne. Le ballon est également visible dans le cône rétinien de la **Vision** (détecté avec une intensité dynamique `DYNAMIC_GRAY = 0.90`) et peut heurter physiquement l'animat (perçu par le capteur de toucher).
 
 ```python
 [ENV]
-  curseur   # (dir, prox, vx, vy) égocentrés
+  curseur   # (dir, prox, vx, vy) égocentrés vers le mobile
 ```
 
 ## Toucher
@@ -145,29 +143,12 @@ la force normale scalaire suffit.
   patte_ar   # (contact_sol,)
 ```
 
-Les forces de contact sol/plateforme sont des signaux extéroceptifs :
-« que touche-je ? ».
-
-`contact_sol` est la force normale (scalaire), déjà implémentée. Les
-collisions non-sol (vecteurs force égocentrés) restent à implémenter.
-
-### Inconfort d'immobilité
-
-L'immobilité prolongée produit une sensation d'inconfort avec un coût
-intrinsèque croissant. Ce renforcement système encode l'instinct biologique qui
-pousse au mouvement.
-
-Ce signal est frontière entre extéroception et intéroception : il s'agit d'une
-mesure interne (depuis quand n'ai-je pas bougé ?) mais sa sémantique est
-motivée par l'environnement. Proposition : le ranger en intéroception, car c'est
-un état interne dérivé de la proprioception (absence de variation des signaux
-proprioceptifs).
 
 ## Audition
 
 Le son est perçu par 5 cellules fréquentielles, chacune produisant un scalaire
-normalisé sur [0, 1]. Le son est toujours émis depuis la position du curseur :
-la proximité du curseur module l'intensité perçue.
+normalisé sur [0, 1]. Le son est toujours émis depuis la position du mobile (ballon) :
+la proximité du mobile (`curseur_prox`) module l'intensité perçue.
 
 ### Dynamique IIR
 
@@ -185,9 +166,10 @@ L'intensité perçue d'une cellule est :
 intensité = min(1, (cps / cps_max) * curseur_prox)
 ```
 
-où `curseur_prox = max_r / (max_r + distance_tete_curseur)` (proche = 1,
-loin = ~0). Ainsi un clic proche est fort, un clic lointain est faible, et la
+où `curseur_prox = max_r / (max_r + distance_tete_ballon)` (proche = 1,
+loin = ~0). Ainsi un événement proche du ballon est fort, un événement lointain est faible, et la
 décroissance temporelle est gérée par le filtre IIR — pas d'enveloppe séparée.
+
 
 ### Spectre fréquentiel
 
@@ -236,26 +218,25 @@ Les modalités extéroceptives sont plus lentes que la proprioception :
 - **Vision** : cadencée à ~6 Hz (10× plus lent que la proprioception à 60 Hz).
   Le cône visuel est un instantané de l'écran, pas besoin de 60 Hz.
 - **Flux optique** : dérivé de deux frames visuelles consécutives, donc ~6 Hz.
-- **Curseur** : 30 Hz (intermédiaire — le mouvement du curseur est rapide mais
-  pas besoin de 60 Hz). Le son (clic + clavier) est inclus dans le curseur car
-  la source sonore est la position du curseur.
+- **Mobile (ballon) + Son** : 30 Hz (intermédiaire — le mouvement du ballon est rapide mais
+  pas besoin de 60 Hz). Le son (clic + clavier) est inclus dans ce canal car
+  la source sonore est la position du mobile.
 - **Toucher** : 60 Hz (contact calculé via `CollisionHandler` sur le pas
   physique).
 
 ## Format de sortie
 
 Chaque modalité produit un `dict` ou une liste de `dict`, assemblés par
-l'encodeur du transformer en séquences d'embeddings délimitées par tokens
-symboliques : `[VISION]`, `[TOUCH]`, `[ENV]`. Pour l'instant, des
-`dict` plats suffisent pour l'IHM de visualisation et les tests.
+l'encodeur du transformer en séquences de tokens denses (voir `tokens.md`).
 
 ## Implémentation — état actuel
 
 Implémentées :
-- **Curseur + Son** : position polaire (direction + proximité), vitesse
+- **Mobile (ballon) + Son** : position polaire (direction + proximité), vitesse
   cartésienne, et 5 cellules fréquentielles IIR pour le son (clic souris +
-  clavier). Le son est émis depuis la position du curseur — `extero.py` classe
+  clavier). Le son est émis depuis la position du mobile — `extero.py` classe
   `Cursor`. Cadencée à 30 Hz.
+
 - **Vision** : cône rétinien 4×4, 16 cellules × 1 brightness (N&B) = 16
   valeurs, échantillonnage par `space.point_query_nearest` — `extero.py`
   classe `Vision`. Cadencée à 6 Hz. Pas de masquage (chaque cellule est
@@ -266,8 +247,3 @@ Implémentées :
 - **Toucher** : forces de contact des pattes (2 scalaires) et collision du
   tronc (force + point de contact dans le repère du tronc, 4 scalaires) via
   `CollisionHandler` `post_solve` — `extero.py` classe `Touch`. Cadencée à
-  60 Hz. Tout solide étranger à l'animat est perçu indifféremment.
-
-L'extéroception est complète pour le sandbox pygame isolé. L'accès au bureau
-réel (souris système, clavier système, notifications) nécessitera une
-intégration OS au-delà de pygame.
