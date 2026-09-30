@@ -50,6 +50,7 @@ _N_CTX = 4                                                 # 4 real transitions 
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
 _WM_IMPACT_FLOOR = 0.05                                     # floor weight added to every sequence's cost impact
+_WM_REWARD_BOOST = 16.0                                      # gradient boost on S10 reward slots and terminal EOS delta
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
 # trajectory-cost: 5 unsigned cost signals (token 10) + 1 signed confort
@@ -104,6 +105,24 @@ for _p in range(_SEQ_LEN - 1):
     if _tidx == _INTERO_IDX and (_p + 1) < (_SEQ_LEN - 1):
         continue
     _target_valid[_p, :_N_SIGNALS[_tidx]] = True
+
+# Float loss weights: 1.0 on every valid slot, boosted (_WM_REWARD_BOOST) on
+# the terminal salve's reward channels (costs token 10, confort token 11) and
+# on the terminal EOS interoception delta (token 12 of salve 10) — the signals
+# the policy's Bellman cost and relief sampling actually consume. The
+# denominator sum(w) in the loss self-scales the magnitude, so the overall
+# step size and the wm_target_loss thresholds keep their meaning: no
+# per-token-type normalization is needed. The boolean ``_target_valid`` above
+# remains the reference for the (unboosted) surprise evaluation.
+_target_weight = torch.zeros(_SEQ_LEN - 1, N_SIGNAL, dtype=torch.float32)
+for _p in range(_SEQ_LEN - 1):
+    _tidx = (_p + 1) % SALVE_TOKENS
+    if _tidx == _INTERO_IDX and (_p + 1) < (_SEQ_LEN - 1):
+        continue
+    _target_weight[_p, :_N_SIGNALS[_tidx]] = 1.0
+for _tidx in (_COST_IDX, _REWARD_IDX, _INTERO_IDX):
+    _p = SEQ_STEPS * SALVE_TOKENS + _tidx - 1
+    _target_weight[_p, :_N_SIGNALS[_tidx]] = _WM_REWARD_BOOST
 
 # Salve-within-type attention mask for the fixed training sequence.
 _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
@@ -736,6 +755,7 @@ class Brain:
         self.buffer = ExperienceBuffer(seq_len=SEQ_STEPS + 1, seed=seed)
         self.mask = _MASK.to(self.device)
         self.target_valid = _target_valid.to(self.device)
+        self.target_weight = _target_weight.to(self.device)
         # WM training step: eager by default, optionally compiled as one
         # fused graph (static shapes [B, 173, 25] — the training loop is the
         # only caller, so no recompilation churn). The module itself stays
@@ -1023,11 +1043,11 @@ class Brain:
         pred = self.world(vals)                           # [B, L, 16] (causal by construction)
         pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
         tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
-        m_b = self.target_valid.unsqueeze(0).expand_as(pred_signals)  # [B, L-1, 16]
+        w_b = self.target_weight.unsqueeze(0).expand_as(pred_signals)  # [B, L-1, 16]
         sq = (pred_signals - tgt_signals) ** 2
-        sqm = (sq * m_b).sum(dim=(1, 2))                  # [B] per-sequence squared error
-        cnt = m_b.sum(dim=(1, 2)).clamp(min=1)            # [B] valid slots per sequence
-        mse = sqm / cnt                                   # [B] per-sequence MSE
+        sqm = (sq * w_b).sum(dim=(1, 2))                  # [B] per-sequence weighted squared error
+        wsum = w_b.sum(dim=(1, 2)).clamp(min=1.0)          # [B] total slot weight per sequence
+        mse = sqm / wsum                                   # [B] per-sequence weighted MSE
         return (mse * weights).sum() / weights.sum().clamp(min=1e-8)
 
     def _train_wm_batch(self, sequences: list[list[list[float]]]) -> float:
