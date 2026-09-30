@@ -39,7 +39,7 @@ from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
                        _COST_IDX, _REWARD_IDX, _INTERO_IDX, _COST_KEYS, _COST_WEIGHTS,
                        _BY_KEY, _LAYOUT, _prefix,
-                       state_tokens, action_tokens)
+                       state_tokens, action_tokens, salve_cost)
 
 
 # Fixed layout of a training sequence: a trajectory of SEQ_STEPS transitions.
@@ -49,6 +49,7 @@ _SEQ_LEN = SEQ_STEPS * SALVE_TOKENS + STATE_TOKENS          # 173
 _N_CTX = 4                                                 # 4 real transitions used as context (s0..s3, a0..a3, s4)
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
+_WM_IMPACT_FLOOR = 0.05                                     # floor weight added to every sequence's cost impact
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
 # trajectory-cost: 5 unsigned cost signals (token 10) + 1 signed confort
@@ -130,6 +131,22 @@ def _salve_moved(s1: list[list[float]], s2: list[list[float]],
             if abs(tok1[k] - tok2[k]) >= tol:
                 return True
     return False
+
+
+def sequence_impact(sequences: list[list[list[float]]]) -> torch.Tensor:
+    """Per-sequence impact weight [B]: |cost(S_last) - cost(S4)|.
+
+    The actual biological consequence of a sequence window is the change in
+    immediate innate cost between the mid-sequence decision state (salve 4)
+    and the terminal state (salve 10). Sequences that leave the cost unchanged
+    are neutral; sequences that raise or lower it carry positive/negative
+    impact, in absolute value. Used to scale each sequence's descent step
+    during World Model training."""
+    impacts = []
+    for seq in sequences:
+        i_mid = min(_N_CTX, len(seq) - 1)          # S4: decision state
+        impacts.append(abs(salve_cost(seq[-1]) - salve_cost(seq[i_mid])))
+    return torch.tensor(impacts, dtype=torch.float32)
 
 # --- naive sequence distance & clustering across all channels -----------------
 def _sequence_signals_tensor(sequences: list[list[list[float]]],
@@ -752,6 +769,7 @@ class Brain:
         self._cached_scalars = None  # [1, 47] — scalar state at last wake_tick
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
+        self.last_wm_impact = float("nan")
         self.last_wm_coreset_loss = float("nan")
         self.last_wm_addendum_loss = float("nan")
         self.last_filter_stats: dict | None = None
@@ -991,8 +1009,15 @@ class Brain:
             vals[b, p_final, SIG_OFFSET + 2:] = 0.0
         return vals
 
-    def _wm_loss_impl(self, vals: torch.Tensor) -> torch.Tensor:
-        """Teacher-forced forward + masked-MSE loss over valid signal slots.
+    def _wm_loss_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced forward + impact-weighted masked-MSE loss over valid
+        signal slots.
+
+        ``weights`` [B] scales each sequence's contribution to the loss, so
+        its descent step is proportional to its measured cost impact
+        (|cost(S10) - cost(S4)|). The weighted mean keeps the overall step
+        magnitude on the same scale as the uniform loss, independent of the
+        cost-unit scale of the impacts.
         Side-effect free so torch.compile can capture it as one graph; the
         backward pass through this graph is also compiled (AOTAutograd)."""
         pred = self.world(vals)                           # [B, L, 16] (causal by construction)
@@ -1000,12 +1025,24 @@ class Brain:
         tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
         m_b = self.target_valid.unsqueeze(0).expand_as(pred_signals)  # [B, L-1, 16]
         sq = (pred_signals - tgt_signals) ** 2
-        return (sq * m_b).sum() / m_b.sum().clamp(min=1)
+        sqm = (sq * m_b).sum(dim=(1, 2))                  # [B] per-sequence squared error
+        cnt = m_b.sum(dim=(1, 2)).clamp(min=1)            # [B] valid slots per sequence
+        mse = sqm / cnt                                   # [B] per-sequence MSE
+        return (mse * weights).sum() / weights.sum().clamp(min=1e-8)
 
     def _train_wm_batch(self, sequences: list[list[list[float]]]) -> float:
-        """Run one training optimization step on a batch of transition sequences."""
+        """Run one training optimization step on a batch of transition sequences.
+
+        Each sequence's descent step is proportional to its actual impact
+        |cost(S10) - cost(S4)|: the absolute change in immediate cost between
+        the decision state and the terminal state. A small floor weight
+        (``_WM_IMPACT_FLOOR``) keeps neutral sequences learning at a trickle
+        and prevents an all-neutral batch from yielding a zero loss that
+        would trip the target-loss stopping criterion."""
         vals = self._batch_tensors(sequences)             # [B, L, 25]
-        loss = self._wm_loss(vals)
+        weights = sequence_impact(sequences).to(self.device) + _WM_IMPACT_FLOOR
+        self.last_wm_impact = (weights.sum() / len(sequences)).item()
+        loss = self._wm_loss(vals, weights)
         self.opt_wm.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
@@ -1424,7 +1461,7 @@ class Brain:
     def train_policy(self, steps: int = 16, batch: int = 32,
                      gamma: float = 1.1, n_imagine: int = 6,
                      prioritize_relief: bool = True,
-                     use_kv_cache: bool = False):
+                     use_kv_cache: bool = True):
         """Policy training via candidate evaluation in WM imagination.
         Generator: yields (label, value) after each step."""
         if len(self.buffer) < 1:
@@ -1593,7 +1630,7 @@ class Brain:
               pol_gamma: float = 1.1,
               wm_target_loss: float | None = 0.01,
               wm_coreset_target_loss: float | None = None,
-              use_kv_cache: bool = False):
+              use_kv_cache: bool = True):
         """One full sleep cycle with Coreset / Addendum and active forgetting.
 
         Phases:

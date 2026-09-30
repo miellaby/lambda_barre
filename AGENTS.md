@@ -29,14 +29,14 @@ Dataset Optimisation & Word Model Training, then Policy Training:
 3. **Geometric Deduplication**:
    - **Intra-Addendum**: Complete linkage clustering removing redundant duplicates within the Addendum (`deduplicate_addendum`).
    - **Addendum vs. Coreset**: Cross-deduplication against the remaining Coreset (`deduplicate_against_coreset`). Sequences within distance $\epsilon < 0.04$ refresh the Coreset memory vivacity to 1.0 and are **immediately dropped from the Addendum**.
-4. **World Model Training on Coreset**: Train the World Model on the remaining Coreset (`wm_coreset`) to establish baseline known dynamics (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$).
+4. **World Model Training on Coreset**: Train the World Model on the remaining Coreset (`wm_coreset`) to establish baseline known dynamics (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$). Each sequence's descent step is proportional to its actual impact $|\,\text{cost}(S_{10}) - \text{cost}(S_4)\,|$ — the absolute change in immediate innate cost between the decision state and the terminal state — so the WM focalizes on sequences with real positive or negative biological consequences. A small floor weight keeps neutral sequences learning at a trickle.
 5. **Surprise Filtering (Cognitive Evaluation)**:
    - Evaluated in inference mode (`torch.no_grad()`), **without gradient descent**.
    - World Model predicts each surviving Addendum sequence.
    - Error $< \text{threshold}$ $\rightarrow$ familiar/known sequence $\rightarrow$ **dropped**.
    - Error $\ge \text{threshold}$ $\rightarrow$ surprising dynamic $\rightarrow$ **kept**.
    - **Update UI Stats immediately**: Update `filter_dropped` and compute expected `coreset_after` before Addendum training begins.
-6. **World Model Training on Addendum**: Train the World Model on the surprising Addendum sequences (`wm_addendum`) with gradient descent (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$).
+6. **World Model Training on Addendum**: Train the World Model on the surprising Addendum sequences (`wm_addendum`) with gradient descent (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$), with the same impact-proportional descent steps as `wm_coreset`.
 7. **Policy Training** Supervised policy improvement using imagined rollout trajectories in Dream Theater (`train_policy`).
 8. **Final consolidation** Commit surviving Addendum sequences into the Coreset (`consolidate_addendum_into_coreset`), apply vivacity decay, and evict coldest memories if exceeding maximum capacity.
 
@@ -121,4 +121,3 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 
 - `README.md`
 - Last session: `session_{date}.md` (chronological logs `session_YYYY_MM_DD.md` document daily decisions, invariant changes, and recent diagnoses)
-

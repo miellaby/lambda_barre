@@ -116,7 +116,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         pol_steps: int = 64, wm_epochs: int = 512,
         freeze_physics: bool = False, no_smooth: bool = False,
         wm_target_loss: float = 0.01,
-        use_kv_cache: bool = False,
+        use_kv_cache: bool = True,
         compile_wm: bool = False) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -582,9 +582,10 @@ def main() -> None:
                    help="freeze physics simulation (for debugging token recordings)")
     p.add_argument("--no-smooth", action="store_true",
                    help="bypass IIR sensor smoother (use raw snapshots)")
-    p.add_argument("--kv-cache", action="store_true",
-                   help="persistent KV-cache for the imagined policy rollouts "
-                        "(inference-only, numerically equivalent, faster)")
+    p.add_argument("--no-kv-cache", action="store_true",
+                   help="disable the persistent KV-cache for the imagined "
+                        "policy rollouts (enabled by default; inference-only, "
+                        "numerically equivalent, faster when on)")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the World Model training step "
                         "(fused fwd+bwd; one-time warm-up at first batch)")
@@ -598,7 +599,7 @@ def main() -> None:
             wm_epochs=args.wm_epochs,
             freeze_physics=args.freeze_physics, no_smooth=args.no_smooth,
             wm_target_loss=args.wm_target_loss,
-            use_kv_cache=args.kv_cache,
+            use_kv_cache=not args.no_kv_cache,
             compile_wm=args.compile)
     except KeyboardInterrupt:
         pygame.quit()
