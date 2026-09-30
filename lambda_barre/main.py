@@ -115,7 +115,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         device: str | None = None, bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_epochs: int = 512,
         freeze_physics: bool = False, no_smooth: bool = False,
-        wm_target_loss: float = 0.01) -> None:
+        wm_target_loss: float = 0.01,
+        use_kv_cache: bool = False,
+        compile_wm: bool = False) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
@@ -154,7 +156,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     touch = E.Touch(space, skel)
     intero = I.Intero()
     encoder = DenseEncoder()
-    brain = Brain(device=device)
+    brain = Brain(device=device, compile_wm=compile_wm)
     auto = False                 # brain drives the consignes when True
     if reset:
         for p in (_WM_CKPT, _POL_CKPT, _BUF_CKPT):
@@ -275,7 +277,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         dream_theater.clear()
                         brain.last_dream_record = None
                         dream_theater.is_paused = False
-                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps, wm_target_loss=wm_target_loss)
+                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps,
+                                                wm_target_loss=wm_target_loss,
+                                                use_kv_cache=use_kv_cache)
                         status = "sleeping..."
                     else:
                         status = "need a complete sequence to sleep"
@@ -578,6 +582,12 @@ def main() -> None:
                    help="freeze physics simulation (for debugging token recordings)")
     p.add_argument("--no-smooth", action="store_true",
                    help="bypass IIR sensor smoother (use raw snapshots)")
+    p.add_argument("--kv-cache", action="store_true",
+                   help="persistent KV-cache for the imagined policy rollouts "
+                        "(inference-only, numerically equivalent, faster)")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the World Model training step "
+                        "(fused fwd+bwd; one-time warm-up at first batch)")
     args = p.parse_args()
     if args.headless and not args.steps:
         p.error("--headless requires --steps")
@@ -587,7 +597,9 @@ def main() -> None:
             bootstrap_dataset=args.bootstrap_dataset, pol_steps=args.pol_steps,
             wm_epochs=args.wm_epochs,
             freeze_physics=args.freeze_physics, no_smooth=args.no_smooth,
-            wm_target_loss=args.wm_target_loss)
+            wm_target_loss=args.wm_target_loss,
+            use_kv_cache=args.kv_cache,
+            compile_wm=args.compile)
     except KeyboardInterrupt:
         pygame.quit()
 

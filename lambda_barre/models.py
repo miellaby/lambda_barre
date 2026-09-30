@@ -93,6 +93,7 @@ _ACTIVE_DEVICE, _ACTIVE_DESC = configure_hardware()
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .tokenize import (_COST_IDX, _REWARD_IDX, DENSE_DIM, N_SIGNAL, STATE_TOKENS, SALVE_TOKENS,
                        ACTION_TOKENS, TYPE_DIM, MOD_DIM, CANAL_DIM, N_POLICY_STATE,
@@ -104,17 +105,66 @@ LIMB_MIN = 10.0
 LIMB_MAX = 32.0
 THETA_RANGE = math.pi   # limb / tail theta consignes in [-pi, +pi]
 
+_SALVE_MASK_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
 
 def build_salve_mask(
     L: int,
     device
 ) -> torch.Tensor:
-    """Classical Transformer mask
-    """
-    return torch.triu(
+    """Classical (strictly causal) Transformer mask. Cached per (length,
+    device): it is queried on every training step and every rollout pass,
+    and the allocation is pure overhead. Read-only — never mutate."""
+    key = (L, str(device))
+    m = _SALVE_MASK_CACHE.get(key)
+    if m is None:
+        m = torch.triu(
             torch.ones(L, L, dtype=torch.bool, device=device),
             diagonal=1,
-        )    
+        )
+        _SALVE_MASK_CACHE[key] = m
+    return m
+
+
+class KVCache:
+    """Incremental key/value cache for the WorldModel's attention layers.
+
+    Stores, per layer, the K and V projections of every already-processed
+    token, plus the next absolute token index and the head prediction at the
+    last processed position. Because the input projections are position-wise
+    and the attention is strictly causal, cached entries are immutable: the
+    cached path is mathematically identical to a full recomputation, whatever
+    the (continuous) token values.
+
+    One cache belongs to one generation branch. Clone it where trajectories
+    diverge (candidate actions, imagination regimes); caches are short-lived
+    and hold ~1.5 KB per token per batch item (fp32, d_model 64, 3 layers).
+
+    INVARIANT: a cache is only valid while the WorldModel weights are frozen.
+    Any optimizer step on the WM invalidates every cache (K/V projections,
+    norms and head all move). Trainable code paths must build a fresh cache
+    after each WM update — never reuse one across gradient steps.
+    """
+
+    def __init__(self, n_layers: int, d_model: int, batch: int, device):
+        self.k = [torch.zeros(batch, 0, d_model, device=device)
+                  for _ in range(n_layers)]
+        self.v = [torch.zeros(batch, 0, d_model, device=device)
+                  for _ in range(n_layers)]
+        self.pos = 0
+        self.last_pred = None  # head output at the last processed position [B, 16]
+
+    def __len__(self) -> int:
+        return self.pos
+
+    def clone(self) -> "KVCache":
+        new = KVCache.__new__(KVCache)
+        new.k = [t.clone() for t in self.k]
+        new.v = [t.clone() for t in self.v]
+        new.pos = self.pos
+        new.last_pred = self.last_pred.clone() if self.last_pred is not None else None
+        return new
+
 
 # =============================================================================
 # World model
@@ -137,6 +187,8 @@ class WorldModel(nn.Module):
                  dim_ff: int = 384, dropout: float = 0.0):
         super().__init__()
         self.d_model = d_model
+        self.nhead = nhead
+        self.dropout_p = dropout
         self.in_proj = nn.Linear(DENSE_DIM, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_ff, dropout=dropout,
@@ -174,6 +226,7 @@ class WorldModel(nn.Module):
         # latent representation (layer index 1 for 3 layers) — the policy reads this.
         self._latent = None
         mid_layer = layers // 2
+        self._mid_layer = mid_layer
         self.transformer.layers[mid_layer].register_forward_hook(self._capture_latent)
 
     def _capture_latent(self, module, input, output):
@@ -217,11 +270,121 @@ class WorldModel(nn.Module):
             attn_mask = build_salve_mask(L, device)
         else:
             attn_mask = attn_mask.to(device)
-        h = self.transformer(h, mask=attn_mask)
+        # strictly causal by construction: the is_causal hint skips the
+        # per-call mask comparison (and its .item() graph break under
+        # torch.compile) inside nn.TransformerEncoder
+        h = self.transformer(h, mask=attn_mask, is_causal=True)
         # self.head produit les logits bruts, la sigmoid les transforme en [0,1]
         return self.head(h)                   # [B, L, 16]
 
-    @torch.no_grad()
+    # --- cached inference path ------------------------------------------------
+    # The cached path replicates the TransformerEncoder computation exactly
+    # (norm_first pre-norm, GELU FFN, per-head 1/sqrt(head_dim) scaling,
+    # dropout 0) but computes each layer's attention with explicit K/V
+    # storage, so already-processed tokens are never re-projected. It is
+    # inference-only and must not run with dropout active.
+
+    def _project_qkv(self, layer: nn.TransformerEncoderLayer,
+                     x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unpack the MultiheadAttention packed in_proj into q, k, v."""
+        w = layer.self_attn.in_proj_weight          # [3*d, d]
+        b = layer.self_attn.in_proj_bias            # [3*d]
+        d = self.d_model
+        q = F.linear(x, w[:d], b[:d])
+        k = F.linear(x, w[d:2 * d], b[d:2 * d])
+        v = F.linear(x, w[2 * d:], b[2 * d:])
+        return q, k, v
+
+    @torch.inference_mode()
+    def cache_forward(self, x: torch.Tensor, cache: KVCache) -> torch.Tensor:
+        """Process a block of tokens [B, T, 25] through the cached attention
+        path, extending ``cache`` in place. Returns the head predictions
+        [B, T, 16] for the block — identical to ``forward`` on the
+        concatenated stream (subject to float rounding).
+        """
+        if self.training and self.dropout_p > 0:
+            raise RuntimeError("cached inference path is only valid without dropout")
+        B, T, _ = x.shape
+        d = self.d_model
+        nh = self.nhead
+        hd = d // nh
+        device = x.device
+        h = self.in_proj(x)                                     # [B, T, d]
+        salve_pos = torch.arange(cache.pos, cache.pos + T, device=device) // SALVE_TOKENS
+        h = h + self._sinusoidal_pe(salve_pos).unsqueeze(0)
+        for i, layer in enumerate(self.transformer.layers):
+            xn = layer.norm1(h)                                  # [B, T, d]
+            q, k, v = self._project_qkv(layer, xn)               # [B, T, d] each
+            K = torch.cat([cache.k[i], k], dim=1)                # [B, P+T, d]
+            V = torch.cat([cache.v[i], v], dim=1)                # [B, P+T, d]
+            cache.k[i], cache.v[i] = K, V
+            qh = q.view(B, T, nh, hd).transpose(1, 2)           # [B, nh, T, hd]
+            Kh = K.view(B, -1, nh, hd).transpose(1, 2)          # [B, nh, P+T, hd]
+            Vh = V.view(B, -1, nh, hd).transpose(1, 2)
+            P = K.shape[1] - T
+            if T > 1:
+                # New token t attends to all P cached tokens and to new tokens <= t.
+                mask = torch.zeros(T, P + T, device=device)
+                mask[:, P:] = torch.full((T, T), float("-inf"), device=device).triu(diagonal=1)
+                out = F.scaled_dot_product_attention(qh, Kh, Vh, attn_mask=mask)
+            else:
+                out = F.scaled_dot_product_attention(qh, Kh, Vh)
+            out = out.transpose(1, 2).reshape(B, T, d)           # [B, T, d]
+            h = h + layer.self_attn.out_proj(out)
+            h = h + layer.linear2(F.gelu(layer.linear1(layer.norm2(h))))
+            if i == self._mid_layer:
+                self._latent = h                                # same capture as the forward hook
+        cache.pos += T
+        out = self.head(h)                                       # [B, T, 16]
+        cache.last_pred = out[:, -1, :]
+        return out
+
+    def _gen_tokens_cached(self, cache: KVCache, n_tokens: int,
+                           template: torch.Tensor, valid_mask: torch.Tensor,
+                           first_pred: torch.Tensor) -> torch.Tensor:
+        """Sequentially generate ``n_tokens`` tokens continuing a populated
+        cache: the head prediction at the last processed position yields
+        token 0, whose feedback yields token 1, and so on. The cache is
+        extended in place with every generated token."""
+        B = first_pred.shape[0]
+        device = first_pred.device
+        preds = []
+
+        def build(i: int, sig: torch.Tensor) -> torch.Tensor:
+            sig = sig.clamp(0.0, 1.0) * valid_mask[i].to(device)
+            tok = template[i].to(device).unsqueeze(0).expand(B, -1).clone()
+            tok[:, TYPE_DIM + MOD_DIM + CANAL_DIM:] = sig
+            return tok
+
+        preds.append(build(0, first_pred))
+        out = self.cache_forward(preds[0].unsqueeze(1), cache)   # [B, 1, 16]
+        for i in range(1, n_tokens):
+            preds.append(build(i, out[:, 0, :]))
+            out = self.cache_forward(preds[-1].unsqueeze(1), cache)
+        return torch.stack(preds, dim=1)                         # [B, n_tokens, 25]
+
+    @torch.inference_mode()
+    def predict_next_state_cached(self, cache: KVCache,
+                                  extra_tokens: torch.Tensor | None = None) -> torch.Tensor:
+        """Cached variant of ``predict_next_state``: continue a populated
+        ``cache``. If ``extra_tokens`` [B, T, 25] is given (typically the 3
+        action tokens), they are processed first. Returns [B, 13, 25]; the
+        cache then ends with the generated state tokens."""
+        if extra_tokens is not None:
+            self.cache_forward(extra_tokens, cache)
+        return self._gen_tokens_cached(cache, STATE_TOKENS, self.state_template,
+                                        self.state_valid_mask, cache.last_pred)
+
+    @torch.inference_mode()
+    def predict_next_action_cached(self, cache: KVCache) -> torch.Tensor:
+        """Cached variant of ``predict_next_action``: generate the 3 action
+        tokens continuing a populated cache that ends with state tokens.
+        Returns [B, 3, 25]; the cache then ends with the generated action
+        tokens."""
+        return self._gen_tokens_cached(cache, ACTION_TOKENS, self.action_template,
+                                       self.action_valid_mask, cache.last_pred)
+
+    @torch.inference_mode()
     def predict_next_state(self, ctx: torch.Tensor) -> torch.Tensor:
         """Autoregressive prediction of the next state's 13 tokens.
 
@@ -241,12 +404,12 @@ class WorldModel(nn.Module):
             curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
         return torch.stack(preds, dim=1)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_next(self, ctx: torch.Tensor) -> torch.Tensor:
         """Alias for ``predict_next_state`` for backwards compatibility."""
         return self.predict_next_state(ctx)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_next_action(self, ctx: torch.Tensor) -> torch.Tensor:
         """Autoregressive prediction of the 3 action tokens from a context
         ending in state tokens.
@@ -267,7 +430,7 @@ class WorldModel(nn.Module):
             curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
         return torch.stack(preds, dim=1)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_next_salve(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict both next state (13 tokens) and next action (3 tokens).
         Returns (state [B, 13, 25], action [B, 3, 25])."""

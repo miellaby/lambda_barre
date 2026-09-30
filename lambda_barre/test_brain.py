@@ -75,6 +75,101 @@ def test_world_model_forward_and_predict_shapes():
     assert a.shape == (3, T.ACTION_TOKENS, T.DENSE_DIM)
 
 
+def test_kv_cache_equivalence():
+    """The cached inference path must be numerically identical to a full
+    recomputation, block-wise and token-by-token (a silently broken cache
+    produces plausible-but-wrong predictions, so this is the guard)."""
+    import torch
+    from .models import KVCache
+
+    torch.manual_seed(7)
+    wm = WorldModel()
+    wm.eval()
+    B = 3
+
+    # block pass through the cache == forward() on the same tokens
+    L = T.SALVE_TOKENS + T.SALVE_TOKENS + T.STATE_TOKENS  # 45
+    x = torch.rand(B, L, T.DENSE_DIM)
+    ref = wm(x)
+    cache = KVCache(len(wm.transformer.layers), wm.d_model, B, x.device)
+    out = wm.cache_forward(x, cache)
+    assert torch.allclose(ref, out, atol=1e-5), (ref - out).abs().max().item()
+
+    # blocks split at arbitrary boundaries == single block
+    cache2 = KVCache(len(wm.transformer.layers), wm.d_model, B, x.device)
+    o1 = wm.cache_forward(x[:, :29, :], cache2)
+    o2 = wm.cache_forward(x[:, 29:, :], cache2)
+    assert torch.allclose(ref, torch.cat([o1, o2], dim=1), atol=1e-5)
+
+    def ref_predict(ctx, n_tokens, template, valid_mask):
+        """Original recompute loop: full forward per generated token."""
+        curr = ctx
+        preds = []
+        for i in range(n_tokens):
+            o = wm(curr)
+            sig = o[:, -1, :].clamp(0.0, 1.0) * valid_mask[i]
+            tok = template[i].unsqueeze(0).expand(B, -1).clone()
+            tok[:, 9:] = sig
+            preds.append(tok)
+            curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
+        return torch.stack(preds, dim=1)
+
+    ctx = torch.rand(B, T.SALVE_TOKENS, T.DENSE_DIM)
+
+    # cached state generation == recompute loop
+    got = wm.predict_next_state(ctx)
+    want = ref_predict(ctx, T.STATE_TOKENS, wm.state_template, wm.state_valid_mask)
+    assert torch.allclose(got, want, atol=1e-5), (got - want).abs().max().item()
+
+    # cached action generation == recompute loop
+    ctx_s = torch.cat([ctx, got], dim=1)
+    got_a = wm.predict_next_action(ctx_s)
+    want_a = ref_predict(ctx_s, T.ACTION_TOKENS, wm.action_template, wm.action_valid_mask)
+    assert torch.allclose(got_a, want_a, atol=1e-5), (got_a - want_a).abs().max().item()
+
+    # cached continuation with extra tokens == fresh-cache prediction on the
+    # concatenated context (this is the train_policy branch pattern)
+    act_toks = torch.rand(B, T.ACTION_TOKENS, T.DENSE_DIM)
+    cache3 = KVCache(len(wm.transformer.layers), wm.d_model, B, ctx.device)
+    wm.cache_forward(ctx, cache3)
+    got_c = wm.predict_next_state_cached(cache3, act_toks)
+    want_c = wm.predict_next_state(torch.cat([ctx, act_toks], dim=1))
+    assert torch.allclose(got_c, want_c, atol=1e-5), (got_c - want_c).abs().max().item()
+
+    # clones diverge without cross-talk, and the original is untouched
+    cache0 = KVCache(len(wm.transformer.layers), wm.d_model, B, ctx.device)
+    wm.cache_forward(ctx, cache0)
+    c_a, c_b = cache0.clone(), cache0.clone()
+    wm.predict_next_state_cached(c_a, torch.rand(B, T.ACTION_TOKENS, T.DENSE_DIM))
+    wm.predict_next_state_cached(c_b, torch.rand(B, T.ACTION_TOKENS, T.DENSE_DIM))
+    assert c_a.pos == c_b.pos == cache0.pos + T.ACTION_TOKENS + T.STATE_TOKENS
+    assert not torch.allclose(c_a.k[0], c_b.k[0])
+    assert cache0.pos == ctx.shape[1]
+
+
+def test_train_policy_kv_cache_option_equivalence():
+    """With use_kv_cache=True, train_policy's imagined rollouts must match
+    the full-recomputation path: same seed, same dream trajectory costs."""
+    import torch
+
+    def dream_costs(use_kv: bool):
+        torch.manual_seed(42)
+        b = Brain(seed=42)
+        for i in range(20):
+            salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+            b.record(salve)
+        list(b.train_policy(steps=1, batch=2, n_imagine=3, use_kv_cache=use_kv))
+        rec = b.last_dream_record
+        assert rec is not None
+        return [t.total_cost for t in rec.trajectories]
+
+    ref = dream_costs(False)
+    got = dream_costs(True)
+    assert len(ref) == len(got) == 12  # 4 candidates x 3 regimes
+    for r, g in zip(ref, got):
+        assert abs(r - g) < 1e-4, (r, g)
+
+
 def test_salve_cost_sign():
     # salve_cost sums the 6 innate signals (effort, douleur, courbature,
     # instabilite, vertige, confort). confort is signed (negative = reward);
