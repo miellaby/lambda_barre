@@ -399,15 +399,6 @@ class WorldModel(nn.Module):
                                         self.state_valid_mask, cache.last_pred)
 
     @torch.inference_mode()
-    def predict_next_action_cached(self, cache: KVCache) -> torch.Tensor:
-        """Cached variant of ``predict_next_action``: generate the 3 action
-        tokens continuing a populated cache that ends with state tokens.
-        Returns [B, 3, 25]; the cache then ends with the generated action
-        tokens."""
-        return self._gen_tokens_cached(cache, ACTION_TOKENS, self.action_template,
-                                       self.action_valid_mask, cache.last_pred)
-
-    @torch.inference_mode()
     def predict_next_state(self, ctx: torch.Tensor) -> torch.Tensor:
         """Autoregressive prediction of the next state's 13 tokens.
 

@@ -1405,7 +1405,7 @@ class Brain:
                            s4_toks, n_imagine, gamma, ctx_len, ctx_mask,
                            use_kv_cache, dream_cand_trajs,
                            candidate_idx) -> torch.Tensor:
-        """Evaluate one candidate action over the 3 imagined futures under
+        """Evaluate one candidate action over the 2 imagined futures under
         Bellman optimism, filling ``dream_cand_trajs[candidate_idx]`` with
         the per-regime trajectories. Returns the optimistic cost [B].
 
@@ -1477,39 +1477,7 @@ class Brain:
         f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
         dream_cand_trajs[candidate_idx][0] = {"steps": f1_steps, "cost": cost_kalman[0].item()}
 
-        # Future 2: World Model autoregressive continuation
-        cost_wm = c0.clone()
-        cur_cache = cand_cache.clone() if use_kv_cache else None
-        cur_ctx = None if use_kv_cache else ctx_s5
-        cur_hist = hist if use_kv_cache else None
-        cur_state_toks = s5_toks
-        cur_cost_val = c0_val
-        f2_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
-        for k in range(1, n_imagine):
-            with torch.inference_mode():
-                if use_kv_cache:
-                    next_a_toks = self.world.predict_next_action_cached(cur_cache)
-                    gen = self._gen_state_cached(cur_cache)
-                else:
-                    next_a_toks = self.world.predict_next_action(cur_ctx)
-                    cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
-                    gen = self.world.predict_next_state(cand_ctx)
-            gen_zeroed = gen.clone()
-            gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-            sc = self._salve_cost_batch(gen)
-            cost_wm = cost_wm + (gamma ** k) * sc
-            a_dec = self._decode_action_batch(next_a_toks)[0].tolist()
-            f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=a_dec, step_cost=cur_cost_val, label=f"s{4+k}"))
-            if use_kv_cache:
-                cur_hist = torch.cat([cur_hist, next_a_toks, gen_zeroed], dim=1)
-            else:
-                cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
-            cur_state_toks = gen[0].tolist()
-            cur_cost_val = sc[0].item()
-        f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
-        dream_cand_trajs[candidate_idx][1] = {"steps": f2_steps, "cost": cost_wm[0].item()}
-
-        # Future 3: Policy closed-loop reaction
+        # Future 2: Policy closed-loop reaction
         # Uses a sliding window of the last n_ctx transitions (77 tokens) with salve-within-type
         # attention mask, matching live wake_tick and avoiding out-of-distribution latents.
         cur_state = s5
@@ -1519,7 +1487,7 @@ class Brain:
         cur_hist = hist if use_kv_cache else None
         cur_state_toks = s5_toks
         cur_cost_val = c0_val
-        f3_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
+        f2_steps = [DreamStep(state_tokens=s4_toks, action=cand_a, label="s4+cand")]
         for k in range(1, n_imagine):
             with torch.inference_mode():
                 slide_src = cur_hist if use_kv_cache else cur_ctx
@@ -1540,7 +1508,7 @@ class Brain:
             gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
             sc = self._salve_cost_batch(gen)
             cost_pol = cost_pol + (gamma ** k) * sc
-            f3_steps.append(DreamStep(state_tokens=cur_state_toks, action=next_action[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
+            f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=next_action[0].tolist(), step_cost=cur_cost_val, label=f"s{4+k}"))
             if use_kv_cache:
                 cur_hist = torch.cat([cur_hist, next_a_toks, gen_zeroed], dim=1)
             else:
@@ -1548,11 +1516,11 @@ class Brain:
             cur_state = gen
             cur_state_toks = gen[0].tolist()
             cur_cost_val = sc[0].item()
-        f3_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
-        dream_cand_trajs[candidate_idx][2] = {"steps": f3_steps, "cost": cost_pol[0].item()}
+        f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{4+n_imagine}"))
+        dream_cand_trajs[candidate_idx][1] = {"steps": f2_steps, "cost": cost_pol[0].item()}
 
-        # Bellman optimism: optimistic minimum across the 3 futures
-        return torch.minimum(torch.minimum(cost_kalman, cost_wm), cost_pol)
+        # Bellman optimism: optimistic minimum across the 2 futures
+        return torch.minimum(cost_kalman, cost_pol)
 
     def train_policy(self, steps: int = 16, batch: int = 32,
                      gamma: float = 1.1, n_imagine: int = 6,
@@ -1567,7 +1535,7 @@ class Brain:
         (graduated relative forcing); the WM's lookahead mode generates the
         action associated with that outcome; a causal verification rollout
         accepts it only if it actually reduces the imagined cost. ~3
-        rollout-equivalents per batch instead of the legacy 12.
+        rollout-equivalents per batch instead of the legacy 6.
 
         ``eos_lookahead=False`` — legacy stochastic-candidate machinery,
         kept alive as a fallback. Also selected automatically when the
@@ -1892,10 +1860,10 @@ class Brain:
                                  prioritize_relief: bool = True,
                                  use_kv_cache: bool = True,
                                  step_offset: int = 0):
-        """Legacy stochastic-candidate machinery: 4 candidates (policy,
-        recorded demonstration, Gaussian noise sigma 0.15 / 0.30) x 3 imagined
-        regimes (Kalman inertia, WM autoregressive, policy closed-loop) under
-        Bellman optimism — 12 rollouts per sample. Kept alive as the fallback
+        """Legacy stochastic-candidate machinery: 3 candidates (policy,
+        recorded demonstration, Gaussian noise sigma 0.30) x 2 imagined
+        regimes (Kalman inertia, policy closed-loop) under
+        Bellman optimism — 6 rollouts per sample. Kept alive as the fallback
         of the EOS-lookahead supervision.
         Generator: yields (label, value) after each step."""
         n_ctx = _N_CTX  # real transitions used as context (s0..s3, a0..a3, s4)
@@ -1936,25 +1904,22 @@ class Brain:
 
             pol_in = torch.cat([cur_scalars, latent], dim=1)
 
-            # 3. generate 4 candidate actions:
+            # 3. generate 3 candidate actions:
             #    candidate 0 = deterministic action from current policy
             #    candidate 1 = recorded demonstrated action from dataset
-            #    candidates 2..3 = growing-sigma exploration around policy action
-            #                      (sigma1 = 0.15, sigma2 = 0.30)
+            #    candidate 2 = exploration noise around policy action (sigma = 0.30)
             with torch.inference_mode():
                 policy_action = self.policy(pol_in)
-                cand_noise1 = self._explore_action_batch(policy_action, sigma=0.15)
-                cand_noise2 = self._explore_action_batch(policy_action, sigma=0.30)
+                cand_noise = self._explore_action_batch(policy_action, sigma=0.30)
 
             candidates = torch.stack(
                 [
                     policy_action,
                     real_actions,
-                    cand_noise1,
-                    cand_noise2,
+                    cand_noise,
                 ],
                 dim=1,
-            )  # [B, 4, 5]
+            )  # [B, 3, 5]
 
             # Decode past actions a2 and a3 from the context for trajectory extrapolation:
             # salve 2 action is at tokens 45..47 (index 2 * 16 + 13)
@@ -1962,12 +1927,12 @@ class Brain:
             past_a2 = self._decode_action_batch(ctx[:, 45:48, :])
             past_a3 = self._decode_action_batch(ctx[:, 61:64, :])
 
-            # 4. evaluate every candidate with 3 futures under Bellman optimism
+            # 4. evaluate every candidate with 2 futures under Bellman optimism
             candidate_costs = []
-            dream_cand_trajs = [{} for _ in range(4)]
+            dream_cand_trajs = [{} for _ in range(3)]
             s4_toks = ctx[0, n_ctx * 16 : n_ctx * 16 + 13].tolist()
 
-            for candidate_idx in range(4):
+            for candidate_idx in range(3):
                 cand_cost = self._imagine_candidate(
                     ctx, base_cache, candidates[:, candidate_idx, :],
                     past_a2, past_a3, s4_toks, n_imagine, gamma,
@@ -1975,7 +1940,7 @@ class Brain:
                     dream_cand_trajs, candidate_idx)
                 candidate_costs.append(cand_cost)
 
-            # [B, 4]
+            # [B, 3]
             candidate_costs = torch.stack(candidate_costs, dim=1)
 
             # 5. Select the best action
@@ -2018,11 +1983,11 @@ class Brain:
                 all_trajs = []
                 best_futures_per_cand = []
                 win_cand = int(best_idx[0].item())
-                for c_idx in range(4):
-                    c_costs = [dream_cand_trajs[c_idx][f]["cost"] for f in range(3)]
+                for c_idx in range(3):
+                    c_costs = [dream_cand_trajs[c_idx][f]["cost"] for f in range(2)]
                     b_f_idx = int(torch.tensor(c_costs).argmin().item())
                     best_futures_per_cand.append(b_f_idx)
-                    for f_idx in range(3):
+                    for f_idx in range(2):
                         traj_info = dream_cand_trajs[c_idx][f_idx]
                         is_b = (f_idx == b_f_idx)
                         is_w = (c_idx == win_cand and is_b)
@@ -2042,7 +2007,7 @@ class Brain:
                     loss=loss.item(),
                     facing=1,
                     context_steps=context_steps,
-                    candidate_actions=[candidates[0, c].tolist() for c in range(4)],
+                    candidate_actions=[candidates[0, c].tolist() for c in range(3)],
                     trajectories=all_trajs,
                     best_candidate_idx=win_cand,
                     best_future_indices=best_futures_per_cand,

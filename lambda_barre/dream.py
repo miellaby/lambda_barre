@@ -4,7 +4,7 @@ Replaces the physics world during sleep with a storyboard of thumbnails (vignett
 - Context row: s0+a0, s1+a1, s2+a2, s3+a3, s4 (decision state)
 - Future rows: the imagined trajectories of each candidate action
   (hindsight supervision: policy baseline vs EOS-lookahead generation;
-  legacy fallback: 4 candidates × 3 future action regimes)
+  legacy fallback: 3 candidates × 2 future action regimes)
   Each row shows s4+a_candidate followed by imagined future steps (s5+a5, s6+a6, ...).
 """
 from __future__ import annotations
@@ -34,11 +34,10 @@ FONT_AA = False
 CAND_COLORS = [
     (90, 190, 255),   # Cand 0: Policy (Cyan)
     (255, 210, 70),   # Cand 1: Replay (Gold)
-    (110, 230, 140),  # Cand 2: Noise 15% (Lime)
-    (240, 120, 240),  # Cand 3: Noise 30% (Magenta)
+    (240, 120, 240),  # Cand 2: Noise 30% (Magenta)
 ]
 
-REGIME_NAMES = ["Kalman", "World Model", "Policy"]
+REGIME_NAMES = ["Kalman", "Policy"]
 
 
 @dataclass
@@ -51,9 +50,9 @@ class DreamStep:
 
 @dataclass
 class DreamTrajectory:
-    candidate_idx: int                # 0..3
-    regime_idx: int                   # 0..2 (Kalman, WM, Policy)
-    regime_name: str                  # "Kalman", "World Model", "Policy"
+    candidate_idx: int                # 0..2
+    regime_idx: int                   # 0..1 (Kalman, Policy)
+    regime_name: str                  # "Kalman", "Policy"
     steps: list[DreamStep] = field(default_factory=list)
     total_cost: float = 0.0
     is_best_future: bool = False
@@ -73,7 +72,7 @@ class DreamRecord:
     best_candidate_idx: int           # Selected candidate index (-1: none accepted)
     best_future_indices: list[int]    # Winning future index per candidate
     candidate_names: list[str] = field(default_factory=lambda: [
-        "0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 15%", "3: NOISE 30%"])
+        "0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 30%"])
     eos_forced: list[float] | None = None  # hindsight forcing target (delta fatigue, delta souffrance), normalized [0, 1]
     lived_steps: list[DreamStep] | None = None        # full lived sequence s0..s10 with actions and per-salve costs
     predicted_steps: list[DreamStep] | None = None     # real s0..s3 + hindsight a4 + imagined s5..s10
@@ -318,10 +317,10 @@ class DreamTheater:
         self.follow = True   # auto-select the newest step as it arrives
         self.scroll_y = 0
         self.target_scroll_y = 0
-        self.tab_idx = 0  # 0: All 12 rows, 1: Cand 0, 2: Cand 1, 3: Cand 2, 4: Cand 3
+        self.tab_idx = 0  # 0: All 6 rows, 1: Cand 0, 2: Cand 1, 3: Cand 2
         self.is_paused = False
         self.step_once = False
-        self.tab_names = ["All (12 Rows)", "0: Policy", "1: Replay", "2: Noise 15%", "3: Noise 30%"]
+        self.tab_names = ["All (6 Rows)", "0: Policy", "1: Replay", "2: Noise 30%"]
         self._btn_rects: dict[str, pygame.Rect] = {}
 
         # Geometry
@@ -536,7 +535,7 @@ class DreamTheater:
 
     def _draw_legacy(self, screen: pygame.Surface, rec: DreamRecord,
                      font: pygame.font.Font, font_small: pygame.font.Font) -> None:
-        """Legacy stochastic-candidate storyboard: 4 candidates x 3 imagined
+        """Legacy stochastic-candidate storyboard: 3 candidates x 2 imagined
         regimes, tab-filterable, scrollable."""
         # Smooth scroll lerp
         self.scroll_y += (self.target_scroll_y - self.scroll_y) * 0.3

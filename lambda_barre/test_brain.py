@@ -167,7 +167,7 @@ def test_train_policy_kv_cache_option_equivalence():
 
     ref = dream_costs(False)
     got = dream_costs(True)
-    assert len(ref) == len(got) == 12  # 4 candidates x 3 regimes
+    assert len(ref) == len(got) == 6  # 3 candidates x 2 regimes
     for r, g in zip(ref, got):
         assert abs(r - g) < 1e-4, (r, g)
 
@@ -375,7 +375,7 @@ def test_dream_theater_hindsight_view_and_browsing():
 def test_policy_lookahead_fallback_on_systematic_rejection():
     """When every hindsight generation is rejected, train_policy falls back to
     the legacy stochastic candidates after _LOOKAHEAD_FALLBACK_STREAK
-    batches: the dream record switches to the 4 x 3 structure."""
+    batches: the dream record switches to the 3 x 2 structure."""
     import lambda_barre.brain as brain_mod
 
     b = Brain(seed=42)
@@ -390,8 +390,8 @@ def test_policy_lookahead_fallback_on_systematic_rejection():
         brain_mod._EXPLORE_MARGIN_PCT = orig
     assert len(out) == 7
     rec = b.last_dream_record
-    assert len(rec.trajectories) == 12     # legacy machinery took over
-    assert len(rec.candidate_actions) == 4
+    assert len(rec.trajectories) == 6      # legacy machinery took over
+    assert len(rec.candidate_actions) == 3
 
 
 def test_wm_lookahead_training_pass_in_sleep():
@@ -786,7 +786,7 @@ def test_reset_restores_limb_distances():
     assert skel.limb_r.theta_star == skel.spawn_theta_r
 
 
-def test_three_futures_bellman_optimism():
+def test_two_futures_bellman_optimism():
     import torch
     b = Brain(seed=42)
     # 1. Test decode_action_batch roundtrip
@@ -795,12 +795,11 @@ def test_three_futures_bellman_optimism():
     decoded = b._decode_action_batch(toks)
     assert torch.allclose(action_in, decoded, atol=1e-5)
 
-    # 2. Test Bellman optimism logic: min across 3 futures
+    # 2. Test Bellman optimism logic: min across 2 futures
     c_kalman = torch.tensor([12.0, 30.0, 15.0])
-    c_wm = torch.tensor([25.0, 10.0, 20.0])
     c_pol = torch.tensor([50.0, 45.0, 8.0])  # clumsy policy has high cost on 0 and 1
-    c_optimistic = torch.minimum(torch.minimum(c_kalman, c_wm), c_pol)
-    assert c_optimistic.tolist() == [12.0, 10.0, 8.0]
+    c_optimistic = torch.minimum(c_kalman, c_pol)
+    assert c_optimistic.tolist() == [12.0, 30.0, 8.0]
 
     # 3. Test train_policy execution with 3-future evaluation
     for i in range(20):
@@ -828,8 +827,8 @@ def test_dream_record_and_dream_theater_rendering():
     rec = b.last_dream_record
     assert isinstance(rec, DreamRecord)
     assert len(rec.context_steps) == 5  # s0..s3 with actions, s4 decision state
-    assert len(rec.candidate_actions) == 4
-    assert len(rec.trajectories) == 12  # 4 cands × 3 regimes
+    assert len(rec.candidate_actions) == 3
+    assert len(rec.trajectories) == 6  # 3 cands × 2 regimes
     for traj in rec.trajectories:
         assert len(traj.steps) == 1 + 4  # s4+cand + 4 imagined steps
 
@@ -861,7 +860,7 @@ def test_dream_record_and_dream_theater_rendering():
     theater.draw(surf, font, font_small, status="sleeping...")
 
     # Test filter by candidate tabs
-    for tab in range(5):
+    for tab in range(4):
         theater.tab_idx = tab
         theater.draw(surf, font, font_small)
 
@@ -1421,7 +1420,7 @@ if __name__ == "__main__":
     test_train_policy_candidate_selection()
     test_sleep_preserves_wake_history_context()
     test_reset_restores_limb_distances()
-    test_three_futures_bellman_optimism()
+    test_two_futures_bellman_optimism()
     test_dream_record_and_dream_theater_rendering()
     test_wm_theater_rollout_and_rendering()
     test_lookahead_mask_structure()
