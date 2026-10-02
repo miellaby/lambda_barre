@@ -4,7 +4,9 @@ Ce document répertorie les chantiers et orientations de conception actés pour 
 
 ---
 
-## 1. Supervision téléologique de la politique : le WM en mode « EOS-lookahead »
+## 1. Supervision efficiente de la politique : le WM en mode « EOS-lookahead »
+
+> **Statut : implémenté** (2026-10-01, voir `session_2026_10_01.md`). Détail d'implémentation par rapport à la spécification : la ligne du token EOS du masque lookahead est restreinte au contexte de décision (et à elle-même) — sans cette restriction, la clé EOS laissait fuiter l'action enregistrée vers la requête de décision en couche ≥ 2, et la génération compacte n'était pas exactement équivalente à l'entraînement.
 
 ### Rationale & Philosophie
 

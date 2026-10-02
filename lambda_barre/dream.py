@@ -2,7 +2,9 @@
 
 Replaces the physics world during sleep with a storyboard of thumbnails (vignettes):
 - Context row: s0+a0, s1+a1, s2+a2, s3+a3, s4 (decision state)
-- Future rows: 12 imagined trajectories (4 candidate actions × 3 future action regimes)
+- Future rows: the imagined trajectories of each candidate action
+  (hindsight supervision: policy baseline vs EOS-lookahead generation;
+  legacy fallback: 4 candidates × 3 future action regimes)
   Each row shows s4+a_candidate followed by imagined future steps (s5+a5, s6+a6, ...).
 """
 from __future__ import annotations
@@ -56,6 +58,7 @@ class DreamTrajectory:
     total_cost: float = 0.0
     is_best_future: bool = False
     is_winner: bool = False
+    eos_pred: list[float] | None = None  # imagined terminal EOS (delta fatigue, delta souffrance), normalized [0, 1]
 
 
 @dataclass
@@ -65,10 +68,16 @@ class DreamRecord:
     loss: float                       # Policy loss
     facing: int                       # Skeleton facing (+1 or -1)
     context_steps: list[DreamStep]    # [s0+a0, s1+a1, s2+a2, s3+a3, s4]
-    candidate_actions: list[list[float]] # 4 candidate actions [4, 5]
-    trajectories: list[DreamTrajectory] # 12 trajectories (4 candidates × 3 regimes)
-    best_candidate_idx: int           # Selected candidate index (0..3)
+    candidate_actions: list[list[float]] # candidate actions [n_candidates, 5]
+    trajectories: list[DreamTrajectory] # n_candidates * n_regimes trajectories
+    best_candidate_idx: int           # Selected candidate index (-1: none accepted)
     best_future_indices: list[int]    # Winning future index per candidate
+    candidate_names: list[str] = field(default_factory=lambda: [
+        "0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 15%", "3: NOISE 30%"])
+    eos_forced: list[float] | None = None  # hindsight forcing target (delta fatigue, delta souffrance), normalized [0, 1]
+    lived_steps: list[DreamStep] | None = None        # full lived sequence s0..s10 with actions and per-salve costs
+    predicted_steps: list[DreamStep] | None = None     # real s0..s3 + hindsight a4 + imagined s5..s10
+    eos_realized: list[float] | None = None           # realized EOS of the lived sequence, normalized [0, 1]
 
 
 def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
@@ -283,18 +292,37 @@ def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
 
 
 class DreamTheater:
-    """Manages the visual Sleep mode interface in Pygame."""
+    """Manages the visual Sleep mode interface in Pygame.
+
+    Hindsight (EOS-lookahead) policy steps are recorded in a per-cycle history
+    and shown one at a time, storyboard style:
+      - LIVED SEQUENCE: the full s0..s10 window as experienced (ground truth),
+      - WM COMPLETION: real s0..s3, the hindsight-generated a4 on s4, and the
+        imagined s5..s10 it causes (completion toward the forced EOS),
+      - DECISION: side by side, what the policy infers on s4 vs what the WM
+        recommends (cost, imagined EOS, accepted/rejected).
+    A step browser (< PREV / NEXT > / LIVE, or arrow keys) navigates the
+    history of the current sleep cycle; LIVE keeps following the newest step.
+
+    Legacy fallback records (stochastic candidates) keep the original
+    candidate x regime storyboard with tab filtering and scrolling."""
+
+    MAX_HISTORY = 128
 
     def __init__(self, width: int = 960, height: int = 600):
         self.width = width
         self.height = height
         self.record: DreamRecord | None = None
+        self.history: list[DreamRecord] = []
+        self.hist_idx = 0
+        self.follow = True   # auto-select the newest step as it arrives
         self.scroll_y = 0
         self.target_scroll_y = 0
         self.tab_idx = 0  # 0: All 12 rows, 1: Cand 0, 2: Cand 1, 3: Cand 2, 4: Cand 3
         self.is_paused = False
         self.step_once = False
         self.tab_names = ["All (12 Rows)", "0: Policy", "1: Replay", "2: Noise 15%", "3: Noise 30%"]
+        self._btn_rects: dict[str, pygame.Rect] = {}
 
         # Geometry
         self.header_h = 56
@@ -303,13 +331,40 @@ class DreamTheater:
         self.thumb_gap = 6
         self.row_h = 76
         self.row_gap = 6
+        self.seq_thumb_w = 64      # small thumbnails for full-sequence rows
+        self.seq_thumb_h = 48
+        self.seq_thumb_gap = 4
 
     def update(self, record: DreamRecord) -> None:
         self.record = record
+        if self.history and self.history[-1] is record:
+            return                      # re-displaying the same step (dream viewer)
+        self.history.append(record)
+        if len(self.history) > self.MAX_HISTORY:
+            del self.history[0]
+        if self.follow:
+            self.hist_idx = len(self.history) - 1
+        else:
+            self.hist_idx = min(self.hist_idx, len(self.history) - 1)
+        if record.lived_steps is not None:
+            self.tab_names = ["All"] + list(record.candidate_names)
+        else:
+            self.tab_names = ["All (12 Rows)", "0: Policy", "1: Replay", "2: Noise 15%", "3: Noise 30%"]
+
+    def _browse(self, delta: int) -> None:
+        """Move the history selector by ``delta`` steps; landing on the newest
+        step re-enables live following."""
+        if not self.history:
+            return
+        self.hist_idx = max(0, min(len(self.history) - 1, self.hist_idx + delta))
+        self.follow = (self.hist_idx == len(self.history) - 1)
 
     def clear(self) -> None:
         """Reset displayed storyboard to prepare for a new sleep cycle."""
         self.record = None
+        self.history.clear()
+        self.hist_idx = 0
+        self.follow = True
         self.scroll_y = 0
         self.target_scroll_y = 0
         self.tab_idx = 0
@@ -321,7 +376,8 @@ class DreamTheater:
         return self.is_paused
 
     def handle_event(self, ev: pygame.event.Event) -> bool:
-        """Handle mouse wheel, keys, and tab selection. Returns True if handled."""
+        """Handle mouse wheel, keys, browser buttons, and tab selection.
+        Returns True if handled."""
         if ev.type == pygame.MOUSEWHEEL:
             self.target_scroll_y = min(0, self.target_scroll_y + ev.y * 40)
             return True
@@ -332,12 +388,11 @@ class DreamTheater:
             elif ev.key == pygame.K_n and self.is_paused:
                 self.step_once = True
                 return True
-            elif ev.key in (pygame.K_TAB, pygame.K_RIGHT):
-                self.tab_idx = (self.tab_idx + 1) % len(self.tab_names)
-                self.target_scroll_y = 0
+            elif ev.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                self._browse(-1 if ev.key == pygame.K_LEFT else 1)
                 return True
-            elif ev.key == pygame.K_LEFT:
-                self.tab_idx = (self.tab_idx - 1) % len(self.tab_names)
+            elif ev.key == pygame.K_TAB:
+                self.tab_idx = (self.tab_idx + 1) % len(self.tab_names)
                 self.target_scroll_y = 0
                 return True
             elif ev.key in (pygame.K_0, pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
@@ -353,8 +408,19 @@ class DreamTheater:
                 self.target_scroll_y -= 60
                 return True
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            # Check tab clicks
             mx, my = ev.pos
+            # Step browser buttons first
+            for key, rect in self._btn_rects.items():
+                if rect.collidepoint(ev.pos):
+                    if key == "prev":
+                        self._browse(-1)
+                    elif key == "next":
+                        self._browse(1)
+                    elif key == "live" and self.history:
+                        self.hist_idx = len(self.history) - 1
+                        self.follow = True
+                    return True
+            # Tab clicks (legacy candidate filtering)
             if 26 <= my <= 52:
                 tx = 16
                 for i, name in enumerate(self.tab_names):
@@ -369,86 +435,111 @@ class DreamTheater:
     def draw(self, screen: pygame.Surface, font: pygame.font.Font,
              font_small: pygame.font.Font, status: str = "",
              brain=None) -> None:
-        """Render the complete Dream Theater storyboard."""
+        """Render the complete Dream Theater storyboard: the browser-selected
+        policy step of the current sleep cycle, or the World Model training
+        screen while no policy step is available yet."""
         screen.fill(DREAM_BG)
 
-        if self.record is None:
-            # World Model training screen (no "Phase 1")
-            pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h))
-            pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
-            title_str = "World Model Training"
-            s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
-            screen.blit(s_title, (16, 16))
-
-            cw, ch = 560, 236
-            cx = (self.width - cw) // 2
-            cy = (self.height - ch) // 2
-            card_rect = pygame.Rect(cx, cy, cw, ch)
-            pygame.draw.rect(screen, CARD_BG, card_rect, border_radius=8)
-            pygame.draw.rect(screen, CARD_BORDER, card_rect, 1, border_radius=8)
-
-            msg = status if status else "World Model optimization in progress..."
-            txt = font.render(msg, FONT_AA, TEXT_WHITE)
-            screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 14))
-
-            import re
-            m = re.search(r"(\d+)/(\d+)", msg)
-            if m:
-                step, total = int(m.group(1)), int(m.group(2))
-                pct = min(1.0, max(0.0, step / max(1, total)))
-                pb_w, pb_h = cw - 60, 6
-                pb_x = cx + 30
-                pb_y = cy + 36
-                pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=3)
-                pygame.draw.rect(screen, (70, 140, 230), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=3)
-
-            # Replicate console print lines in the GUI
-            print_lines: list[tuple[str, tuple[int, int, int]]] = []
-            if brain is not None:
-                cycle = getattr(brain, "sleep_cycle_stats", {})
-                c_before = cycle.get("coreset_before", getattr(brain.buffer, "coreset_size", 0))
-                n_wake = cycle.get("wake", 0)
-                n_prune = cycle.get("pruned", 0)
-                add_raw = cycle.get("addendum_initial", n_wake + n_prune)
-                d_intra = cycle.get("dedup_intra", 0)
-                d_cross = cycle.get("dedup_coreset", 0)
-                n_refresh = cycle.get("refreshed", 0)
-                f_dropped = cycle.get("filter_dropped", None)
-                c_after = cycle.get("coreset_after", None)
-
-                c_after_str = str(c_after) if c_after is not None else f"{brain.buffer.coreset_size} (in progress)"
-                f_drop_str = f"-{f_dropped}" if f_dropped is not None else "-- (in progress)"
-
-                print_lines.append((f"  - Coreset before sleep           : {c_before}", TEXT_WHITE))
-                print_lines.append((f"  - New experiences                : +{n_wake}", TEXT_ACCENT))
-                print_lines.append((f"  - Memories revisited (forgetting): +{n_prune}", TEXT_ACCENT))
-                print_lines.append((f"  - Raw addendum                   : {add_raw}", TEXT_WHITE))
-                print_lines.append((f"  - Intra-addendum duplicates      : -{d_intra}", TEXT_MUTED))
-                print_lines.append((f"  - Addendum/coreset duplicates    : -{d_cross} ({n_refresh} refreshed)", TEXT_MUTED))
-                print_lines.append((f"  - Familiar sequences dropped     : {f_drop_str}", TEXT_MUTED))
-                print_lines.append((f"  - Coreset after sleep            : {c_after_str}", WINNER_BORDER if c_after is not None else TEXT_WHITE))
-            else:
-                print_lines.append(("  - Waiting for sleep cycle to start...", TEXT_MUTED))
-
-            for idx, (s_line, s_col) in enumerate(print_lines):
-                s_rend = font_small.render(s_line, FONT_AA, s_col)
-                screen.blit(s_rend, (cx + 36, cy + 52 + idx * 21))
+        if not self.history:
+            self._draw_wm_training(screen, font, font_small, status, brain)
             return
 
-        rec = self.record
-
-        # Smooth scroll lerp
-        self.scroll_y += (self.target_scroll_y - self.scroll_y) * 0.3
+        rec = self.history[self.hist_idx]
 
         # 1. Top Header Bar
         pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h))
         pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
 
-        # Title and status
+        # Title, status and loss
         pause_txt = " [PAUSED - [n] for next step]" if self.is_paused else " [Running — Space to pause]"
         title_str = f"DREAM THEATER  |  Step {rec.step_idx + 1}/{rec.total_steps}  |  Loss: {rec.loss:.4f}{pause_txt}"
         s_title = font.render(title_str, FONT_AA, WINNER_BORDER if self.is_paused else TEXT_WHITE)
         screen.blit(s_title, (16, 6))
+
+        # Hindsight forcing target of the selected step (EOS-lookahead policy training)
+        if rec.eos_forced is not None:
+            dfat = 2.0 * rec.eos_forced[0] - 1.0
+            dsuf = 2.0 * rec.eos_forced[1] - 1.0
+            eos_txt = f"Hindsight EOS forced: dfat {dfat:+.2f} dsuffering {dsuf:+.2f}"
+            s_eos = font_small.render(eos_txt, FONT_AA, TEXT_ACCENT)
+            screen.blit(s_eos, (16 + s_title.get_width() + 24, 9))
+
+        if rec.lived_steps is not None:
+            self._draw_hindsight(screen, rec, font, font_small)
+        else:
+            self._draw_legacy(screen, rec, font, font_small)
+
+    def _draw_wm_training(self, screen: pygame.Surface, font: pygame.font.Font,
+                          font_small: pygame.font.Font, status: str,
+                          brain) -> None:
+        """Sleep screen shown before the first policy step of the cycle."""
+        # World Model training screen (no "Phase 1")
+        pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h))
+        pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
+        title_str = "World Model Training"
+        s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
+        screen.blit(s_title, (16, 16))
+
+        cw, ch = 560, 236
+        cx = (self.width - cw) // 2
+        cy = (self.height - ch) // 2
+        card_rect = pygame.Rect(cx, cy, cw, ch)
+        pygame.draw.rect(screen, CARD_BG, card_rect, border_radius=8)
+        pygame.draw.rect(screen, CARD_BORDER, card_rect, 1, border_radius=8)
+
+        msg = status if status else "World Model optimization in progress..."
+        txt = font.render(msg, FONT_AA, TEXT_WHITE)
+        screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 14))
+
+        import re
+        m = re.search(r"(\d+)/(\d+)", msg)
+        if m:
+            step, total = int(m.group(1)), int(m.group(2))
+            pct = min(1.0, max(0.0, step / max(1, total)))
+            pb_w, pb_h = cw - 60, 6
+            pb_x = cx + 30
+            pb_y = cy + 36
+            pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=3)
+            pygame.draw.rect(screen, (70, 140, 230), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=3)
+
+        # Replicate console print lines in the GUI
+        print_lines: list[tuple[str, tuple[int, int, int]]] = []
+        if brain is not None:
+            cycle = getattr(brain, "sleep_cycle_stats", {})
+            c_before = cycle.get("coreset_before", getattr(brain.buffer, "coreset_size", 0))
+            n_wake = cycle.get("wake", 0)
+            n_prune = cycle.get("pruned", 0)
+            add_raw = cycle.get("addendum_initial", n_wake + n_prune)
+            d_intra = cycle.get("dedup_intra", 0)
+            d_cross = cycle.get("dedup_coreset", 0)
+            n_refresh = cycle.get("refreshed", 0)
+            f_dropped = cycle.get("filter_dropped", None)
+            c_after = cycle.get("coreset_after", None)
+
+            c_after_str = str(c_after) if c_after is not None else f"{brain.buffer.coreset_size} (in progress)"
+            f_drop_str = f"-{f_dropped}" if f_dropped is not None else "-- (in progress)"
+
+            print_lines.append((f"  - Coreset before sleep           : {c_before}", TEXT_WHITE))
+            print_lines.append((f"  - New experiences                : +{n_wake}", TEXT_ACCENT))
+            print_lines.append((f"  - Memories revisited (forgetting): +{n_prune}", TEXT_ACCENT))
+            print_lines.append((f"  - Raw addendum                   : {add_raw}", TEXT_WHITE))
+            print_lines.append((f"  - Intra-addendum duplicates      : -{d_intra}", TEXT_MUTED))
+            print_lines.append((f"  - Addendum/coreset duplicates    : -{d_cross} ({n_refresh} refreshed)", TEXT_MUTED))
+            print_lines.append((f"  - Familiar sequences dropped     : {f_drop_str}", TEXT_MUTED))
+            print_lines.append((f"  - Coreset after sleep            : {c_after_str}", WINNER_BORDER if c_after is not None else TEXT_WHITE))
+        else:
+            print_lines.append(("  - Waiting for sleep cycle to start...", TEXT_MUTED))
+
+        for idx, (s_line, s_col) in enumerate(print_lines):
+            s_rend = font_small.render(s_line, FONT_AA, s_col)
+            screen.blit(s_rend, (cx + 36, cy + 52 + idx * 21))
+
+    def _draw_legacy(self, screen: pygame.Surface, rec: DreamRecord,
+                     font: pygame.font.Font, font_small: pygame.font.Font) -> None:
+        """Legacy stochastic-candidate storyboard: 4 candidates x 3 imagined
+        regimes, tab-filterable, scrollable."""
+        # Smooth scroll lerp
+        self.scroll_y += (self.target_scroll_y - self.scroll_y) * 0.3
 
         # Tabs
         tx = 16
@@ -460,13 +551,13 @@ class DreamTheater:
             tab_border = WINNER_BORDER if is_active else CARD_BORDER
             pygame.draw.rect(screen, tab_bg, rect_tab, border_radius=3)
             pygame.draw.rect(screen, tab_border, rect_tab, 1, border_radius=3)
-            c_name = CAND_COLORS[i - 1] if i > 0 else TEXT_WHITE
+            c_name = CAND_COLORS[(i - 1) % len(CAND_COLORS)] if i > 0 else TEXT_WHITE
             s_tab = font_small.render(name, FONT_AA, c_name if is_active else TEXT_MUTED)
             screen.blit(s_tab, (tx + (tw - s_tab.get_width()) // 2, 31))
             tx += tw + 8
 
         # Help hint on top-right
-        hint_txt = "Tab / 0-4: Filter | Wheel: Scroll | [n]: Next step | Space: Resume" if self.is_paused else "Tab / 0-4: Filter | Wheel: Scroll | Space: Pause"
+        hint_txt = "Tab / 0-4: Filter | Arrows: Steps | Wheel: Scroll | [n]: Next step | Space: Resume" if self.is_paused else "Tab / 0-4: Filter | Arrows: Steps | Wheel: Scroll | Space: Pause"
         hint = font_small.render(hint_txt, FONT_AA, TEXT_MUTED)
         screen.blit(hint, (self.width - hint.get_width() - 16, 31))
 
@@ -509,9 +600,8 @@ class DreamTheater:
             # Candidate group header
             if c_idx != last_cand:
                 last_cand = c_idx
-                cand_names = ["0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 15%", "3: NOISE 30%"]
                 is_win_cand = (c_idx == rec.best_candidate_idx)
-                header_text = f"CANDIDATE {cand_names[c_idx]}"
+                header_text = f"CANDIDATE {rec.candidate_names[c_idx]}"
                 if is_win_cand:
                     header_text += "  ★ WINNER (SELECTED FOR LEARNING)"
                 s_grp = font.render(header_text, FONT_AA, WINNER_BORDER if is_win_cand else cand_color)
@@ -540,6 +630,13 @@ class DreamTheater:
             if is_win:
                 s_win = font_small.render("🏆 WINNER", FONT_AA, WINNER_BORDER)
                 screen.blit(s_win, (20, content_y + 48))
+            elif traj.eos_pred is not None:
+                # Imagined terminal outcome of this rollout (physical deltas)
+                dfat = 2.0 * traj.eos_pred[0] - 1.0
+                dsuf = 2.0 * traj.eos_pred[1] - 1.0
+                s_eos = font_small.render(f"EOS dfat {dfat:+.2f} dsuf {dsuf:+.2f}",
+                                          FONT_AA, TEXT_MUTED)
+                screen.blit(s_eos, (20, content_y + 48))
             elif is_best:
                 s_best = font_small.render("★ Best Regime", FONT_AA, BEST_BORDER)
                 screen.blit(s_best, (20, content_y + 48))
@@ -559,3 +656,128 @@ class DreamTheater:
         # Min scroll clamping
         min_scroll = min(0, self.height - content_y - 20)
         self.target_scroll_y = max(min_scroll, min(0, self.target_scroll_y))
+
+    # --- hindsight (EOS-lookahead) storyboard ---------------------------------
+    def _draw_hindsight(self, screen: pygame.Surface, rec: DreamRecord,
+                        font: pygame.font.Font, font_small: pygame.font.Font) -> None:
+        """Storyboard of one hindsight policy step: the lived sequence, the WM
+        completion toward the forced EOS, and the policy-vs-WM decision."""
+        # the full-sequence rows fit on screen: no scrolling in this view
+        self.scroll_y = self.target_scroll_y = 0
+        self._draw_browser(screen, rec, font_small)
+
+        y = self.header_h + 10
+
+        # --- LIVED SEQUENCE row: the ground truth s0 -> s10 ---
+        label = "LIVED SEQUENCE (s0-s10)"
+        if rec.eos_realized is not None:
+            label += f"  EOS dfat {2.0 * rec.eos_realized[0] - 1.0:+.2f} dsuf {2.0 * rec.eos_realized[1] - 1.0:+.2f}"
+        y = self._draw_seq_row(screen, rec, rec.lived_steps, label, y, font_small,
+                               TEXT_WHITE, (200, 200, 210))
+
+        # --- WM COMPLETION row: hindsight-generated a4 + imagined s5 -> s10 ---
+        label = "WM COMPLETION (hindsight EOS)"
+        traj_gen = rec.trajectories[1]
+        if traj_gen.eos_pred is not None:
+            label += f"  EOS dfat {2.0 * traj_gen.eos_pred[0] - 1.0:+.2f} dsuf {2.0 * traj_gen.eos_pred[1] - 1.0:+.2f}"
+        y = self._draw_seq_row(screen, rec, rec.predicted_steps, label, y, font_small,
+                               TEXT_ACCENT, CAND_COLORS[1])
+
+        # --- DECISION row: what the policy infers vs what the WM recommends ---
+        y = self._draw_decision_row(screen, rec, font, font_small, y)
+
+    def _draw_browser(self, screen: pygame.Surface, rec: DreamRecord,
+                      font_small: pygame.font.Font) -> None:
+        """Step browser bar: < PREV / NEXT > / LIVE plus the step indicator —
+        the selector for browsing what happened during policy training."""
+        n = len(self.history)
+        specs = [
+            ("prev", "< PREV", self.hist_idx > 0),
+            ("next", "NEXT >", self.hist_idx < n - 1),
+            ("live", "LIVE", self.follow),
+        ]
+        x = 16
+        for key, txt, enabled in specs:
+            rect = pygame.Rect(x, 28, 84, 22)
+            bg = (50, 56, 75) if enabled else (26, 30, 40)
+            border = WINNER_BORDER if enabled else CARD_BORDER
+            pygame.draw.rect(screen, bg, rect, border_radius=3)
+            pygame.draw.rect(screen, border, rect, 1, border_radius=3)
+            s = font_small.render(txt, FONT_AA, TEXT_WHITE if enabled else TEXT_MUTED)
+            screen.blit(s, (x + (84 - s.get_width()) // 2, 31))
+            self._btn_rects[key] = rect
+            x += 84 + 8
+        s_idx = font_small.render(f"step {self.hist_idx + 1}/{n}", FONT_AA, TEXT_WHITE)
+        screen.blit(s_idx, (x + 4, 31))
+
+        # Acceptance of the selected step (hindsight supervision metric)
+        acc = f"accepted: {'yes' if traj_accepted(rec) else 'no'}"
+        s_acc = font_small.render(acc, FONT_AA,
+                                  BEST_BORDER if traj_accepted(rec) else TEXT_MUTED)
+        screen.blit(s_acc, (x + 4 + s_idx.get_width() + 24, 31))
+
+        # Help hint on top-right
+        hint_txt = "Arrows: Browse steps | [n]: Next step | Space: Resume" if self.is_paused \
+            else "Arrows: Browse steps | Space: Pause"
+        hint = font_small.render(hint_txt, FONT_AA, TEXT_MUTED)
+        screen.blit(hint, (self.width - hint.get_width() - 16, 31))
+
+    def _draw_seq_row(self, screen: pygame.Surface, rec: DreamRecord,
+                      steps: list[DreamStep], label: str, y: int,
+                      font_small: pygame.font.Font,
+                      label_color, action_color) -> int:
+        """One full-sequence row: label line, then small thumbnails wrapped
+        below it. Returns the y below the row."""
+        s_lbl = font_small.render(label, FONT_AA, label_color)
+        screen.blit(s_lbl, (16, y))
+        yy = y + 16
+        x0 = 16
+        avail = max(self.seq_thumb_w, self.width - 24 - x0)
+        step_w = self.seq_thumb_w + self.seq_thumb_gap
+        x = x0
+        for st in steps:
+            if x + self.seq_thumb_w > x0 + avail:
+                x = x0
+                yy += self.seq_thumb_h + self.seq_thumb_gap
+            rect = pygame.Rect(x, yy, self.seq_thumb_w, self.seq_thumb_h)
+            draw_thumbnail(screen, rect, st, font_small, facing=rec.facing,
+                           cand_color=action_color)
+            x += step_w
+        return yy + self.seq_thumb_h + 10
+
+    def _draw_decision_row(self, screen: pygame.Surface, rec: DreamRecord,
+                           font: pygame.font.Font, font_small: pygame.font.Font,
+                           y: int) -> int:
+        """Side-by-side decision on s4: what the policy infers vs what the WM
+        recommends, with cost, imagined EOS and acceptance."""
+        s_lbl = font_small.render("DECISION (POLICY vs WM HINDSIGHT)", FONT_AA, TEXT_ACCENT)
+        screen.blit(s_lbl, (16, y))
+        y += 16
+        s4 = rec.context_steps[-1]
+        names = ["POLICY", "WM HINDSIGHT"]
+        x = 16
+        for c_idx in range(2):
+            traj = rec.trajectories[c_idx]
+            step = DreamStep(state_tokens=s4.state_tokens,
+                             action=rec.candidate_actions[c_idx])
+            rect = pygame.Rect(x, y, self.thumb_w, self.thumb_h)
+            draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
+                           cand_color=CAND_COLORS[c_idx], is_winner=traj.is_winner)
+            ax = x + self.thumb_w + 10
+            lines = [names[c_idx], f"Cost {traj.total_cost:.2f}"]
+            if traj.eos_pred is not None:
+                lines.append(f"EOS dfat {2.0 * traj.eos_pred[0] - 1.0:+.2f}"
+                             f" dsuf {2.0 * traj.eos_pred[1] - 1.0:+.2f}")
+            if c_idx == 1:
+                lines.append("ACCEPTED" if traj.is_winner else "REJECTED")
+            col = WINNER_BORDER if traj.is_winner else CAND_COLORS[c_idx]
+            for i, txt in enumerate(lines):
+                s = font_small.render(txt, FONT_AA, col if i == 0 else TEXT_MUTED)
+                screen.blit(s, (ax, y + 4 + i * 16))
+            x = ax + 150
+        return y + self.thumb_h + 12
+
+
+def traj_accepted(rec: DreamRecord) -> bool:
+    """Whether the WM's hindsight action was accepted for learning in this step."""
+    return bool(rec.trajectories) and rec.trajectories[-1].is_winner

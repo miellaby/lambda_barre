@@ -117,6 +117,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         freeze_physics: bool = False, no_smooth: bool = False,
         wm_target_loss: float = 0.01,
         use_kv_cache: bool = True,
+        pol_eos_lookahead: bool = True,
         compile_wm: bool = False) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -279,7 +280,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         dream_theater.is_paused = False
                         sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps,
                                                 wm_target_loss=wm_target_loss,
-                                                use_kv_cache=use_kv_cache)
+                                                use_kv_cache=use_kv_cache,
+                                                pol_eos_lookahead=pol_eos_lookahead)
                         status = "sleeping..."
                     else:
                         status = "need a complete sequence to sleep"
@@ -367,7 +369,12 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 elif label == "filter":
                     status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
                 elif label == "pol":
-                    status = f"sleeping: pol {value:.2f}"
+                    pol_stats = getattr(brain, "last_pol_stats", None)
+                    if pol_stats is not None:
+                        status = (f"sleeping: pol {value:.2f} "
+                                  f"(hindsight {pol_stats['accepted']}/{pol_stats['total']} accepted)")
+                    else:
+                        status = f"sleeping: pol {value:.2f}"
                     if brain.last_dream_record is not None:
                         dream_theater.update(brain.last_dream_record)
                 elif label == "done":
@@ -586,6 +593,10 @@ def main() -> None:
                    help="disable the persistent KV-cache for the imagined "
                         "policy rollouts (enabled by default; inference-only, "
                         "numerically equivalent, faster when on)")
+    p.add_argument("--no-eos-lookahead", action="store_true",
+                   help="disable the EOS-lookahead (hindsight) policy "
+                        "supervision and fall back to the legacy stochastic "
+                        "candidates (enabled by default)")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the World Model training step "
                         "(fused fwd+bwd; one-time warm-up at first batch)")
@@ -600,6 +611,7 @@ def main() -> None:
             freeze_physics=args.freeze_physics, no_smooth=args.no_smooth,
             wm_target_loss=args.wm_target_loss,
             use_kv_cache=not args.no_kv_cache,
+            pol_eos_lookahead=not args.no_eos_lookahead,
             compile_wm=args.compile)
     except KeyboardInterrupt:
         pygame.quit()

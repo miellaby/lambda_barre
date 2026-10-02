@@ -258,22 +258,45 @@ class WorldModel(nn.Module):
         return pe
 
     def forward(self, x: torch.Tensor,
-                attn_mask: torch.Tensor = None) -> torch.Tensor:
+                attn_mask: torch.Tensor = None,
+                is_causal: bool | None = None,
+                salve_positions: torch.Tensor = None) -> torch.Tensor:
         """x: [B, L, 25] float tokens. Returns predicted signal slots
-        [B, L, 16] (each position predicts the next token's 16 signals)."""
+        [B, L, 16] (each position predicts the next token's 16 signals).
+
+        ``attn_mask`` defaults to the strictly causal salve mask. ``is_causal``
+        is only a fast-path hint for ``nn.TransformerEncoder`` (it skips the
+        per-call mask comparison): inferred from the mask when None, so a
+        non-causal mask (e.g. the EOS-lookahead mask) never takes the causal
+        fast path silently.
+
+        ``salve_positions`` ([L] long, salve indices) overrides the default
+        ``arange(L) // SALVE_TOKENS`` positional encoding. The encoding only
+        keys on the salve index, so a token can sit anywhere in the input and
+        still "be" at its temporal slot — used by hindsight generation to
+        append the terminal EOS token at salve ``SEQ_STEPS`` position of an
+        otherwise short context."""
         B, L, _ = x.shape
         device = x.device
         h = self.in_proj(x)                              # [B, L, d_model]
-        salve_pos = torch.arange(L, device=device) // SALVE_TOKENS
+        if salve_positions is None:
+            salve_pos = torch.arange(L, device=device) // SALVE_TOKENS
+        else:
+            salve_pos = salve_positions.to(device)
         h = h + self._sinusoidal_pe(salve_pos).unsqueeze(0)
         if attn_mask is None:
             attn_mask = build_salve_mask(L, device)
+            causal = True
         else:
             attn_mask = attn_mask.to(device)
+            if is_causal is None:
+                causal = bool(torch.equal(attn_mask, build_salve_mask(L, device)))
+            else:
+                causal = bool(is_causal)
         # strictly causal by construction: the is_causal hint skips the
         # per-call mask comparison (and its .item() graph break under
         # torch.compile) inside nn.TransformerEncoder
-        h = self.transformer(h, mask=attn_mask, is_causal=True)
+        h = self.transformer(h, mask=attn_mask, is_causal=causal)
         # self.head produit les logits bruts, la sigmoid les transforme en [0,1]
         return self.head(h)                   # [B, L, 16]
 

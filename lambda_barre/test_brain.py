@@ -148,8 +148,9 @@ def test_kv_cache_equivalence():
 
 
 def test_train_policy_kv_cache_option_equivalence():
-    """With use_kv_cache=True, train_policy's imagined rollouts must match
-    the full-recomputation path: same seed, same dream trajectory costs."""
+    """With use_kv_cache=True, the legacy candidate machinery's imagined
+    rollouts must match the full-recomputation path: same seed, same dream
+    trajectory costs."""
     import torch
 
     def dream_costs(use_kv: bool):
@@ -158,7 +159,8 @@ def test_train_policy_kv_cache_option_equivalence():
         for i in range(20):
             salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
             b.record(salve)
-        list(b.train_policy(steps=1, batch=2, n_imagine=3, use_kv_cache=use_kv))
+        list(b.train_policy(steps=1, batch=2, n_imagine=3, use_kv_cache=use_kv,
+                            eos_lookahead=False))
         rec = b.last_dream_record
         assert rec is not None
         return [t.total_cost for t in rec.trajectories]
@@ -168,6 +170,250 @@ def test_train_policy_kv_cache_option_equivalence():
     assert len(ref) == len(got) == 12  # 4 candidates x 3 regimes
     for r, g in zip(ref, got):
         assert abs(r - g) < 1e-4, (r, g)
+
+
+def test_lookahead_mask_structure():
+    """The EOS-lookahead training mask is the causal mask plus two deviations:
+    the decision query (position 76) attends the terminal EOS token (172),
+    and the EOS token itself attends only the decision context (0..76) and
+    itself — never the intervening trajectory (which would let the recorded
+    a4 leak into the decision and break compact-generation equivalence)."""
+    import torch
+    from . import brain as brain_mod
+    from .models import build_salve_mask
+
+    m = brain_mod._MASK_LOOKAHEAD
+    dp, ep = brain_mod._DECISION_POS, brain_mod._EOS_POS
+    assert not bool(m[dp, ep])                       # decision query sees the EOS
+    assert bool(m[dp, ep - 1])                       # ...but nothing else beyond causal
+    assert not bool(m[ep, dp])                       # EOS sees the decision context
+    assert not bool(m[ep, ep])                       # ...and itself
+    assert bool(m[ep, dp + 1]) and bool(m[ep, ep - 1])  # ...but not the trajectory in between
+    # every other row stays strictly causal
+    ref = build_salve_mask(brain_mod._SEQ_LEN, torch.device("cpu"))
+    ref = ref.clone()
+    ref[dp, ep] = False
+    ref[ep, dp + 1: ep] = True
+    assert torch.equal(m, ref)
+
+
+def test_lookahead_generation_matches_training_mask():
+    """The compact [context, EOS] generation input must reproduce exactly the
+    decision-query prediction of the full 173-token sequence under the
+    training lookahead mask: positions 77..171 are never attended by the
+    decision query, so the two computations share the same attended keys."""
+    import torch
+    from . import brain as brain_mod
+
+    torch.manual_seed(3)
+    b = Brain(seed=3)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    sequences = b.buffer.sample(2)
+    vals = b._batch_tensors(sequences)                       # [B, 173, 25]
+    ctx = vals[:, :brain_mod._DECISION_POS + 1, :].clone()   # [B, 77, 25]
+    eos_tok = vals[:, brain_mod._EOS_POS, :].clone()         # realized EOS token
+
+    b.world.eval()
+    with torch.inference_mode():
+        out_full = b.world(vals, attn_mask=b.mask_lookahead, is_causal=False)
+        ref = out_full[:, brain_mod._DECISION_POS, :]
+
+        x = torch.cat([ctx, eos_tok.unsqueeze(1)], dim=1)   # [B, 78, 25]
+        salve_pos = torch.arange(x.shape[1]) // 16
+        salve_pos[-1] = brain_mod.SEQ_STEPS
+        gen_mask = brain_mod.build_lookahead_gen_mask(ctx.shape[1], b.device)
+        out_gen = b.world(x, attn_mask=gen_mask, is_causal=False,
+                          salve_positions=salve_pos)
+        got = out_gen[:, brain_mod._DECISION_POS, :]
+
+    assert torch.allclose(ref, got, atol=1e-5), (ref - got).abs().max().item()
+
+
+def test_lookahead_generation_is_eos_conditioned():
+    """The decision-query prediction must depend on the forced EOS (the
+    conditioning signal, measured on the raw head logits — the [0,1] signal
+    clamp may flatten it on an untrained WM), and the generated action
+    tokens must be structurally valid (prefixes intact, signals in range,
+    consignes in their physical ranges)."""
+    import torch
+    from . import brain as brain_mod
+    from .models import KVCache
+
+    torch.manual_seed(5)
+    b = Brain(seed=5)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    sequences = b.buffer.sample(2)
+    vals = b._batch_tensors(sequences)
+    ctx = vals[:, :brain_mod._DECISION_POS + 1, :].clone()   # [B, 77, 25]
+
+    b.world.eval()
+    B = ctx.shape[0]
+    with torch.inference_mode():
+        base_cache = KVCache(len(b.world.transformer.layers), b.world.d_model,
+                             B, b.device)
+        b.world.cache_forward(ctx, base_cache)
+
+        def decision_logits(eos_vals):
+            eos_tok = b._build_eos_token(eos_vals).unsqueeze(1)
+            x = torch.cat([ctx, eos_tok], dim=1)
+            salve_pos = torch.arange(x.shape[1]) // 16
+            salve_pos[-1] = brain_mod.SEQ_STEPS
+            gen_mask = brain_mod.build_lookahead_gen_mask(ctx.shape[1], b.device)
+            out = b.world(x, attn_mask=gen_mask, is_causal=False,
+                          salve_positions=salve_pos)
+            return out[:, brain_mod._DECISION_POS, :]
+
+        logits_good = decision_logits(torch.full((B, 2), 0.2))
+        logits_bad = decision_logits(torch.full((B, 2), 0.9))
+        assert (logits_good - logits_bad).abs().max().item() > 1e-3
+
+        toks_good = b._lookahead_generate(ctx, base_cache, torch.full((B, 2), 0.2), True)
+        act_good = b._decode_action_batch(toks_good)
+
+    assert toks_good.shape == (B, 3, 25)
+    # structural prefixes are identical to the WM action template
+    tmpl = b.world.action_template.to(b.device)[:, :9].unsqueeze(0)
+    assert torch.allclose(toks_good[:, :, :9], tmpl.expand(B, -1, -1))
+    # valid signal slots in [0, 1], padded slots strictly zero
+    assert (toks_good[:, :, 9:] >= 0).all() and (toks_good[:, :, 9:] <= 1).all()
+    # signed consignes in [-1, 1], unsigned in [0, 1]
+    for col in (0, 2, 4):
+        assert (act_good[:, col] >= -1.0).all() and (act_good[:, col] <= 1.0).all()
+    for col in (1, 3):
+        assert (act_good[:, col] >= 0.0).all() and (act_good[:, col] <= 1.0).all()
+
+
+def test_policy_eos_lookahead_step_and_kv_equivalence():
+    """One hindsight policy step: baseline + verification rollouts in the
+    Dream record, acceptance stats exposed, and numerical equivalence
+    between the cached and full-recomputation paths."""
+    import torch
+
+    def run_case(use_kv: bool):
+        torch.manual_seed(7)
+        b = Brain(seed=7)
+        for i in range(20):
+            salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+            b.record(salve)
+        out = list(b.train_policy(steps=1, batch=2, n_imagine=6, use_kv_cache=use_kv))
+        rec = b.last_dream_record
+        assert rec is not None
+        return rec, b.last_pol_stats, out
+
+    rec_ref, st_ref, out_ref = run_case(False)
+    rec_got, st_got, out_got = run_case(True)
+    for r, g in zip(rec_ref.trajectories, rec_got.trajectories):
+        assert abs(r.total_cost - g.total_cost) < 1e-4, (r.total_cost, g.total_cost)
+    for a, b_ in zip(rec_ref.candidate_actions, rec_got.candidate_actions):
+        assert len(a) == len(b_) == 5
+    assert rec_got.eos_forced is not None and len(rec_got.eos_forced) == 2
+    for st in (st_ref, st_got):
+        assert st["total"] == 2 and 0 <= st["accepted"] <= 2
+    # dream record structure: 2 candidates x 1 regime, rollouts reach s10
+    assert rec_got.candidate_names == ["0: POLICY", "1: HINDSIGHT"]
+    assert len(rec_got.trajectories) == 2
+    for traj in rec_got.trajectories:
+        assert len(traj.steps) == 1 + 6          # s4+cand + 6 imagined steps
+        assert traj.eos_pred is not None and len(traj.eos_pred) == 2
+        assert traj.regime_name == "Policy"
+    assert out_got[0][0] == "pol"
+
+
+def test_dream_theater_hindsight_view_and_browsing():
+    """Hindsight policy steps carry the full lived sequence and the WM
+    completion; the Dream Theater browses them with prev/next and follows the
+    newest step while live."""
+    import pygame
+    from lambda_barre.dream import DreamTheater
+    pygame.init()
+
+    b = Brain(seed=42)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    theater = DreamTheater(960, 600)
+    for _ in range(3):
+        list(b.train_policy(steps=1, batch=2, n_imagine=6))
+        theater.update(b.last_dream_record)
+
+    rec = b.last_dream_record
+    assert rec.lived_steps is not None and len(rec.lived_steps) == 11      # s0..s10
+    assert rec.predicted_steps is not None and len(rec.predicted_steps) == 11
+    assert rec.eos_realized is not None and len(rec.eos_realized) == 2
+    assert len(theater.history) == 3
+    assert theater.hist_idx == 2 and theater.follow
+
+    # browse back: live following disengages; landing on newest re-engages it
+    assert theater.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LEFT))
+    assert theater.hist_idx == 1 and not theater.follow
+    assert theater.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RIGHT))
+    assert theater.hist_idx == 2 and theater.follow
+    theater.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LEFT))
+    assert theater.hist_idx == 1 and not theater.follow
+
+    # rendering every browsed step (hindsight storyboard), selector unmoved
+    surf = pygame.Surface((960, 600))
+    font = pygame.font.SysFont("monospace", 16)
+    font_small = pygame.font.SysFont("monospace", 10)
+    for idx in range(3):
+        theater.hist_idx = idx
+        theater.draw(surf, font, font_small)
+        assert theater.hist_idx == idx
+
+    # browser buttons: NEXT returns to the newest step and re-enables LIVE
+    rect_next = theater._btn_rects["next"]
+    ev_next = pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1,
+                                 pos=rect_next.center)
+    assert theater.handle_event(ev_next)
+    assert theater.hist_idx == 2 and theater.follow
+
+
+def test_policy_lookahead_fallback_on_systematic_rejection():
+    """When every hindsight generation is rejected, train_policy falls back to
+    the legacy stochastic candidates after _LOOKAHEAD_FALLBACK_STREAK
+    batches: the dream record switches to the 4 x 3 structure."""
+    import lambda_barre.brain as brain_mod
+
+    b = Brain(seed=42)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    orig = brain_mod._EXPLORE_MARGIN_PCT
+    brain_mod._EXPLORE_MARGIN_PCT = 1e9   # impossible margin: all rejected
+    try:
+        out = list(b.train_policy(steps=7, batch=2, n_imagine=6))
+    finally:
+        brain_mod._EXPLORE_MARGIN_PCT = orig
+    assert len(out) == 7
+    rec = b.last_dream_record
+    assert len(rec.trajectories) == 12     # legacy machinery took over
+    assert len(rec.candidate_actions) == 4
+
+
+def test_wm_lookahead_training_pass_in_sleep():
+    """The WM trains with alternated causal / EOS-lookahead passes during
+    sleep; the lookahead loss is tracked separately and stays finite."""
+    import math
+    import torch
+
+    torch.manual_seed(11)
+    b = Brain(seed=11)
+    for i in range(20):
+        salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
+        b.record(salve)
+    seqs = b.buffer.sample(4)
+    loss_causal = b._train_wm_batch(seqs, lookahead=False)
+    loss_look = b._train_wm_batch(seqs, lookahead=True)
+    assert math.isfinite(loss_causal) and loss_causal >= 0.0
+    assert math.isfinite(loss_look) and loss_look >= 0.0
+
+    stats = _run_sleep(b, wm_epochs=8, wm_batch=16, pol_steps=1, pol_batch=4)
+    assert stats is not None
+    assert math.isfinite(stats["wm_lookahead_loss"])   # epochs 4 and 8 are lookahead passes
 
 
 def test_salve_cost_sign():
@@ -200,8 +446,13 @@ def test_sleep_trains_both_models_and_world_loss_decreases():
         salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
         b.record(salve)
     assert len(b.buffer) >= 1  # at least one complete 10-step sequence
-    s1 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12, clear_buffer=False)
-    s2 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12)
+    # wm_target_loss=None: quota-only — the data is i.i.d. random, its
+    # irreducible loss floor (~0.08) can never reach the 0.01 target and the
+    # overtime loop would never terminate.
+    s1 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12,
+                    clear_buffer=False, wm_target_loss=None)
+    s2 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12,
+                    wm_target_loss=None)
     # losses are finite
     for k in ("wm_loss", "pol_loss"):
         assert s2[k] == s2[k], f"{k} is NaN"   # NaN check
@@ -274,7 +525,10 @@ def test_brain_drives_real_sim_and_sleeps():
             skel.tail_act.theta_star = tq_phys
             B.apply_consignes(skel)
     assert len(brain.buffer) >= 1  # at least one complete sequence from 4s sim
-    stats = _run_sleep(brain, wm_epochs=2, wm_batch=24, pol_steps=4, pol_batch=12)
+    # wm_target_loss=None: quota-only — real-sim data rarely reaches the 0.01
+    # target within a test's time budget, and the overtime loop has no cap.
+    stats = _run_sleep(brain, wm_epochs=2, wm_batch=24, pol_steps=4, pol_batch=12,
+                       wm_target_loss=None)
     for k in ("wm_loss", "pol_loss"):
         assert stats[k] == stats[k]   # finite
     a = brain.act(salve)
@@ -493,8 +747,9 @@ def test_sleep_preserves_wake_history_context():
     assert wake_len_before > 0
     assert b._cached_latent is not None
 
-    # Run sleep
-    _run_sleep(b, wm_epochs=1, wm_batch=8, pol_steps=1, pol_batch=4)
+    # Run sleep (quota-only: the 0.01 target is not the point of this test)
+    _run_sleep(b, wm_epochs=1, wm_batch=8, pol_steps=1, pol_batch=4,
+               wm_target_loss=None)
 
     # Wake history and cached latent must be preserved across sleep
     assert len(b._wake_history) == wake_len_before
@@ -1169,6 +1424,13 @@ if __name__ == "__main__":
     test_three_futures_bellman_optimism()
     test_dream_record_and_dream_theater_rendering()
     test_wm_theater_rollout_and_rendering()
+    test_lookahead_mask_structure()
+    test_lookahead_generation_matches_training_mask()
+    test_lookahead_generation_is_eos_conditioned()
+    test_policy_eos_lookahead_step_and_kv_equivalence()
+    test_policy_lookahead_fallback_on_systematic_rejection()
+    test_wm_lookahead_training_pass_in_sleep()
+    test_dream_theater_hindsight_view_and_browsing()
     print("all brain tests passed")
 
 
