@@ -152,7 +152,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     B.apply_consignes(skel)
     proprio = S.Proprio(space, skel)
     reward = S.Reward(skel)
-    cursor = E.Cursor(skel)
+    ball_sensor = E.Ball(skel)
     vision = E.Vision(skel, space)
     touch = E.Touch(space, skel)
     intero = I.Intero()
@@ -205,9 +205,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     touch_signals = touch.update(skel, 1.0 / 60.0)
     reward_signals = reward.update(skel, signals, touch_signals, 1.0 / 60.0)
     intero_signals = intero.update(reward_signals, 1.0 / 60.0)
-    cursor_signals = cursor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
+    ball_signals = ball_sensor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
     vision_signals = vision.update(skel, 1.0 / 60.0)
-    smoother.reinit(signals, touch_signals, cursor_signals, vision_signals, intero_signals, reward_signals)
+    smoother.reinit(signals, touch_signals, ball_signals, vision_signals, intero_signals, reward_signals)
 
     n = 0
     running = True
@@ -239,7 +239,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     controls = UI.Controls(skel)
                     proprio.reset()
                     reward.reset()
-                    cursor.reset()
+                    ball_sensor.reset()
                     vision.reset()
                     touch.reset()
                     intero.reset()
@@ -248,7 +248,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     ts_r = touch.update(skel, 1.0 / 60.0)
                     rs_r = reward.update(skel, sig_r, ts_r, 1.0 / 60.0)
                     isg_r = intero.update(rs_r, 1.0 / 60.0)
-                    cs_r = cursor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
+                    cs_r = ball_sensor.update(skel, getattr(space, "ball", (400, 300)), 1.0 / 60.0)
                     vs_r = vision.update(skel, 1.0 / 60.0)
                     smoother.reinit(sig_r, ts_r, cs_r, vs_r, isg_r, rs_r)
                     brain.clear_history()
@@ -295,7 +295,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     speed_idx = 2
                     status = "speed 1.00x"
                 else:
-                    cursor.on_key(ev.scancode)
+                    ball_sensor.on_key(ev.scancode)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 controls.on_down(*ev.pos)
                 wpos = R.s2w(*ev.pos)
@@ -309,7 +309,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         drag_ball_prev_pos = (ball.position.x, ball.position.y)
                         drag_ball_vel = (0.0, 0.0)
                         ball.velocity = (0.0, 0.0)
-                cursor.on_click()
+                ball_sensor.on_click()
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3:
                 wpos = R.s2w(*ev.pos)
                 hit = _platform_hit(space, wpos)
@@ -414,7 +414,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
             rs = reward.update(skel, sig, ts, 1.0 / 60.0)
             isg = intero.update(rs, 1.0 / 60.0)
             ball_target = getattr(space, "ball", None)
-            cs = cursor.update(skel, ball_target if ball_target is not None else (400, 300), 1.0 / 60.0)
+            cs = ball_sensor.update(skel, ball_target if ball_target is not None else (400, 300), 1.0 / 60.0)
             vs = vision.update(skel, 1.0 / 60.0)
 
             # detect instantaneous facing direction flip (frame of reference change)
@@ -432,8 +432,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         salves.pop(0)
                     brain.record(salve)
                     wm_view = _wm_view_step(brain, salve)
+                    brain.wake_tick(salve)
                     if auto:
-                        brain.wake_tick(salve)
                         # 4. Immediately re-evaluate policy in the new reference frame
                         theta_front, d_front, theta_back, d_back, tail_t = brain.act(salve)
                         facing = skel.facing
@@ -453,7 +453,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                             skel.limb_r.theta_star = -theta_back_phys
                             skel.limb_r.d_star = d_back_phys
                         skel.tail_act.theta_star = tail_t_phys
-                        B.apply_consignes(skel)
+                        # re-anchor in the new frame without snapping the
+                        # effective values: keep the motor smoothing alive
+                        B.apply_consignes(skel, 1.0 / 180.0)
                     wm_accum = 0.0
                     pol_accum = 0.0
             else:
@@ -472,15 +474,16 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     # even with the brain offline, we record the salve for the next sleep cycle
                     brain.record(salve)
                     wm_view = _wm_view_step(brain, salve)
-                    if auto:  # produces fresh latent for policy when brain online
-                        brain.wake_tick(salve)
+                    # perceptual pass: always refresh the latent, brain on or
+                    # off, so the policy's observation is never stale
+                    brain.wake_tick(salve)
 
                 # policy tick at 6 Hz (every 10 physics frames, POL_DT = 1/6 s)
                 pol_accum += 1.0 / 60.0
                 if pol_accum >= POL_DT:
                     pol_accum -= POL_DT
-                    theta_front, d_front, theta_back, d_back, tail_t = brain.act(smoother.salve(skel))
                     if auto:
+                        theta_front, d_front, theta_back, d_back, tail_t = brain.act(smoother.salve(skel))
                         # put the consignes back into the skeleton for the next physics step
                         facing = skel.facing
                         theta_front_phys = theta_front * THETA_RANGE
@@ -513,7 +516,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 sim_accum = speed
             while sim_accum >= 1.0:
                 sim_accum -= 1.0
-                signals, touch_signals, reward_signals, intero_signals, cursor_signals, vision_signals = sim_step()
+                signals, touch_signals, reward_signals, intero_signals, ball_signals, vision_signals = sim_step()
                 n += 1
                 if steps and n >= steps:
                     running = False
@@ -534,10 +537,10 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                 h_proprio = R.draw_proprio(screen, font, signals, mouse)
                 h_touch = R.draw_touch(screen, font, touch_signals, mouse)
                 h_flux = R.draw_flux(screen, font, vision_signals, mouse)
-                h_cursor = R.draw_cursor(screen, font, cursor_signals, mouse)
+                h_ball = R.draw_ball(screen, font, ball_signals, mouse)
                 h_reward = R.draw_reward(screen, font, reward_signals,
                                          intero_signals, mouse)
-                hover_text = (h_proprio or h_touch or h_flux or h_cursor
+                hover_text = (h_proprio or h_touch or h_flux or h_ball
                              or h_reward)
                 if hover_text:
                     s = font.render(hover_text, False, R.PROPRIO_LABEL_C)

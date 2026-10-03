@@ -90,8 +90,9 @@ def make_space() -> pymunk.Space:
 
 
 def step(space: pymunk.Space, skel: "B.Skeleton", dt: float) -> None:
-    """Advance the world by dt, applying the current consignes first."""
-    B.apply_consignes(skel)
+    """Advance the world by dt, applying the current consignes first (with
+    motor smoothing: the effective values converge toward the consignes)."""
+    B.apply_consignes(skel, dt)
     space.step(dt)
     if hasattr(space, "ball") and space.ball is not None:
         ball = space.ball

@@ -1,17 +1,18 @@
 """Exteroception: perception of the external environment.
 
-See exteroception.md for the full spec. This module implements the cursor
-modality (position, velocity, click/keyboard sound), the vision modality (4×4
-retina cone + optical flow), and the touch modality (contact forces).
+See exteroception.md for the full spec. This module implements the ball
+modality (red balloon position, radial/angular velocity, click/keyboard
+sound), the vision modality (4×4 retina cone + optical flow), and the touch
+modality (contact forces).
 
 The facing sign is an internal mirror variable — never perceived. "In front
 of the head" = always positive, regardless of which way the animat faces.
 
 Usage:
-    cursor = extero.Cursor(skel)
-    cursor.on_click()                         # on MOUSEBUTTONDOWN (main button)
-    cursor.on_key(ev.scancode)               # on KEYDOWN, pass ev.scancode
-    cursor_signals = cursor.update(skel, mouse_screen, frame_dt)
+    ball_sensor = extero.Ball(skel)
+    ball_sensor.on_click()                    # on MOUSEBUTTONDOWN (main button)
+    ball_sensor.on_key(ev.scancode)           # on KEYDOWN, pass ev.scancode
+    ball_signals = ball_sensor.update(skel, space.ball, frame_dt)
 
     vision = extero.Vision(skel, space)
     vision_signals = vision.update(skel, frame_dt)
@@ -31,37 +32,42 @@ from . import body as B
 from . import render as R
 
 
-class Cursor:
-    """Mouse cursor position, velocity, and sound in the head's egocentric
-    frame.
+class Ball:
+    """Red balloon (mobile): position, velocity, and sound in the head's
+    egocentric frame.
 
-    Cadenced at 30 Hz: the main loop runs at 60 Hz, but the cursor is sampled
+    Cadenced at 30 Hz: the main loop runs at 60 Hz, but the ball is sampled
     every other frame. Between samples, the last values are returned.
 
-    The mouse position from pygame is in screen coordinates (y-down). It is
-    converted to world coordinates (y-up) before computing egocentric values.
+    The target is a pymunk body (the red balloon) or a world coordinate
+    tuple. Velocities are *relative to the head* (head motion included) and
+    egocentered by the facing sign: moving the animat toward a still ball
+    produces a negative radial velocity.
 
     Sound: 5 frequency cells, each driven by an IIR low-pass filter. On a
     click or keypress, the cells matching the event's frequency mask are
     incremented (cps += 1). At each sample, cps decays exponentially
-    (half-life = 1 s). The perceived intensity is ``cps * curseur_prox``,
-    normalised to [0, 1]. The sound source is the cursor position — both
-    clicks and keyboard keys emit from the cursor.
+    (half-life = 1 s). The perceived intensity is ``cps * ball_prox``,
+    normalised to [0, 1]. The sound source is the ball position — both
+    clicks and keyboard keys emit from the ball.
 
     Mouse click activates cell 0 only (bit 0 = 1).
     Keyboard keys activate cells based on the key index encoded in binary
     on 5 bits (1-31). Space = bit 0, Return = all bits (31).
 
     Signals produced:
-        curseur_dir: facing * atan2(dy, dx) — angle égocentré (devant = 0)
-        curseur_prox: max_r / (max_r + r) — proximité (proche = 1, loin = ~0)
-        curseur_vx: facing * mouse_vx — horizontal velocity, egocentered
-        curseur_vy: mouse_vy — vertical velocity
+        ball_dir: atan2(dy, dx) with dx = facing * (ball_x - head_x) —
+                  angle égocentré (devant = 0)
+        ball_prox: max_r / (max_r + r) — proximité (proche = 1, loin = ~0)
+        ball_vr: dr/dt — radial velocity relative to the head
+                 (négatif = rapprochement, positif = éloignement)
+        ball_va: d dir/dt — angular velocity of the line of sight (rad/s),
+                 shortest-path across the +/-pi seam
         son_0 .. son_4: intensité par cellule fréquentielle (0..1)
     """
 
     SAMPLE_HZ = 30.0
-    CURSOR_MAX_R = 600.0      # px — max distance for proximity normalization
+    BALL_MAX_R = 600.0        # px — max distance for proximity normalization
     N_FREQ = 5                # number of frequency cells
     CPS_HALF_LIFE = 1.0       # seconds — IIR decay half-life
     CPS_MAX = 10.0            # normalisation cap for cps
@@ -98,16 +104,20 @@ class Cursor:
         self._sample_dt = 1.0 / self.SAMPLE_HZ
         self._accum = self._sample_dt
         self._t = 0.0
-        self._prev_mouse_world: tuple[float, float] | None = None
+        # (r, direction) of the ball at the previous 30 Hz sample; None until
+        # the first sample, and across a facing flip (the egocentric frame
+        # jumps discontinuously, so the finite difference would be spurious)
+        self._prev: tuple[float, float] | None = None
+        self._prev_facing: int | None = None
         # IIR cps per frequency cell
         self._cps = [0.0] * self.N_FREQ
         # decay factor per sample (half-life = 1s)
         self._decay = 0.5 ** (self._sample_dt / self.CPS_HALF_LIFE)
         self._signals = {
-            "curseur_dir": 0.0,
-            "curseur_prox": 0.0,
-            "curseur_vx": 0.0,
-            "curseur_vy": 0.0,
+            "ball_dir": 0.0,
+            "ball_prox": 0.0,
+            "ball_vr": 0.0,
+            "ball_va": 0.0,
         }
         for i in range(self.N_FREQ):
             self._signals[f"son_{i}"] = 0.0
@@ -132,7 +142,8 @@ class Cursor:
         """Call after B.reset(skel) to clear velocity and sound history."""
         self._accum = self._sample_dt
         self._t = 0.0
-        self._prev_mouse_world = None
+        self._prev = None
+        self._prev_facing = None
         self._cps = [0.0] * self.N_FREQ
         self._signals = {k: 0.0 for k in self._signals}
 
@@ -173,21 +184,27 @@ class Cursor:
         dy = target_world[1] - head.y
         r = math.hypot(dx, dy)
         direction = math.atan2(dy, dx)
-        prox = self.CURSOR_MAX_R / (self.CURSOR_MAX_R + r) if r > 0 else 1.0
+        prox = self.BALL_MAX_R / (self.BALL_MAX_R + r) if r > 0 else 1.0
 
-        if self._prev_mouse_world is not None:
-            vx = (target_world[0] - self._prev_mouse_world[0]) / self._sample_dt
-            vy = (target_world[1] - self._prev_mouse_world[1]) / self._sample_dt
-        else:
-            vx = vy = 0.0
-        self._prev_mouse_world = target_world
+        # Radial / angular velocity of the line of sight, relative to the
+        # head (r and direction are head-relative, so the animat's own motion
+        # counts: walking toward a still ball reads as a negative vr). Across
+        # a facing flip the egocentric frame jumps discontinuously, so no
+        # finite difference is produced for one sample.
+        vr = va = 0.0
+        if self._prev is not None and self._prev_facing == facing:
+            vr = (r - self._prev[0]) / self._sample_dt
+            d_dir = (direction - self._prev[1] + math.pi) % (2.0 * math.pi) - math.pi
+            va = d_dir / self._sample_dt
+        self._prev = (r, direction)
+        self._prev_facing = facing
 
         # IIR decay + intensity = cps * prox, normalised
         self._signals = {
-            "curseur_dir": direction,
-            "curseur_prox": prox,
-            "curseur_vx": facing * vx,
-            "curseur_vy": vy,
+            "ball_dir": direction,
+            "ball_prox": prox,
+            "ball_vr": vr,
+            "ball_va": va,
         }
         for i in range(self.N_FREQ):
             self._cps[i] *= self._decay

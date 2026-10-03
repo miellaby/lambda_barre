@@ -1,31 +1,25 @@
 # Le cerveau de λ̄ — l'IA à 2 modèles
 
-Ce document décrit la mise en œuvre du système de décision apprenant de λ̄ :
+Ce document décrit le système de décision apprenant de λ̄ :
 un **world model** (transformer autorégressif) et une **politique** (réseau de
-renforcement), entraînés en continu selon l'architecture décrite dans
-`Lambda barre.md` § « Architecture du système de décision apprenant ».
+renforcement), entraînés en continu.
 
-L'implémentation se compose de trois modules :
-
-```
-lambda_barre/
-├── models.py     ← les 2 réseaux PyTorch (WorldModel, Policy)
-├── brain.py       ← orchestrateur (act / record / sleep)
-└── test_brain.py  ← tests de bout en bout (sans fenêtre)
-```
-
-ainsi que des helpers ajoutés à `tokenize.py` et du branchement dans `main.py`.
-
-Sources de la spec : `Lambda barre.md` (architecture, apprentissage, mise en
-œuvre), `encodeur.md` (layout des tokens), `interoception.md` (états internes),
-`proprioception.md` (circuit de reward).
+L'implémentation se compose de `models.py` (les deux réseaux), `brain.py`
+(l'orchestrateur `Brain`, la mémoire à deux étages `ExperienceBuffer` et le
+pipeline de sommeil), `tokenize.py` (l'encodage dense des salves),
+`smoother.py` (le lissage IIR des capteurs), `body.py`/`world.py` (la physique
+et les consignes), `main.py` (la boucle interactive), `dream.py` (le Dream
+Theater), `wm_theater.py` (la visualisation des rollouts) et `dataset.py` (le
+bootstrap de données d'équilibre). Le pipeline complet est documenté dans
+`DESIGN.md` ; les détails bas niveau des capteurs dans `exteroception.md`,
+`encodeur.md` et `tokens.md`.
 
 ---
 
 ## Vue d'ensemble
 
 ```
-                état (salve de 67 tokens)
+                état (salve de 16 tokens)
                       │
              ┌────────┴────────┐
              │                 │
@@ -36,313 +30,286 @@ Sources de la spec : `Lambda barre.md` (architecture, apprentissage, mise en
              │                 │
              ▼                 ▼
       conséquence            action
-      prédite (s')           (5 consignes)
+      prédite (s')         (consignes)
              │                 │
              └───────┬─────────┘
                      ▼
-                  action ──► environnement (physique pymunk)
+                  action ──► environnement simulé
                      │
                      ▼
                 nouvel état
 ```
 
-Pendant l'**éveil**, la politique pilote les actuateurs et chaque transition
-`(s, a, s')` est journalisée. Pendant le **sommeil**, le world model est
-entraîné hors-ligne sur ces transitions, puis la politique est entraînée par
-RL sur des trajectoires *imaginées* par le world model.
+Pendant l'**éveil**, la physique tourne à 60 Hz. À 3 Hz, chaque tick du world
+model produit une **salve** : 16 tokens denses (13 d'état + 3 d'action) qui
+résume la dernière seconde d'expérience sensorielle (lissée par IIR). La
+salve est journalisée dans la mémoire (`Brain.record`, avec pause
+d'enregistrement quand plus rien ne bouge) et un forward pass du world model
+rafraîchit le **latent** observé par la politique (`Brain.wake_tick`) — que
+le cerveau pilote ou non : c'est le passe perceptif, l'observation de la
+politique ne doit jamais être périmée. À 6 Hz (brain on), la politique
+échantillonne 5 consignes à partir des scalaires sensoriels frais et du
+latent caché (`Brain.act`) ; les consignes ne rentrent pas directement dans la physique :
+des **valeurs effectives** convergent vers elles (50 % de l'écart par période
+policy, voir `body.py`), amortissant les changements brutaux.
+
+Pendant le **sommeil** (`Brain.sleep`, déclenché par `S`), tout se passe
+hors-ligne et en générateur (l'UI consomme un pas par frame) : optimisation
+du dataset (extraction de l'addendum, oubli actif d'un tiers du coreset,
+déduplication géométrique), entraînement du world model sur le coreset puis
+l'addendum survivant au filtre de surprise, entraînement de la politique par
+imitation de l'action rétrospective (*hindsight*) générée par le world model
+en mode EOS-lookahead, puis consolidation de l'addendum dans le coreset et
+sauvegarde des checkpoints. Le Dream Theater (`dream.py`) rejoue les
+trajectoires imaginées du dernier cycle.
 
 ---
 
 ## Le world model (`models.py` — `WorldModel`)
 
-Un **transformer autorégressif** sur le flux de tokens multimodaux.
+Un transformer autorégressif sur le flux de tokens denses qui apprend
+P(s(t+1) | s(t), a(t)) — en pratique la régression des 16 slots de signaux
+du token suivant à chaque position. Entraîné uniquement pendant le sommeil,
+sur les séquences du coreset et de l'addendum.
 
 ### Tokens
 
-Chaque token est une paire `(id, valeur)` sur 2 octets (voir `encodeur.md`).
-L'id identifie le type de signal (structural, fixe par le layout de la salve) ;
-la valeur est quantifiée sur 256 niveaux. Le world model prédit la **valeur**
-du token suivant — c'est cette prédiction discrète sur 256 classes qui permet
-une distribution de trajectoires **multi-modale** plutôt qu'une gaussienne
-centrée (point clé de la spec).
+Chaque tick produit une **salve** de 16 tokens.
+
+Chaque token est un vecteur dense (25 floats) :
+
+* un préfixe structurel de 9 floats (1 float binaire état/action,
+  4 floats de modalité et 4 floats de canal)
+* suivi de 16 slots de signaux normalisés sur [0, 1].
+
+Le layout (quel capteur dans quel token/slot) est fixé par
+`tokenize.py` :
+
+* 13 tokens d'état: proprioception, membres, rétine, balle,
+flux optique, sons, toucher, coûts, récompense, interoception
+* 3 tokens d'action (valeurs des consignes après lissage).
+
+Famille interoceptive — deux canaux orthogonaux au sein de la même
+modalité : le **bilan métabolique** (fatigue, souffrance — niveaux absolus,
+canal `(0,0,0,1)`) et le **token EOS** (canal `(0,0,1,0)`, construit en batch
+dans `brain.py`, jamais enregistré dans les salves). Les niveaux absolus
+sont des intégrateurs lents (demi-vie 100 s / 240 s) : la **porteuse** du
+dénouement, quasi-statique à l'échelle d'une fenêtre de décision — masquée
+de toutes les entrées du WM. Le dénouement lui-même est porté par l'EOS : le
+delta des canaux de coût innés entre la fenêtre de conséquence s5..s10
+(pondérée à l'inverse du temps restant) et la fenêtre de décision s0..s4 —
+normalisé 0.5 = neutre, < 0.5 = rétablissement, > 0.5 = aggravation ; la
+hiérarchie innée usuelle s'applique dès que l'EOS est lu comme un scalaire.
+
+Les slots de padding au-delà du nombre de signaux valides
+d'un token donné restent à 0 et sont masqués.
 
 ### Embedding
 
-```
-x = (id_embed(id) + val_embed(valeur) + pos_embed(position)) * sqrt(d_model)
-```
+Les embeddings ne sont pas appris.
 
-L'id et la valeur ont chacun leur table d'embedding (256 × d_model), la
-position a la sienne. La somme est normalisée par `sqrt(d_model)`.
+Le token 25-dim est projeté par une couche linéaire vers `d_model` (64),
+puis un encodage positionnel **sinusoïdal non appris** est ajouté,
+indexé par **numéro de salve** : les 16 tokens d'une même salve
+partagent donc la même position: on encode le tick temporel, pas
+l'ordre dans la salve déjà identifié par le préfixe structurel.
 
-### Architecture
+Un même token peut donc être inséré à une position d'entrée arbitraire
+et rester à son créneau temporel. C'est notamment utilisé par la
+génération rétrospective pour accoler l'EOS terminal en fin de contexte.
 
-- `d_model = 64`, `nhead = 4`, `layers = 3`, `dim_ff = 384` (taille réduite
-  pour la vitesse CPU)
-- `TransformerEncoder` avec `norm_first=True` (pre-LN) et activation GELU
-- Masque causal triangulaire (chaque position n'attend que les précédentes)
-- Tête linéaire → 256 logits (prédiction de la valeur du token suivant)
+### Architecture du modèle
+
+`nn.TransformerEncoder` : d_model 64, 4 têtes, 3 couches, feed-forward 384,
+GELU, pre-norm (`norm_first`), dropout 0.
+
+Masque **causal par salve** : tous
+les tokens d'une salve voient les salves passées, jamais les suivantes. La
+tête est une linéaire d_model → 16 qui prédit les slots de signaux du token
+suivant.
+
+Le **latent** lu par la politique est capturé (**hook**) sur la couche du
+milieu : l'embedding du dernier token de la dernière forward, une
+représentation compressée de l'état courant conditionnée par tout
+l'historique.
+
+Pour l'imagination il existe un chemin de **cache KV incrémental**
+(`cache_forward`, `predict_next_state_cached`) : projection K/V stockée par
+couche, strictement équivalent au recalcul complet, réservé à l'inférence et
+cloné à chaque embranchement de trajectoire. Un cache n'est valide que tant
+que les poids du world model ne bougent pas.
 
 ### Séquence d'entraînement
 
-Une transition est encodée comme une séquence de 128 tokens :
+Une séquence = une trajectoire de `SEQ_STEPS` (10) salves :
+`[s0, a0, s1, a1, ..., a9, s10]`, soit 173 tokens. La cible est
+la section signaux du token suivant (décalée d'un) : MSE sur les slots
+valides seulement.
 
-```
-[état_t (61)] [action_t (6)] [état_{t+1} (61)]
-```
+Une pondération par position/canal renforce le gradient sur les canaux
+de récompense et sur l'**EOS terminal** — la position avant-dernière apprend
+l'EOS : le delta de dénouement des canaux de coût innés (effort, douleur,
+courbature, instabilité, vertige, confort) entre la fenêtre de conséquence
+s5..s10 (temps pondéré à l'inverse du temps restant — le long terme domine)
+et la fenêtre de décision s0..s4 ; normalisé 0.5 = neutre, < 0.5 =
+rétablissement, > 0.5 = aggravation ; hiérarchie innée usuelle pour toute
+lecture scalaire.
 
-Le modèle est entraîné par **teacher forcing** : à chaque position, prédire la
-valeur du token suivant. La loss (cross-entropy) ne porte que sur les
-positions dont la cible est un **scalaire** — les tokens de séparation
-(valeur toujours 0) sont masqués car ils ne portent pas de signal.
+L'entraînement alterne les passes :
+
+* 3 passes avec masque causal classique,
+* **1 passe EOS-lookahead**
+
+En mode _lookahead_, l'action après S4 peut aussi attendre
+l'EOS *réalisé* de la séquence : le
+world model apprend ainsi P(a4 | contexte, EOS), l'action rétrospective qui
+mène au dénouement réel. C'est cette prédiction que la politique imite.
 
 ### Méthodes
 
-| Méthode | Rôle |
-|---------|------|
-| `forward(ids, vals)` | logits `[B, L, 256]` prédits à chaque position |
-| `roll(ctx, n_gen)` | génération **autorégressive** token par token (lente) |
-| `predict_next(ctx)` | prédiction **parallèle** du prochain état en une passe (rapide, utilisée pour l'imagination) |
-
-`predict_next` conditionne chaque token du prochain état sur
-`(état, action)` + un placeholder zéro pour le reste du prochain état. C'est
-~60× plus rapide que `roll` et c'est ce que la politique utilise pour
-imaginer des trajectoires pendant le sommeil. Le world model lui-même reste
-entraîné avec l'objectif causal autorégressif complet.
+* `forward(x, attn_mask, salve_positions)` — passe parallèle [B, L, 25] →
+  [B, L, 16], prédictions à toutes les positions.
+* `predict_next_state(ctx)` — génère autorégressivement les 13 tokens d'état
+  suivant (template structurel + slots prédits clampés et masqués, chaque
+  token prédit renvoyé dans le contexte).
+* `predict_next_action(ctx)` / `predict_next_salve(ctx)` — idem pour les 3
+  tokens d'action, ou les deux blocs enchaînés.
+* `cache_forward` / `predict_next_state_cached` — variantes à cache KV.
+* `last_latent()` — le latent intermédiaire du dernier token (observation
+  de la politique).
 
 ---
 
 ## La politique (`models.py` — `Policy`)
 
-Un **MLP** `π(a|s)` qui produit les 5 consignes d'actuateurs.
+π(a|s) : un petit réseau qui produit les 5 consignes d'actionneurs. Il
+n'apprend pas une fonction de valeur : il est entraîné par imitation de
+l'action rétrospective du world model (et, en repli, par tournoi de
+candidats guidés par les futurs imaginés).
 
-### Entrée
+### Entrées
 
-Les **55 valeurs scalaires sensorielles** de l'état (la partie état de la
-salve, séparateurs exclus), normalisées sur `[0, 1]`.
+Deux sources d'entrées :
+
+* les **45 scalaires sensoriels** non-récompense de l'état
+  (tokens 0..9 : posture, membres, rétine, balle, flux, sons, toucher)
+  déjà normalisés [0, 1]
+* le **latent du world model** (d_model 64), normalisé par une `LayerNorm`
+  pour le mettre à la même échelle que les scalaires.
+
+Le vecteur d'état fait donc 109 dimensions. Les scalaires sont
+lus à chaque tick policy (6 Hz) ; le latent est rafraîchi au rythme du
+world model (3 Hz) et conservé entre les ticks.
 
 ### Architecture
 
-```
-Linear(55 → 128) → Tanh
-Linear(128 → 128) → Tanh
-Linear(128 → 128) → Tanh
-Linear(128 → 5)            # raw (logit-space)
-```
+Un MLP : 3 couches cachées de 256 (ReLU), puis une tête linéaire 256 → 5.
+L'échantillonnage se fait dans l'espace pré-squash avec une gaussienne
+isotrope de std fixe (`act_std` = 0.05 ; `explore_std` = 0.2 pendant
+l'exploration en sommeil).
 
-### Squash
+### Sorties
 
-Les 5 sorties sont squashed dans les plages valides des consignes :
+Les 5 consignes squashed dans leurs plages physiques, toujours valides :
 
-| Sortie | Transformation | Plage |
-|--------|----------------|-------|
-| membre_avant_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
-| membre_avant_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
-| membre_arriere_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
-| membre_arriere_d | `LIMB_MIN + sigmoid(raw)*(LIMB_MAX−LIMB_MIN)` | [10, 32] |
-| queue_theta | `tanh(raw) * π/2` | [−π/2, +π/2] |
+* θ des membres et de la queue via `tanh` ([-π, +π]),
+* d des membres via `sigmoid` ([LIMB_MIN=10, LIMB_MAX=32] px).
 
-Ainsi toute action échantillonnée est une consigne valide pour la physique.
+Convention égocentrée avant/ arrière : la correspondance anatomique
+gauche/droite se fait dans `main.py` selon le facing.
 
-### Exploration
-
-Échantillonnage dans l'espace **pre-squash** (logit) avec une gaussienne
-isotrope de std fixe (`explore_std = 0.4`), puis squash. Le `log_prob` est
-calculé contre la même distribution dans l'espace logit (simplification
-standard : on optimise en espace raw).
+Les consignes rentrent dans la physique à travers le
+lissage par valeurs effectives.
 
 ---
 
-## L'orchestrateur (`brain.py` — `Brain`)
+## L'orchestrateur
 
 ### Cycle de vie
 
-```
-brain.act(salve_t)              → 5 consignes d'actuateurs
-    ... physique, capteurs, encodeur ...
-brain.record(salve_t, salve_{t+1})   → journalise (s, a, s')
-brain.sleep()                        → entraîne les 2 modèles hors-ligne
-```
+`Brain` (brain.py) porte les deux réseaux, leurs optimiseurs (Adam, lr_wm
+3e-4, lr_pol 2e-4, weight decay 1e-4 sur la politique), le `latent_norm`, la
+mémoire `ExperienceBuffer` et les masques. Trois checkpoints persistants
+sont sauvés à la fin de chaque sommeil :
+
+* `buf_ckpt.pt`: mémoire
+* `wm_ckpt.pt`: world model
+* `pol_ckpt.pt`: politique
+
+Les discontinuités temporelles (retour au spawn, flip de facing)
+passent par `clear_history`/`boundary` : le contexte réveil est vidé,
+le segment en cours est scellé, et le smoother est réinitialisé sans
+interpolation.
 
 ### Éveil
 
-- `act()` : échantillonne une action depuis la politique (exploration) et la
-  renvoie. Les consignes sont poussées dans le squelette par `main.py`.
-- `record()` : journalise une transition dans le `ExperienceBuffer` (ring
-  buffer de capacité 4000). Les états sont stockés comme listes de 61 valeurs
-  de tokens (séparateurs inclus, valeur 0), les actions comme 6 valeurs
-  (séparateur + 5 scalaires).
+* `record(salve)` (3 Hz) journalise la salve dans les segments linéaires
+  de la mémoire ; l'enregistrement se met en pause après 6 ticks
+  successifs où animal, environnement et consignes sont immobiles (tolérance
+  1e-4), et reprend dès qu'un signal bouge sans vider le contexte.
+* `wake_tick(salve)` (3 Hz) forward du world model sur l'historique
+  glissant (4 dernières transitions + état courant), rafraîchit le latent
+  normalisé et les scalaires cachés.
+* `act(salve)` (6 Hz) échantillonne les 5 consignes
+  (scalaires frais + latent caché) et les renvoie à la boucle, qui les écrit
+  comme consignes dans le squelette ; Ce sont des valeurs lissées
+  de ces consignes qui sont entrées dans la physique et journalisées
+  (convergence à 50 % de l'écart par période policy).
 
-### Sommeil — `sleep()`
+La policy (act) peut être désactivée pendant l'éveil (*brain off*).
+Les consignes sont alors contrôlés par l'utisateur.
 
-Deux phases, dans l'ordre de la spec :
+### Sommeil
 
-**1. Entraînement du world model** (`train_world`) :
-- Échantillonne des batches de transitions depuis le buffer
-- Construit les séquences `[s, a, s']` de 128 tokens
-- Cross-entropy sur les positions scalaires seulement
-- Clip de gradient (norme 1.0), optimizer Adam (lr 3e-4)
+La mémoire `ExperienceBuffer` est à deux étages :
 
-**2. Entraînement de la politique** (`train_policy`) — model-based RL :
-- Le world model est **gelé** (`eval`)
-- Pour chaque batch d'états de départ :
-  1. La politique **échantillonne** une première action (garde le gradient)
-  2. Le world model **imagine** la trajectoire sur `horizon` pas
-  3. À chaque pas : coût lu sur les tokens REWARD de l'état imaginé
-  4. Return = −Σ coût actualisé (maximiser ⇔ minimiser le coût prédit)
-- **REINFORCE** : `loss = −E[log π(a|s) · (return − baseline)]`
-- Baseline = moyenne glissante des returns imaginés (stabilise la variance)
-- Clip de gradient, optimizer Adam (lr 1e-3)
+* le **coreset** : mémoire long terme consolidée, dataset effectif du world model,
+  soumis à la décroissance de vivacité et l'éviction par capacité (compté en
+  séquences)
+* l'**addendum** : mémoire court terme contenant les expériences de veille fraîches
+  et des expériences passées revisitées pour l'oubli actif.
 
-C'est la boucle décrite dans la spec : la politique apprend à produire des
-actions qui **minimisent le coût prédit par le world model**, sans avoir
-besoin d'effectuer réellement toutes ces actions.
+Le sommeil, `sleep()`, suit alors la séquence suivante.
 
-### Coût d'une salve (`salve_cost`)
-
-Le coût instantané est lu sur les tokens REWARD de l'état :
-
-```python
-cost = reward_neg (coût, 0..1) + reward_pos (coût négatif, −1..0)
-```
-
-`reward_pos` négatif = récompense (réduit le coût) ; `reward_neg` positif =
-pénalité (augmente le coût). Les valeurs sont déquantifiées vers leurs
-échelles physiques (1.0 pour les deux).
-
----
-
-## Helpers de tokenization (`tokenize.py`)
-
-Ajoutés pour l'interface entre le cerveau et l'encodeur :
-
-| Helper | Rôle |
-|--------|------|
-| `SALVE_IDS` | layout plat des 67 ids d'une salve (séparateurs + scalaires) |
-| `STATE_IDS` / `ACTION_IDS` | ids des 61 tokens d'état / 6 tokens d'action |
-| `STATE_LEN = 61` / `ACTION_LEN = 6` / `SALVE_LEN = 67` | tailles |
-| `state_values(salve)` | 55 valeurs scalaires de l'état (pour la politique) |
-| `action_values(salve)` | 5 valeurs scalaires de l'action |
-| `state_token_values(salve)` | 61 valeurs de tokens d'état (pour le world model) |
-| `action_token_values(salve)` | 6 valeurs de tokens d'action |
-| `encode_action(5 consignes)` | encode les consignes en tokens ACTION |
-| `salve_cost(salve)` | coût instantané lu sur les tokens REWARD |
-| `state_vals_from_scalars` / `scalars_from_state_vals` | conversion 55 ↔ 61 |
-
----
-
-## Branchement dans la boucle live (`main.py`)
-
-### Contrôles clavier
-
-| Touche | Action |
-|--------|--------|
-| **B** | Active/désactive le cerveau (mode auto vs joysticks manuels) |
-| **S** | Déclenche un cycle de sommeil (entraîne les 2 modèles) |
-| **R** | Récompense utilisateur (impulsion valencée positive) |
-| **T** | Punition utilisateur (impulsion valencée négative) |
-| BACKSPACE | Reset (efface aussi le buffer de transitions) |
-| G | Toggle des marqueurs de cible |
-| ESC | Quitter |
-
-### Reward / punition utilisateur
-
-Conformément à la spec, le reward n'est **pas une supervision spéciale** :
-c'est un **événement sensoriel à valeur intrinsèque** injecté dans les tokens
-REWARD. La touche **R** rend `reward_pos` plus négatif (réduit le coût) ; **T**
-augmente `reward_neg` (augmente le coût). Les impulsions décroissent
-exponentiellement (×0.9 par frame).
-
-### Cadencement
-
-La salve est générée à **6 Hz** (une salve toutes les 10 frames à 60 Hz),
-conformément à la spec. C'est la cadence du world model, plus lente que la
-proprioception (60 Hz) ou le curseur (30 Hz).
-
-### HUD
-
-Le HUD affiche en plus, quand le cerveau est actif :
-
-```
-fps 60 facing R [BRAIN]
-buf 35 wm 29.70 pol 2.70 ret 3.44
-```
-
-— taille du buffer, dernière loss du world model, dernière loss de politique,
-dernier return imaginé.
+* **Consolidation du journal** : toutes les fenêtres glissantes de
+  `seq_len` (11) salves de la session de veille sont extraites vers
+  l'addendum.
+* **Oubli actif** : 1/3 du coreset est tiré au sort et remis en jeu dans
+  l'addendum comme candidats à l'oubli.
+* **Déduplication géométrique** : Les quasi-doublons sont trouvés
+  et supprimés d'abord intra-addendum, puis contre le coreset.
+* **World model, phase coreset** : entraînement jusqu'au
+  quota d'epoch *et* la loss cible (0.01 par défaut). 1 passe
+  EOS-lookahead est alternée avec 3 passe à masque causale ; le poids
+  d'impact de chaque séquence est saliency-proportionnel (gated par la
+  loss coreset : en dessous de 0.02, les distances EOS-saliency sont
+  fiables).
+* **Filtre de surprise** : la divergence de dynamique et de coût
+  de chaque séquence de l'addendum est évaluée par le world model;
+  le *connu* est jeté, le *surprenant* est gardé.
+* **World model, phase addendum** : entraînement sur l'addendum après
+  déduplication et filtrage, même alternance de masque.
+* **Politique** : supervision *hindsight* EOS-lookahead : l'action propre
+  de la politique est roulée pour obtenir le coût de base C_pi et l'EOS
+  imaginé ; l'écart au neutre du dénouement prédit est forcé
+  multiplicativement vers le favorable (`EOS_pi − ε·|EOS_pi − 0.5|`,
+  ε ~ U(2 %, 10 %) par slot) ; le
+  world model en mode lookahead génère l'action associée à ce dénouement ;
+  un rollout causal de vérification ne l'accepte que si elle réduit
+  réellement le coût imaginé. En repli (rejet systématique pendant
+  plusieurs batches, ou horizon d'imagination trop court) : la machinerie
+  historique de candidats stochastiques (π, démonstration enregistrée,
+  bruit gaussien) reprend la main.
+* **Consolidation finale** — l'addendum survivant est committé dans le
+  coreset (vivacité rafraîchie, éviction par capacité 1000), le latent de
+  réveil est rafraîchi, les checkpoints sont sauvés, et le dernier dream
+  record est publié pour le Dream Theater.
 
 ---
 
 ## Configuration technique
 
-### PyTorch
-
-PyTorch (build CPU) est ajouté aux dépendances (`torch>=2.0`).
-
-**Note de compatibilité** : sur certains hôtes (ex. conteneurs avec un
-`/proc/cpuinfo` inutilisable), les noyaux fusionnés oneDNN (MKL-DNN) lèvent un
-SIGILL. `models.py` force donc par défaut le backend d'attention « math »
-avec oneDNN désactivé et 1 thread. Pour restaurer les noyaux optimisés sur une
-machine connue pour les supporter :
-
-```bash
-export LAMBDA_TORCH_MKLDNN=1
-```
-
-### Performances
-
-Un cycle de sommeil complet (4 epochs WM + 12 pas de politique, batch 16,
-horizon 3) prend ~5–10 s sur CPU. La prédiction parallèle `predict_next`
-(une seule passe plutôt que 61 passes autorégressives) rend l'imagination
-pratique pour le RL hors-ligne.
-
----
-
-## Tests (`test_brain.py`)
-
-Tous les tests tournent sans fenêtre (`SDL_VIDEODRIVER=dummy`).
-
-| Test | Vérifie |
-|------|---------|
-| `test_policy_outputs_are_valid_consignes` | la politique renvoie 5 consignes dans les plages valides |
-| `test_world_model_forward_and_predict_shapes` | formes du forward et de `predict_next` |
-| `test_salve_cost_sign` | reward → coût négatif, punition → coût positif |
-| `test_act_returns_five_consignes` | `act()` renvoie 5 valeurs |
-| `test_sleep_trains_both_models_and_world_loss_decreases` | la loss du world model décroît sur données structurées |
-| `test_brain_drives_real_sim_and_sleeps` | **intégration réelle** : le cerveau pilote le corps pymunk, journalise les vraies transitions, et enchaîne un sommeil |
-
-Lancer :
-
-```bash
-SDL_VIDEODRIVER=dummy PYTHONPATH=. python -m lambda_barre.test_brain
-```
-
-Le test d'intégration reproduit la boucle live sans affichage : construit le
-squelette pymunk, les capteurs, l'encodeur, laisse le cerveau piloter les
-consignes pendant 4 s, puis déclenche un sommeil et vérifie que les loss
-sont finies et que la politique post-sommeil produit encore des consignes
-valides.
-
----
-
-## Périmètre (minimal viable)
-
-Conformément au choix « minimal viable », les briques suivantes de la spec
-sont **laissées en stub** pour une iteration ultérieure :
-
-- **Coreset / Addendum** : la consolidation par ablation pendant le sommeil
-  (§ « Consolidation de l'apprentissage durant le sommeil »). Le buffer actuel
-  est un ring buffer simple.
-- **Segmentation d'épisodes** : la détection automatique des frontières
-  d'épisode par l'erreur de prédiction `L_t = −log P(o_{t+1}, r_t | o_t, a_t)`
-  (§ « Délimitation des séquences du dataset »).
-- **Compression temporelle des actions** : le résumé des blocs moteurs entre
-  deux salves (§ « Granularité temporelle »).
-- **Vocalises** : l'actuateur vocal et l'instinct d'imitation.
-
-L'objectif démontrable avec les seuls coûts innés est l'émergence d'une
-posture stable (lutter contre gravité et instabilité). L'émergence de
-« suivre le curseur » nécessite les reward/punish (R/T) et plusieurs cycles
-veille/sommeil — c'est le test décrit dans la spec : après apprentissage,
-arrêter de récompenser et observer si λ̄ continue spontanément à suivre le
-curseur.
+* **Hyperparamètres** :
+  gamma 1.1, boost de gradient ×16 sur reward et EOS.
+* **Matériel** : Pas de dépendances matérielles fortes, l'accélération CPU/GPU
+  s'active sur option.

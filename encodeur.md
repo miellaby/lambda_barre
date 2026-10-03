@@ -28,11 +28,11 @@ Le `Smoother` opère la **compression temporelle** entre la dynamique physique (
     * Forces et couples (`force_actuateur_avant`, `force_actuateur_arriere`, `couple_queue`).
     * Accélérations de la tête (`accel_tete_avant`, `accel_tete_haut`).
     * Métabolique et puissance (`effort`, `douleur`).
-    * Vitesses du mobile (`curseur_vx`, `curseur_vy`).
+    * Vitesses du mobile (`ball_vr`, `ball_va`).
     * Flux optique (`flux_surface`, `flux_x`, `flux_y`).
   * **Signaux bruts directs (*passthrough* sans lag)** :
     * Posture et géométrie directe (`tronc_angle`, `queue_angle`, `membre_*`).
-    * Extéroception spatiale (`curseur_dir`, `curseur_prox`, cône rétinien `vis_c1..16`).
+    * Extéroception spatiale (`ball_dir`, `ball_prox`, cône rétinien `vis_c1..16`).
     * Contacts discrets (`contact_sol_*`, `collision_tronc_*`).
     * Intégrateurs lents internes déjà amortis (`fatigue`, `souffrance`, `courbature`, `vertige`).
 * **Réinitialisation instantanée (`reinit`)** : lors d'un basculement de direction du regard (*facing flip*), l'état interne du filtre est immédiatement écrasé par la nouvelle mesure pour éviter toute traînée ou interpolation croisée entre les deux référentiels.

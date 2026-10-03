@@ -15,7 +15,14 @@ from dataclasses import dataclass, field
 import pygame
 
 from . import body as B
-from .tokenize import _BY_KEY, _denormalize, SIG_OFFSET
+from .tokenize import _BY_KEY, _denormalize, SIG_OFFSET, _EOS_CHANNEL_W
+
+
+def _eos_scalar(vals: list[float]) -> float:
+    """Scalarize an EOS slot list as the channel-hierarchy-weighted deviation
+    from neutral (0.5): negative = recovery, positive = worsening."""
+    w = _EOS_CHANNEL_W[:len(vals)]
+    return sum(a * b for a, b in zip(w, vals)) / sum(w) - 0.5
 
 
 # Colors
@@ -57,7 +64,7 @@ class DreamTrajectory:
     total_cost: float = 0.0
     is_best_future: bool = False
     is_winner: bool = False
-    eos_pred: list[float] | None = None  # imagined terminal EOS (delta fatigue, delta souffrance), normalized [0, 1]
+    eos_pred: list[float] | None = None  # imagined denouement delta (6 slots, 0.5 = neutre)
 
 
 @dataclass
@@ -73,10 +80,10 @@ class DreamRecord:
     best_future_indices: list[int]    # Winning future index per candidate
     candidate_names: list[str] = field(default_factory=lambda: [
         "0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 30%"])
-    eos_forced: list[float] | None = None  # hindsight forcing target (delta fatigue, delta souffrance), normalized [0, 1]
+    eos_forced: list[float] | None = None  # hindsight forcing target (denouement delta, 0.5 = neutre)
     lived_steps: list[DreamStep] | None = None        # full lived sequence s0..s10 with actions and per-salve costs
     predicted_steps: list[DreamStep] | None = None     # real s0..s3 + hindsight a4 + imagined s5..s10
-    eos_realized: list[float] | None = None           # realized EOS of the lived sequence, normalized [0, 1]
+    eos_realized: list[float] | None = None           # realized denouement delta of the lived sequence
 
 
 def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
@@ -457,9 +464,8 @@ class DreamTheater:
 
         # Hindsight forcing target of the selected step (EOS-lookahead policy training)
         if rec.eos_forced is not None:
-            dfat = 2.0 * rec.eos_forced[0] - 1.0
-            dsuf = 2.0 * rec.eos_forced[1] - 1.0
-            eos_txt = f"Hindsight EOS forced: dfat {dfat:+.2f} dsuffering {dsuf:+.2f}"
+            eos_txt = (f"Hindsight EOS forced (delta, - = recovery): "
+                       f"{_eos_scalar(rec.eos_forced):+.2f}")
             s_eos = font_small.render(eos_txt, FONT_AA, TEXT_ACCENT)
             screen.blit(s_eos, (16 + s_title.get_width() + 24, 9))
 
@@ -630,10 +636,8 @@ class DreamTheater:
                 s_win = font_small.render("🏆 WINNER", FONT_AA, WINNER_BORDER)
                 screen.blit(s_win, (20, content_y + 48))
             elif traj.eos_pred is not None:
-                # Imagined terminal outcome of this rollout (physical deltas)
-                dfat = 2.0 * traj.eos_pred[0] - 1.0
-                dsuf = 2.0 * traj.eos_pred[1] - 1.0
-                s_eos = font_small.render(f"EOS dfat {dfat:+.2f} dsuf {dsuf:+.2f}",
+                # Imagined terminal outcome of this rollout (mean cost)
+                s_eos = font_small.render(f"EOS delta {_eos_scalar(traj.eos_pred):+.2f}",
                                           FONT_AA, TEXT_MUTED)
                 screen.blit(s_eos, (20, content_y + 48))
             elif is_best:
@@ -670,7 +674,7 @@ class DreamTheater:
         # --- LIVED SEQUENCE row: the ground truth s0 -> s10 ---
         label = "LIVED SEQUENCE (s0-s10)"
         if rec.eos_realized is not None:
-            label += f"  EOS dfat {2.0 * rec.eos_realized[0] - 1.0:+.2f} dsuf {2.0 * rec.eos_realized[1] - 1.0:+.2f}"
+            label += f"  EOS delta {_eos_scalar(rec.eos_realized):+.2f}"
         y = self._draw_seq_row(screen, rec, rec.lived_steps, label, y, font_small,
                                TEXT_WHITE, (200, 200, 210))
 
@@ -678,7 +682,7 @@ class DreamTheater:
         label = "WM COMPLETION (hindsight EOS)"
         traj_gen = rec.trajectories[1]
         if traj_gen.eos_pred is not None:
-            label += f"  EOS dfat {2.0 * traj_gen.eos_pred[0] - 1.0:+.2f} dsuf {2.0 * traj_gen.eos_pred[1] - 1.0:+.2f}"
+            label += f"  EOS delta {_eos_scalar(traj_gen.eos_pred):+.2f}"
         y = self._draw_seq_row(screen, rec, rec.predicted_steps, label, y, font_small,
                                TEXT_ACCENT, CAND_COLORS[1])
 
@@ -765,8 +769,7 @@ class DreamTheater:
             ax = x + self.thumb_w + 10
             lines = [names[c_idx], f"Cost {traj.total_cost:.2f}"]
             if traj.eos_pred is not None:
-                lines.append(f"EOS dfat {2.0 * traj.eos_pred[0] - 1.0:+.2f}"
-                             f" dsuf {2.0 * traj.eos_pred[1] - 1.0:+.2f}")
+                lines.append(f"EOS delta {_eos_scalar(traj.eos_pred):+.2f}")
             if c_idx == 1:
                 lines.append("ACCEPTED" if traj.is_winner else "REJECTED")
             col = WINNER_BORDER if traj.is_winner else CAND_COLORS[c_idx]

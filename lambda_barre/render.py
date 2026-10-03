@@ -249,42 +249,42 @@ def draw_proprio(screen, font, signals: dict,
     return None
 
 
-# --- extéroception: curseur ---------------------------------------------------
+# --- exteroception: ball ------------------------------------------------------
 
 # (2-letter code, dict key, scale, description) — scale maps value to [-1, +1]
-_CURSOR_SPECS = [
-    ("CD", "curseur_dir",  math.pi, "curseur direction (devant = 0)"),
-    ("CP", "curseur_prox", 1.0,    "curseur proximite (proche = 1)"),
-    ("CV", "curseur_vx",  1500.0, "curseur vx (mouvement vers devant = +)"),
-    ("CW", "curseur_vy",  1500.0, "curseur vy (mouvement vers le haut = +)"),
-    ("S0", "son_0",       1.0,    "son cellule 0 (clic souris / espace)"),
-    ("S1", "son_1",       1.0,    "son cellule 1"),
-    ("S2", "son_2",       1.0,    "son cellule 2"),
-    ("S3", "son_3",       1.0,    "son cellule 3"),
-    ("S4", "son_4",       1.0,    "son cellule 4"),
+_BALL_SPECS = [
+    ("BD", "ball_dir",  math.pi, "ball direction (ahead = 0)"),
+    ("BP", "ball_prox", 1.0,    "ball proximity (near = 1)"),
+    ("BR", "ball_vr",   1500.0, "ball radial velocity (approach = -)"),
+    ("BW", "ball_va",   10.0,   "ball angular velocity (rad/s)"),
+    ("S0", "son_0",     1.0,    "sound cell 0 (mouse click / space)"),
+    ("S1", "son_1",     1.0,    "sound cell 1"),
+    ("S2", "son_2",     1.0,    "sound cell 2"),
+    ("S3", "son_3",     1.0,    "sound cell 3"),
+    ("S4", "son_4",     1.0,    "sound cell 4"),
 ]
 
-CURSOR_BLOCK = 40
-CURSOR_GAP = 4
-CURSOR_TOP = 115
+BALL_BLOCK = 40
+BALL_GAP = 4
+BALL_TOP = 115
 
 
-def draw_cursor(screen, font, signals: dict,
-                mouse_pos: tuple[int, int] | None = None) -> str | None:
-    """Draw the cursor extéroceptive signals as a row of coloured blocks.
+def draw_ball(screen, font, signals: dict,
+              mouse_pos: tuple[int, int] | None = None) -> str | None:
+    """Draw the ball exteroceptive signals as a row of coloured blocks.
     Returns the hover description text if a block is hovered, else None."""
-    n = len(_CURSOR_SPECS)
-    total_w = n * CURSOR_BLOCK + (n - 1) * CURSOR_GAP
+    n = len(_BALL_SPECS)
+    total_w = n * BALL_BLOCK + (n - 1) * BALL_GAP
     x0 = (WIDTH - total_w) // 2
-    y = CURSOR_TOP
+    y = BALL_TOP
     bg = PROPRIO_BAR_BG
     pos_c = PROPRIO_BAR_POS
     neg_c = PROPRIO_BAR_NEG
 
     hover = -1
-    for i, (code, key, scale, desc) in enumerate(_CURSOR_SPECS):
-        bx = x0 + i * (CURSOR_BLOCK + CURSOR_GAP)
-        rect = pygame.Rect(bx, y, CURSOR_BLOCK, CURSOR_BLOCK)
+    for i, (code, key, scale, desc) in enumerate(_BALL_SPECS):
+        bx = x0 + i * (BALL_BLOCK + BALL_GAP)
+        rect = pygame.Rect(bx, y, BALL_BLOCK, BALL_BLOCK)
         if mouse_pos and rect.collidepoint(mouse_pos):
             hover = i
         val = signals.get(key, 0.0)
@@ -297,11 +297,11 @@ def draw_cursor(screen, font, signals: dict,
         border_c = (140, 150, 170) if hover == i else (60, 66, 82)
         pygame.draw.rect(screen, border_c, rect, 2, border_radius=4)
         s = font.render(code, FONT_AA, PROPRIO_LABEL_C)
-        screen.blit(s, (bx + (CURSOR_BLOCK - s.get_width()) // 2,
-                        y + (CURSOR_BLOCK - s.get_height()) // 2))
+        screen.blit(s, (bx + (BALL_BLOCK - s.get_width()) // 2,
+                        y + (BALL_BLOCK - s.get_height()) // 2))
 
     if hover >= 0:
-        code, key, scale, desc = _CURSOR_SPECS[hover]
+        code, key, scale, desc = _BALL_SPECS[hover]
         val = signals.get(key, 0.0)
         return f"{key}  =  {val:+.1f}"
     return None

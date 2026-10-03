@@ -7,3 +7,4 @@ brain_ckpt.pt
 wm_ckpt.pt
 pol_ckpt.pt
 buf_ckpt.pt
+.tmp/

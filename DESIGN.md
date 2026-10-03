@@ -1,63 +1,156 @@
 # λ̄ Design — Sleep Cycle & Policy Training
 
 Detailed implementation reference for the two-model brain: the offline sleep
-pipeline (`Brain.sleep`) and policy training (`Brain.train_policy`).
-High-level agent instructions live in `AGENTS.md`; this document carries the
-mechanics.
+pipeline (`Brain.sleep`) and policy training (`Brain.train_policy`). Numbers
+and signatures live in `brain.py`; this document carries the order, the
+reasoning, and the attention-mask geometry that are hard to reconstruct from
+the code alone.
 
 ## Sleep Cycle Pipeline (`Brain.sleep`)
 
-Dataset Optimisation & Word Model Training, then Policy Training:
+Dataset optimisation and World Model training first, then policy training.
+The generator yields one phase step per UI frame, so the HUD/Dream Theater
+follow the cycle live:
 
-1. **Wake Extraction**: Extract sliding-window sequences from the wake session into the Addendum (`extract_addendum`).
-2. **Active Forgetting Candidates**: Randomly prune 33% of the Coreset (lowest vivacity biased random) into the Addendum (`prune_coreset`).
-3. **Geometric Deduplication**:
-   - **Intra-Addendum**: Complete linkage clustering removing redundant duplicates within the Addendum (`deduplicate_addendum`).
-   - **Addendum vs. Coreset**: Cross-deduplication against the remaining Coreset (`deduplicate_against_coreset`). Sequences within distance $\epsilon < 0.04$ refresh the Coreset memory vivacity to 1.0 and are **immediately dropped from the Addendum**.
-4. **World Model Training on Coreset**: Train the World Model on the remaining Coreset (`wm_coreset`) to establish baseline known dynamics (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$). Each sequence's descent step is proportional to its actual impact $|\,\text{cost}(S_{10}) - \text{cost}(S_4)\,|$ — the absolute change in immediate innate cost between the decision state and the terminal state — so the WM focalizes on sequences with real positive or negative biological consequences. A small floor weight keeps neutral sequences learning at a trickle. Within each sequence, the gradient is boosted ($\times 16$) on the terminal salve's reward slots (costs, confort) and EOS delta. Causal passes alternate with **EOS-lookahead passes** (1 in 4, `_WM_LOOKAHEAD_PERIOD`): under the lookahead attention mask, the decision position (76, whose head predicts $a_4$) additionally attends the realized terminal EOS token (172), and the EOS token attends only the decision context and itself — so the WM learns the hindsight action $P(a_4 \mid \text{contexte}, EOS)$ on the same trunk, without letting the recorded $a_4$ leak through the EOS key.
-5. **Surprise Filtering (Cognitive Evaluation)**:
-   - Evaluated in inference mode (`torch.no_grad()`), **without gradient descent**.
-   - World Model predicts each surviving Addendum sequence.
-   - Error $< \text{threshold}$ $\rightarrow$ familiar/known sequence $\rightarrow$ **dropped**.
-   - Error $\ge \text{threshold}$ $\rightarrow$ surprising dynamic $\rightarrow$ **kept**.
-   - **Update UI Stats immediately**: Update `filter_dropped` and compute expected `coreset_after` before Addendum training begins.
-6. **World Model Training on Addendum**: Train the World Model on the surprising Addendum sequences (`wm_addendum`) with gradient descent (continues while $\text{loss} > 0.01$, stops when quota is validated and $\text{loss} \le 0.01$), with the same impact-proportional descent steps and the same causal/lookahead alternation as `wm_coreset`.
-7. **Policy Training** Supervised policy improvement by imitation of the World Model's hindsight (EOS-lookahead) action, verified by imagined rollouts in Dream Theater (`train_policy`).
-8. **Final consolidation** Commit surviving Addendum sequences into the Coreset (`consolidate_addendum_into_coreset`), apply vivacity decay, and evict coldest memories if exceeding maximum capacity.
+1. **Wake Extraction** — all sliding-window sequences of the wake session
+   are extracted into the Addendum (`extract_addendum`).
+2. **Active Forgetting Candidates** — a third of the Coreset is pruned into
+   the Addendum (vivacity-biased random, `prune_coreset`): old memories are
+   systematically put back in play at every sleep.
+3. **Geometric Deduplication**
+   - Intra-Addendum: complete-linkage clustering drops redundant duplicates
+     (`deduplicate_addendum`).
+   - Addendum vs Coreset: near-duplicates refresh the Coreset memory's
+     vivacity and are dropped from the Addendum
+     (`deduplicate_against_coreset`). Distances are saliency-weighted only
+     once the coreset WM loss is low enough to trust the sensitivity map.
+4. **World Model Training on Coreset** (`wm_coreset`) — establishes the
+   baseline known dynamics. Runs until the epoch quota is validated AND the
+   loss reaches the target. Each sequence's descent weight is proportional
+   to its realized impact — the absolute change in innate cost between the
+   decision state S4 and the terminal state S10 — so the WM focuses on
+   sequences with real biological consequences; a small floor weight keeps
+   neutral sequences learning at a trickle. The gradient is strongly
+   boosted on the terminal salve's reward slots and on the EOS token.
+   Causal passes alternate with EOS-lookahead passes (one lookahead in
+   four): under the lookahead attention mask, the decision position (token
+   76, whose head predicts a4) additionally attends the realized terminal
+   EOS token (position 172), and the EOS token attends only the decision
+   context and itself — so the WM learns the hindsight action (a4 given the
+   context and the EOS) on the same trunk, without letting the recorded a4
+   leak through the EOS key.
+5. **Surprise Filtering** — inference only, no gradient: the WM predicts
+   each surviving Addendum sequence. Error below threshold = familiar =
+   dropped; error at or above = surprising = kept. UI stats update
+   immediately, before Addendum training begins.
+6. **World Model Training on Addendum** (`wm_addendum`) — same impact
+   weighting and the same causal/lookahead alternation, on the surprising
+   survivors.
+7. **Policy Training** — supervised improvement by imitation of the WM's
+   hindsight action, verified by imagined rollouts (`train_policy`); every
+   step is recorded for the Dream Theater.
+8. **Final Consolidation** — surviving Addendum sequences commit into the
+   Coreset (`consolidate_addendum_into_coreset`), vivacity decay is applied,
+   coldest memories are evicted above capacity.
+
+## The EOS Token (dénouement)
+
+Position 172 of a training sequence carries the denouement delta the
+lookahead machinery conditions on. It is built at batch time (never recorded
+in salves) from the innate cost channels — effort, douleur, courbature,
+instabilité, vertige, confort — as the delta between the consequence salves
+s5..s10 (the six states produced by a4..a9, i.e. exactly the salves the
+imagination rolls out) and the decision salves s0..s4. The slots read
+0.5 = neutral (no change), below = recovery, above = worsening; the scale is
+calibrated on the measured dynamics so typical deltas use most of the range
+and crisis spikes saturate.
+
+- The slots stay raw per-channel deltas — the WM conditions on each
+  channel's outcome. Wherever the EOS is read as ONE scalar (relief score,
+  saliency anchor, Dream Theater display), the usual innate cost hierarchy
+  applies: douleur above vertige above courbature/instabilité above
+  effort/confort.
+- Time is weighted inversely to the remaining time-to-denouement
+  (hyperbolic), so the long-term outcome dominates and transient
+  post-action costs count little.
+- The interoception levels (fatigue, souffrance) are slow carriers at this
+  horizon — quasi-static over a decision window — and are masked from every
+  WM input.
+- Structurally it is a dedicated token type (intero modality, canal
+  orthogonal to the metabolic balance channel), so the WM can never confuse
+  the outcome aggregate with a recorded interoception snapshot.
 
 ## Policy Training (`Brain.train_policy`)
 
-Supervised policy improvement conditioned on World Model latent representations. The default path imitates the WM's **hindsight action** (EOS-lookahead supervision); the legacy stochastic-candidate machinery survives as an explicit fallback.
+Supervised policy improvement conditioned on World Model latent
+representations. The default path imitates the WM's **hindsight action**
+(EOS-lookahead supervision); the legacy stochastic-candidate machinery
+survives as an explicit fallback.
 
-- **Architecture & Input** (both paths):
-  - Multi-Layer Perceptron ($143 \to 256 \to 256 \to 256 \to 5$ with internal $\text{ReLU}$ activations).
-  - Input: 47 normalized non-reward sensory scalars (proprioception, touch, vision, cursor) concatenated with the 96-dim intermediate latent vector of the World Model ($143$ floats total).
-  - Output: 5 motor consignes $(\theta_{\text{front}}, d_{\text{front}}, \theta_{\text{back}}, d_{\text{back}}, \tau_{\text{tail}})$ squashed via $\tanh$ and $\text{sigmoid}$ into physical actuator ranges.
-
+- **Architecture & Input** (both paths): a 3×256 MLP; input = 45
+  non-reward sensory scalars (proprioception, touch, vision, ball)
+  concatenated with the normalized 64-dim intermediate latent of the World
+  Model (109 floats total). Output: 5 motor consignes squashed into
+  physical actuator ranges (tanh for angles, sigmoid for limb lengths).
 
 - **Real Context Sampling** (both paths):
-  - Training draws batches from the experience buffer via prioritized sampling (`self.buffer.sample_for_policy(batch)`).
-  - Prioritizes sequences demonstrating net biological recovery (EOS relief score $\text{relief} = -\Delta \text{souffrance} - 0.25 \cdot \Delta \text{fatigue}$) using stochastic weighted sampling without replacement ($w = \exp(2.0 \cdot \text{relief})$).
-  - Context window: 4 real past transitions $[s_0, a_0, s_1, a_1, s_2, a_2, s_3, a_3, s_4]$ (77 tokens).
-  - World Model inference extracts and normalizes the latent state representation at the decision state $s_4$.
+  - Batches are drawn from the buffer by prioritized sampling
+    (`sample_for_policy`). Priority = the relief score: the flat mean of
+    the cost channels over the decision window s0..s4 minus the
+    time-weighted aggregate over s5..s10 (the same time weights as the
+    EOS), scalarized under the usual innate cost hierarchy — i.e. the
+    realized denouement delta; recovery trajectories dominate.
+  - Context: 4 real past transitions plus the decision state s4 (77
+    tokens). The WM inference extracts and normalizes the latent at s4 —
+    the same latent the policy consumes at live wake, so training never
+    feeds out-of-distribution latents.
 
-
-- **Hindsight Supervision — EOS-lookahead** (`eos_lookahead=True`, default; ~3 rollout-equivalents per batch instead of the legacy 6):
-  - **Baseline rollout**: the policy's deterministic action $\pi$ acts on $s_4$ and the policy reacts in closed loop to each imagined state for 6 steps / 2.0s (sliding 77-token window, same latent as live wake). Discounted cost $C_{\pi} = c_0 + \sum_{k=1}^{5} \gamma^k c_k$ with $\gamma = 1.1$; the imagined salve-10 interoception token yields the predicted terminal EOS $\widehat{EOS}_{\pi}$.
-  - **Graduated relative forcing**: $EOS_{\text{forcé}} = \widehat{EOS}_{\pi} - \varepsilon$ with $\varepsilon \sim U(0.02, 0.10)$ per slot, in the favorable direction (automatic curriculum: targets tighten as the policy improves).
-  - **Hindsight generation**: $a_4$ is generated in one forward on a compact $[\text{context}, EOS]$ input — the EOS token carries the salve-10 positional encoding, so the decision query attends exactly the keys the training lookahead mask defines (mathematically identical conditioning).
-  - **Verification forward**: causal rollout of 6 steps with the generated $a_4$ → $C_{\text{gen}}$. One test, three roles: causality, reachability, graceful overshoot discovery.
-  - **Comparative acceptance**: $a_4$ becomes the supervised target only if $C_{\text{gen}} < C_{\pi} - \text{margin}$ (existing stability margin `_EXPLORE_MARGIN_PCT`); otherwise no optimizer step. $\mathcal{L} = \text{MSE}(\pi(\text{pol\_in}), a_{4,\text{généré}})$ over accepted samples only, gradient norm clipping ($1.0$), Adam step.
-  - **Fallbacks**: `--no-eos-lookahead` CLI flag / `eos_lookahead=False`; automatic fallback to the stochastic candidates when the horizon cannot reach the terminal salve ($\text{n\_imagine} < 6$) or after `_LOOKAHEAD_FALLBACK_STREAK` consecutive fully-rejected batches.
+- **Hindsight Supervision — EOS-lookahead** (default; about 3
+  rollout-equivalents per batch instead of the legacy 6):
+  - **Baseline rollout**: the policy's action acts on s4, then the policy
+    reacts in closed loop to each imagined state for 6 steps (sliding
+    77-token window). The accumulated cost is discounted (gamma > 1
+    amplifies long-horizon consequences) and the imagined salves yield the
+    predicted denouement delta (time-weighted consequence window minus the
+    decision-window baseline read from the real context).
+  - **Multiplicative forcing**: the predicted deviation from neutral is
+    forced a few percent (random, per slot) further toward the favorable
+    side — worsening shrinks toward neutral, recovery deepens — an automatic
+    curriculum that scales with what the policy itself predicts.
+  - **Hindsight generation**: a4 is generated in one forward on a compact
+    [context, EOS] input — the EOS token carries the salve-10 positional
+    encoding, so the decision query attends exactly the keys the training
+    lookahead mask defines (mathematically identical conditioning).
+  - **Verification forward**: causal rollout of the generated a4. One test,
+    three roles: causality, reachability, graceful overshoot discovery.
+  - **Comparative acceptance**: the generated a4 becomes the supervised
+    target only if its verified cost beats the baseline cost by the
+    exploration margin; otherwise no optimizer step. MSE toward accepted
+    samples only, gradient norm clipped, Adam step.
+  - **Fallbacks**: `--no-eos-lookahead` CLI flag; automatic fallback to the
+    stochastic candidates when the horizon cannot reach the terminal salve
+    or after consecutive fully-rejected batches.
 
 - **Legacy Stochastic Candidates** (fallback, `_train_policy_candidates`):
-  - 3 parallel candidates: policy baseline ($\pi$), recorded demonstration ($a_{\text{dataset}}$), Gaussian noise $\sigma = 0.30$ around $\pi$, all clamped to valid physical actuator limits.
-  - 2 future regimes over 6 steps / 2.0s at 3 Hz: *Kalman / Inertia* (action velocity $(a_2, a_3, a_4)$ damped by $0.8$), *Policy Closed-Loop*.
-  - Each state step incurs a biological cost (`_salve_cost_batch`); Bellman optimism takes the optimistic minimum across regimes: $C_{\text{cand}} = \min(C_{\text{Kalman}}, C_{\text{Policy}})$.
-  - Alternatives must beat the baseline by the same $0.1\%$ margin; the winner is detached as the supervised target.
+  - 3 parallel candidates: policy baseline, recorded demonstration,
+    Gaussian noise around the policy — all clamped to valid physical
+    actuator ranges.
+  - 2 future regimes over 6 imagined steps: Kalman/inertia (action
+    velocity damped) and policy closed-loop.
+  - Each imagined step incurs a biological cost; Bellman optimism takes
+    the optimistic minimum across regimes.
+  - A candidate must beat the baseline by the same exploration margin;
+    the winner is detached as the supervised target.
 
 - **Dream Theater Playback**:
-  - Per-step history of the sleep cycle, browsable with a step selector (`< PREV` / `NEXT >` / `LIVE` buttons, arrow keys; `LIVE` keeps following the newest step).
-  - Each hindsight step shows: the **lived sequence** $s_0 \to s_{10}$ (per-salve cost, realized EOS), the **WM completion** toward the forced EOS (real $s_0..s_3$ + generated $a_4$ + imagined $s_5..s_{10}$), and the **decision** compared side by side — what the policy infers on $s_4$ vs what the WM recommends, with costs, imagined EOS and accepted/rejected verdict.
-  - Loss, acceptance rate (`hindsight accepted/total`) and forced EOS in the header.
-  - Legacy fallback records keep the 6-trajectory (3 candidates $\times$ 2 regimes) tab-filterable storyboard.
+  - Per-step history of the sleep cycle, browsable with a step selector
+    (`< PREV` / `NEXT >` / `LIVE` buttons, arrow keys; `LIVE` keeps
+    following the newest step).
+  - Each hindsight step shows: the **lived sequence** s0→s10 (per-salve
+    cost, realized EOS), the **WM completion** toward the forced EOS (real
+    s0..s3 + generated a4 + imagined s5..s10), and the **decision**
+    side-by-side — what the policy infers on s4 vs what the WM recommends,
+    with costs, imagined EOS and accepted/rejected verdict.
+  - Loss, acceptance rate and forced EOS in the header.
+  - Legacy fallback records keep the candidate-by-regime storyboard,
+    tab-filterable.

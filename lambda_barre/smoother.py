@@ -9,7 +9,7 @@ Smoothing is a per-scalar decision: only noisy *derived* quantities (finite
 differences, impulse-based forces, thresholded cost spikes) are smoothed.
 Direct physical reads (positions, angles), signals already filtered or
 integrated inside their sensor (vertige, courbature, sons, fatigue), and
-reactivity-critical geometric signals (curseur_dir/prox) pass through raw —
+reactivity-critical geometric signals (ball_dir/prox) pass through raw —
 smoothing them would only add lag.
 
 This is the "compression temporelle" described in Lambda barre.md §
@@ -37,7 +37,8 @@ _SENSOR_KEYS = [k for k in _BY_KEY if k not in _ACTION_KEYS]
 # the filter acts as a ~1/3 s perceptual integration window.
 #   proprio: finite-difference accelerations + impulse-based forces
 #   reward: effort (power = force × velocity) and douleur (thresholded spikes)
-#   cursor: mouse velocity (finite difference, sampled at 30 Hz)
+#   ball: radial/angular velocity of the line of sight (finite difference,
+#     head-relative, sampled at 30 Hz)
 #   vision: optical flow (platform-rect differencing at 6 Hz)
 # Touch signals (contact_sol_*, collision_tronc_*) are deliberately NOT
 # smoothed: they must be instantaneous. Brief events falling between two WM
@@ -47,14 +48,14 @@ _SMOOTHED_KEYS = {
     "accel_tete_avant", "accel_tete_haut",
     "force_actuateur_avant", "force_actuateur_arriere", "couple_queue",
     "effort", "douleur",
-    "curseur_vx", "curseur_vy",
+    "ball_vr", "ball_va",
     "flux_surface", "flux_x", "flux_y",
 }
 # Everything else passes through raw (no lag): direct physics reads
 # (tronc_angle, queue_angle, membre_*, contact_sol_*, collision_tronc_*),
 # already-slow internal integrators (courbature, vertige, fatigue,
 # souffrance), direct geometric functions (instabilite, confort,
-# curseur_dir, curseur_prox), spatially-averaged retina cells (vis_c*), and
+# ball_dir, ball_prox), spatially-averaged retina cells (vis_c*), and
 # internally IIR-filtered sounds (son_*).
 
 
@@ -70,16 +71,16 @@ class Smoother:
         for k in self._state:
             self._state[k] = 0.0
 
-    def reinit(self, proprio: dict, touch: dict, cursor: dict,
+    def reinit(self, proprio: dict, touch: dict, ball: dict,
                vision: dict, intero: dict, reward: dict) -> None:
         """Immediately overwrite all filter states with the new sensor snapshot
         without EMA blending (used when a discrete reference-frame flip occurs)."""
         for k in _SENSOR_KEYS:
-            raw = self._lookup(k, proprio, touch, cursor, vision, intero, reward)
+            raw = self._lookup(k, proprio, touch, ball, vision, intero, reward)
             if raw is not None:
                 self._state[k] = raw
 
-    def update(self, proprio: dict, touch: dict, cursor: dict,
+    def update(self, proprio: dict, touch: dict, ball: dict,
                vision: dict, intero: dict, reward: dict, dt: float) -> None:
         """Update the IIR filters with the latest sensor readings.
 
@@ -87,7 +88,7 @@ class Smoother:
         (pass-through, no lag)."""
         alpha = dt / (self._tau + dt)
         for k in _SENSOR_KEYS:
-            raw = self._lookup(k, proprio, touch, cursor, vision, intero, reward)
+            raw = self._lookup(k, proprio, touch, ball, vision, intero, reward)
             if raw is None:
                 continue
             if k in _SMOOTHED_KEYS:
@@ -95,13 +96,13 @@ class Smoother:
             else:
                 self._state[k] = raw
 
-    def _lookup(self, key, proprio, touch, cursor, vision, intero, reward):
+    def _lookup(self, key, proprio, touch, ball, vision, intero, reward):
         if key in proprio:
             return proprio[key]
         if key in touch:
             return touch[key]
-        if key in cursor:
-            return cursor[key]
+        if key in ball:
+            return ball[key]
         if key in vision:
             return vision[key]
         if key in intero:
@@ -112,7 +113,8 @@ class Smoother:
 
     def salve(self, skel) -> list[list[float]]:
         """Produce a compressed salve from the smoothed sensor values +
-        current actuator consignes (read live from the skeleton)."""
+        current actuator effective values (read live from the skeleton —
+        what the physics is actually following, see body.py)."""
         return self._encoder.encode(
             self._state, self._state, self._state,
             self._state, self._state, self._state, skel)

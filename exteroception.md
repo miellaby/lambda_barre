@@ -8,16 +8,13 @@ mesure le monde extérieur. L'animat ne perçoit pas des abstractions informatiq
 discrètes (« fenêtre », « bouton », « souris », « clavier ») mais un petit
 nombre de valeurs continues, respectant l'égocentricité.
 
-Source : `Lambda barre.md` § "L'environnement sensoriel de λ̄" (l.195-258) et
-§ "Encodage de la perception" (l.313-352).
-
 ## Égocentricité et facing
 
 Même principe qu'en proprioception : le `facing` est une variable interne de
 miroir, jamais perçue. L'animal ignore s'il regarde à gauche ou à droite.
 
 Mais l'extéroception introduit une différence : l'environnement est **fixe dans
-le repère monde**, alors que le corps de l'animat se déplace et tourne. La
+le repère monde**, même si le corps de l'animat se déplace et tourne. La
 conversion se fait en deux temps :
 
 1. **Translation** : soustraire la position monde de la tête (point
@@ -33,8 +30,8 @@ dx_ego = facing * (stimulus_x - head_world.x)
 dy_ego = stimulus_y - head_world.y
 ```
 
-Aucune rotation par `torso.angle` : l'animat est un être 2D qui ne tourne que
-selon l'axe gauche/droite (facing). Le miroir facing suffit à égocentrer.
+Aucun influence de `torso.angle` : l'animat 2D ne tourne que
+selon l'axe gauche/droite (facing). Le miroir facing suffit.
 
 ## Vision
 
@@ -58,8 +55,7 @@ Soit 16 valeurs.
   cellule_16
 ```
 
-Ces informations rudimentaires permettent de distinguer une surface uniforme,
-un bord, un objet, du mouvement.
+Cela suffit pour distinguer une surface uniforme, un bord, un objet, du mouvement.
 
 ### Flux optique
 
@@ -72,40 +68,31 @@ et t. La surface qui a changé est la différence symétrique des rectangles :
 changed = area(old) + area(new) - 2 * area(intersection)
 ```
 
-Les plateformes immobiles contribuent 0 (l'intersection couvre tout le
-rectangle, donc la différence symétrique est nulle).
-
-Le barycentre de la zone changée est calculé géométriquement, puis égocentré :
+Le barycentre de la zone changée est calculé puis égocentré :
 
 - `flux_surface` : somme des surfaces changées (scalaire, sans miroir)
 - `flux_x` : `facing * (bx - head_x)` du barycentre, référentiel tête
 - `flux_y` : `by - head_y` du barycentre, référentiel tête
-
-```python
-[VISION]
-  ...
-  flux_optique   # (surface, dx_ego, dy_ego)
-```
 
 Cela restitue un flux optique grossier : « quelque chose de gros bouge à
 gauche/droite ».
 
 ## Mobile physique (ballon / balle)
 
-L'environnement physique Pymunk intègre un corps mobile dynamique (balle / ballon rouge, $r = 16\text{ px}$, masse $0.5\text{ kg}$) soumis à la gravité (`GRAVITY = -900 px/s²`), au rebond (`restitution = 0.75`) et au frottement de roulement, manipulable à la souris (saisie, lancer).
+L'environnement physique Pymunk intègre un corps mobile dynamique (balle rouge, $r = 16\text{ px}$, masse $0.5\text{ kg}$) soumis à la gravité (`GRAVITY = -900 px/s²`), au rebond (`restitution = 0.75`) et au frottement de roulement, manipulable à la souris (saisie, lancer).
 
 Les signaux du capteur mesurent la position et la vitesse de ce mobile dans le référentiel de la tête :
 
-- `curseur_dir` : `atan2(facing * dy, facing * dx)` — angle égocentré vers le ballon (devant = 0, [-π, +π]).
-- `curseur_prox` : `max_r / (max_r + r)` — proximité du ballon, décroît avec la distance mais s'aplatit (proche = 1, loin = ~0), simulant une résolution fovéale.
-- `curseur_vx` : `facing * ball_vx` — vitesse horizontale égocentrée du ballon.
-- `curseur_vy` : `ball_vy` — vitesse verticale du ballon.
+- `ball_dir` : `atan2(dy, facing * dx)` — angle égocentré vers le ballon (devant = 0, [-π, +π]).
+- `ball_prox` : `max_r / (max_r + r)` — proximité du ballon, décroît avec la distance mais s'aplatit (proche = 1, loin = ~0), simulant une résolution fovéale.
+- `ball_vr` : `dr/dt` — vitesse radiale du ballon relative à la tête (négatif = rapprochement, positif = éloignement) ; le mouvement propre de l'animat compte (avancer vers un ballon immobile lit un `ball_vr` négatif).
+- `ball_va` : `d(dir)/dt` — vitesse angulaire de la ligne de visée (rad/s), différence finie en plus court chemin à travers la couture ±π.
 
-La position est encodée en polaire (direction + proximité) et la vitesse reste cartésienne. Le ballon est également visible dans le cône rétinien de la **Vision** (détecté avec une intensité dynamique `DYNAMIC_GRAY = 0.90`) et peut heurter physiquement l'animat (perçu par le capteur de toucher).
+La position est encodée en polaire (direction + proximité) et la vitesse aussi (radiale + angulaire). Le ballon est également visible dans le cône rétinien de la **Vision** (détecté avec une intensité dynamique `DYNAMIC_GRAY = 0.90`) et peut heurter physiquement l'animat (perçu par le capteur de toucher).
 
 ```python
 [ENV]
-  curseur   # (dir, prox, vx, vy) égocentrés vers le mobile
+  ball      # (dir, prox, vr, va) égocentrés vers le mobile
 ```
 
 ## Toucher
@@ -148,7 +135,7 @@ la force normale scalaire suffit.
 
 Le son est perçu par 5 cellules fréquentielles, chacune produisant un scalaire
 normalisé sur [0, 1]. Le son est toujours émis depuis la position du mobile (ballon) :
-la proximité du mobile (`curseur_prox`) module l'intensité perçue.
+la proximité du mobile (`ball_prox`) module l'intensité perçue.
 
 ### Dynamique IIR
 
@@ -163,10 +150,10 @@ passe-bas à réponse impulsionnelle infinie (IIR) :
 L'intensité perçue d'une cellule est :
 
 ```
-intensité = min(1, (cps / cps_max) * curseur_prox)
+intensité = min(1, (cps / cps_max) * ball_prox)
 ```
 
-où `curseur_prox = max_r / (max_r + distance_tete_ballon)` (proche = 1,
+où `ball_prox = max_r / (max_r + distance_tete_ballon)` (proche = 1,
 loin = ~0). Ainsi un événement proche du ballon est fort, un événement lointain est faible, et la
 décroissance temporelle est gérée par le filtre IIR — pas d'enveloppe séparée.
 
@@ -204,7 +191,7 @@ index 27.
 
 ```python
 [ENV]
-  curseur   # (dir, prox, vx, vy, son_0, son_1, son_2, son_3, son_4)
+  ball      # (dir, prox, vr, va, son_0, son_1, son_2, son_3, son_4)
 ```
 
 L'audition de sa propre voix (vocalises) est un signal proprioceptif, pas

@@ -48,6 +48,7 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 - **Python Virtual Environment** in `.venv` with ML/physics dependencies `torch`, `pygame`, `pymunk`
 - Compile check: `.venv/bin/python -m py_compile <files>`.
 - App run: `.venv/bin/python -m lambda_barre.main --accel`
+- **Temporary scripts** (scratch checks, throwaway experiments) go in the `.tmp/` folder (gitignored), never at the repo root.
 - Torch **Checkpoints**: `buf_ckpt.pt` (experience buffer), `wm_ckpt.pt` (World Model), and `pol_ckpt.pt` (Policy)
 
 ## Rules for AI Agents

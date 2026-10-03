@@ -16,7 +16,7 @@ is thus ``list[list[float]]`` of length 16, each inner list length 25.
 Usage::
 
     enc = DenseEncoder()
-    salve = enc.encode(proprio, touch, cursor, vision, intero, reward, skel)
+    salve = enc.encode(proprio, touch, ball, vision, intero, reward, skel)
     # salve: 16 tokens x 25 floats
 """
 from __future__ import annotations
@@ -81,11 +81,11 @@ def _build_specs() -> dict[str, TokenSpec]:
     add("flux_x",       "FX", 150.0,  True)
     add("flux_y",       "FY", 150.0,  True)
 
-    # Env / cursor (9)
-    add("curseur_dir",  "CD", math.pi, True)
-    add("curseur_prox", "CP", 1.0,     False)
-    add("curseur_vx",   "CV", 1500.0,  True)
-    add("curseur_vy",   "CW", 1500.0,  True)
+    # Env / ball (9)
+    add("ball_dir",  "BD", math.pi, True)
+    add("ball_prox", "BP", 1.0,     False)
+    add("ball_vr",   "BR", 1500.0,  True)
+    add("ball_va",   "BW", 10.0,    True)
     add("son_0",        "S0", 1.0,     False)
     add("son_1",        "S1", 1.0,     False)
     add("son_2",        "S2", 1.0,     False)
@@ -100,7 +100,9 @@ def _build_specs() -> dict[str, TokenSpec]:
     add("collision_tronc_cx",   "TC", 200.0,  True)
     add("collision_tronc_cy",   "TD", 200.0,  True)
 
-    # Interoception (2) - signed delta in [-1.0, +1.0]
+    # Interoception (2) — absolute levels in [0, 1]: the carrier (onde
+    # porteuse) that the S4->S10 delta subtracts (see the dedicated EOS token
+    # in brain.py); masked from the WM inputs.
     add("fatigue",     "FT", 1.0, True)
     add("souffrance",  "SF", 1.0, True)
 
@@ -189,7 +191,7 @@ class ChannelSpec:
     modality: tuple                 # 4 floats
     canal: tuple                   # 4 floats
     signals: list[str] = field(default_factory=list)  # signal keys, in order
-    source: str = ""                # sensor dict: proprio/touch/cursor/vision/
+    source: str = ""                # sensor dict: proprio/touch/ball/vision/
                                     # intero/reward/action
 
 
@@ -218,12 +220,12 @@ def _build_layout() -> list[ChannelSpec]:
         ChannelSpec(4, False, _M_VISUAL, (1.0, 1.0, 1.0, 1.0),
                     [f"vis_c{i}" for i in range(1, 17)], "vision"),
         ChannelSpec(5, False, _M_VISUAL, (0.0, 0.0, 0.0, 1.0),
-                    ["curseur_dir", "curseur_prox", "curseur_vx",
-                     "curseur_vy"], "cursor"),
+                    ["ball_dir", "ball_prox", "ball_vr",
+                     "ball_va"], "ball"),
         ChannelSpec(6, False, _M_VISUAL, (0.0, 0.0, 1.0, 0.0),
                     ["flux_surface", "flux_x", "flux_y"], "vision"),
         ChannelSpec(7, False, _M_VISUAL, (0.0, 1.0, 0.0, 0.0),
-                    ["son_0", "son_1", "son_2", "son_3", "son_4"], "cursor"),
+                    ["son_0", "son_1", "son_2", "son_3", "son_4"], "ball"),
         ChannelSpec(8, False, _M_SOMATO, (0.0, 0.0, 0.0, 1.0),
                     ["contact_sol_avant", "contact_sol_arriere"], "touch"),
         ChannelSpec(9, False, _M_SOMATO, (0.0, 0.0, 1.0, 0.0),
@@ -234,7 +236,7 @@ def _build_layout() -> list[ChannelSpec]:
                      "vertige"], "reward"),
         ChannelSpec(11, False, _M_MOTIV, (1.0, 0.0, 0.0, 0.0),
                     ["confort"], "reward"),
-        ChannelSpec(12, False, _M_INTERO, (1.0, 1.0, 1.0, 1.0),
+        ChannelSpec(12, False, _M_INTERO, (0.0, 0.0, 0.0, 1.0),
                     ["fatigue", "souffrance"], "intero"),
         # --- motor (13..15) ---
         ChannelSpec(13, True, _M_ACTION, (0.0, 0.0, 0.0, 1.0),
@@ -255,7 +257,7 @@ _N_SIGNALS: list[int] = [len(ch.signals) for ch in _LAYOUT]
 # Index of the reward tokens and interoception within the state.
 _COST_IDX = 10        # "Coûts"  (effort, douleur, courbature, instabilite, vertige)
 _REWARD_IDX = 11      # "Récompense" (confort)
-_INTERO_IDX = 12      # "Intéroception" (delta fatigue, delta souffrance)
+_INTERO_IDX = 12      # "Intéroception" (fatigue, souffrance — niveaux absolus)
 
 # Signal-slot offset within a 25-dim token (type + modality + canal = 9).
 SIG_OFFSET = TYPE_DIM + MOD_DIM + CANAL_DIM   # 9
@@ -271,12 +273,17 @@ _ACTION_FLAT_LEN = sum(_N_SIGNALS[STATE_TOKENS:])   # 5
 N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 45
 
 # Per-token action-key → (skeleton attribute, field) lookup.
+# Action tokens record the EFFECTIVE actuator values (theta_eff / d_eff) —
+# the input the physics actually followed — not the consigne (theta_star /
+# d_star), which is only the convergence target of the motor smoothing
+# (body.py). This keeps the recorded (state, action) pairs causally exact:
+# the world model learns the dynamics of what was really applied.
 _ACTION_LOOKUP = {
-    "membre_avant_theta":   ("limb_front", "theta_star"),
-    "membre_avant_d":       ("limb_front", "d_star"),
-    "membre_arriere_theta": ("limb_back", "theta_star"),
-    "membre_arriere_d":     ("limb_back", "d_star"),
-    "queue_theta":   ("tail_act", "theta_star"),
+    "membre_avant_theta":   ("limb_front", "theta_eff"),
+    "membre_avant_d":       ("limb_front", "d_eff"),
+    "membre_arriere_theta": ("limb_back", "theta_eff"),
+    "membre_arriere_d":     ("limb_back", "d_eff"),
+    "queue_theta":   ("tail_act", "theta_eff"),
 }
 
 # Weights for each innate cost signal in salve_cost.
@@ -288,6 +295,14 @@ _COST_WEIGHTS = {
     "vertige": 3.0,
     "confort": 1.0,
 }
+
+# Per-slot channel weights of the EOS aggregate (brain.py): the usual innate
+# cost hierarchy — a douleur spike in the denouement weighs more than a
+# vertige wobble. Applies wherever the EOS is read as a scalar (relief score,
+# saliency anchor, Dream Theater display); the slots themselves stay raw
+# per-channel aggregates.
+_EOS_CHANNEL_W = ([_COST_WEIGHTS[k] for k in _COST_KEYS]
+                  + [_COST_WEIGHTS["confort"]])          # [1, 4, 2, 2, 3, 1]
 
 
 def _prefix(ch: ChannelSpec) -> list[float]:
@@ -394,10 +409,10 @@ class DenseEncoder:
     A salve is a list of 16 tokens, each a 25-float vector.
     """
 
-    def encode(self, proprio: dict, touch: dict, cursor: dict,
+    def encode(self, proprio: dict, touch: dict, ball: dict,
               vision: dict, intero: dict, reward: dict,
               skel) -> list[list[float]]:
-        dicts = {"proprio": proprio, "touch": touch, "cursor": cursor,
+        dicts = {"proprio": proprio, "touch": touch, "ball": ball,
                  "vision": vision, "intero": intero, "reward": reward}
         salve: list[list[float]] = []
         for ch in _LAYOUT:

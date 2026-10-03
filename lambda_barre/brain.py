@@ -37,6 +37,7 @@ from .dream import DreamStep, DreamTrajectory, DreamRecord, REGIME_NAMES
 from .models import build_salve_mask, KVCache
 from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
+                       _M_INTERO, _EOS_CHANNEL_W,
                        _COST_IDX, _REWARD_IDX, _INTERO_IDX, _COST_KEYS, _COST_WEIGHTS,
                        _BY_KEY, _LAYOUT, _prefix,
                        state_tokens, action_tokens, salve_cost)
@@ -54,12 +55,46 @@ _WM_REWARD_BOOST = 16.0                                      # gradient boost on
 _WM_LOOKAHEAD_PERIOD = 4                                     # WM mask alternation: 1 lookahead pass every 4 (3:1 causal:lookahead)
 # EOS-lookahead geometry (fixed by the sequence layout):
 #   _DECISION_POS: last state token of S4 — its head prediction is a4.
-#   _EOS_POS: terminal interoception token — the realized EOS (delta fatigue,
-#   delta souffrance) of the sequence window.
+#   _EOS_POS: terminal EOS token — the time-weighted window aggregate of the
+#   innate cost channels over the consequence salves s5..s10 (see _EOS_TIME_W).
+#   The interoception levels never enter it: they are the carrier, masked.
 _DECISION_POS = _N_CTX * SALVE_TOKENS + _INTERO_IDX          # 76
 _EOS_POS = SEQ_STEPS * SALVE_TOKENS + _INTERO_IDX             # 172
 _EOS_IMAGINE = 6                                             # imagined steps from s4 to the terminal salve s10
 _EOS_FORCE_EPS = (0.02, 0.10)                                # relative hindsight forcing: eps ~ U(lo, hi) per slot
+# Dedicated structural canal of the EOS token, orthogonal to the metabolic
+# balance canal (0,0,0,1) within the intero modality: bilan = (0,0,0,1),
+# EOS = (0,0,1,0). The WM can never confuse the terminal outcome with a
+# recorded interoception snapshot.
+_EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
+# EOS = the DENOUEMENT DELTA of the innate cost channels: the time-weighted
+# consequence window (s5..s10 — the 6 states produced by a4..a9, the same
+# salves the imagination rolls out) minus the flat decision window (s0..s4).
+# Slots: [effort, douleur, courbature, instabilite, vertige, confort], one
+# per channel, normalized so 0.5 = neutre (no change), < 0.5 = rétablissement,
+# > 0.5 = aggravation; full scale = +/- _EOS_DELTA_SCALE of raw cost-slot
+# delta (measured typical deltas ~ +/-0.05, crisis spikes saturate).
+# The slots stay raw per-channel deltas (the WM conditions on each channel's
+# outcome; the per-slot forcing scales the deviation from neutral); wherever
+# the EOS is read as ONE scalar (relief score, saliency anchor, Dream
+# Theater display), the usual innate cost hierarchy applies (_EOS_CHANNEL_W:
+# douleur x4 > vertige x3 > courbature/instabilite x2 > effort/confort x1).
+# TIME is weighted inversely to the remaining time-to-denouement (hyperbolic:
+# w = 1/steps left), so the long-term outcome dominates.
+_EOS_NSLOTS = 6
+_EOS_DELTA_SCALE = 0.15
+_EOS_TIME_W = [1.0 / (_EOS_IMAGINE - i) for i in range(_EOS_IMAGINE)]
+_EOS_TIME_W = [w / sum(_EOS_TIME_W) for w in _EOS_TIME_W]   # sums to 1
+_EOS_TIME_W_T = torch.tensor(_EOS_TIME_W, dtype=torch.float32)
+_EOS_CHANNEL_W_T = (torch.tensor(_EOS_CHANNEL_W, dtype=torch.float32)
+                    / sum(_EOS_CHANNEL_W))                   # sums to 1
+
+
+def _eos_delta_slot(d: float) -> float:
+    """Raw cost-slot delta -> EOS slot: 0.5 = no change, below = recovery,
+    above = worsening; full scale = +/- _EOS_DELTA_SCALE."""
+    t = max(-1.0, min(1.0, d / _EOS_DELTA_SCALE))
+    return (t + 1.0) / 2.0
 _LOOKAHEAD_FALLBACK_STREAK = 4                               # consecutive all-rejected batches before falling back
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
@@ -106,20 +141,25 @@ _ACT_TEMPLATE = torch.tensor(
 # Per-target-position valid-slot mask: position p predicts token p+1, whose
 # token index within a salve is (p+1) % 16 — only its first ``_N_SIGNALS[tidx]``
 # signal slots are real (the rest are zero-padded and excluded from the loss).
-# For Token 12 (interoception delta): intermediate salves (0..SEQ_STEPS-1) are
-# zero-padded and excluded from the loss; only the terminal salve
-# (position _SEQ_LEN - 2, predicting the final token 172) is trained.
+# For the interoception position (token 12): intermediate salves (0..SEQ_STEPS-1)
+# are zero-padded and excluded from the loss; only the terminal salve
+# (position _SEQ_LEN - 2, predicting the final token 172 = the EOS, 6 slots)
+# is trained.
 _target_valid = torch.zeros(_SEQ_LEN - 1, N_SIGNAL, dtype=torch.bool)
 for _p in range(_SEQ_LEN - 1):
     _tidx = (_p + 1) % SALVE_TOKENS
     if _tidx == _INTERO_IDX and (_p + 1) < (_SEQ_LEN - 1):
         continue
-    _target_valid[_p, :_N_SIGNALS[_tidx]] = True
+    # the terminal EOS token carries _EOS_NSLOTS valid slots (6), not the
+    # interoception token's 2
+    _n = _EOS_NSLOTS if (_p + 1) == (_SEQ_LEN - 1) else _N_SIGNALS[_tidx]
+    _target_valid[_p, :_n] = True
 
 # Float loss weights: 1.0 on every valid slot, boosted (_WM_REWARD_BOOST) on
 # the terminal salve's reward channels (costs token 10, confort token 11) and
-# on the terminal EOS interoception delta (token 12 of salve 10) — the signals
-# the policy's Bellman cost and relief sampling actually consume. The
+# on the terminal EOS token (the time-weighted cost aggregate at salve 10's
+# intero position) — the signals the policy's Bellman cost and relief
+# sampling actually consume. The
 # denominator sum(w) in the loss self-scales the magnitude, so the overall
 # step size and the wm_target_loss thresholds keep their meaning: no
 # per-token-type normalization is needed. The boolean ``_target_valid`` above
@@ -129,10 +169,12 @@ for _p in range(_SEQ_LEN - 1):
     _tidx = (_p + 1) % SALVE_TOKENS
     if _tidx == _INTERO_IDX and (_p + 1) < (_SEQ_LEN - 1):
         continue
-    _target_weight[_p, :_N_SIGNALS[_tidx]] = 1.0
+    _n = _EOS_NSLOTS if (_p + 1) == (_SEQ_LEN - 1) else _N_SIGNALS[_tidx]
+    _target_weight[_p, :_n] = 1.0
 for _tidx in (_COST_IDX, _REWARD_IDX, _INTERO_IDX):
     _p = SEQ_STEPS * SALVE_TOKENS + _tidx - 1
-    _target_weight[_p, :_N_SIGNALS[_tidx]] = _WM_REWARD_BOOST
+    _n = _EOS_NSLOTS if _tidx == _INTERO_IDX else _N_SIGNALS[_tidx]
+    _target_weight[_p, :_n] = _WM_REWARD_BOOST
 
 # Salve-within-type attention mask for the fixed training sequence.
 _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
@@ -168,17 +210,19 @@ def build_lookahead_gen_mask(ctx_len: int, device) -> torch.Tensor:
     return m
 
 
-# Structural template of the terminal EOS (interoception delta) token: prefix
-# of the intero channel with zeroed signal slots.
-_EOS_TEMPLATE = torch.tensor(_prefix(_LAYOUT[_INTERO_IDX]) + [0.0] * N_SIGNAL,
-                             dtype=torch.float32)
+# Structural template of the terminal EOS token: intero modality, dedicated
+# canal, state type, zeroed signal slots (filled with the 6 cost-aggregate
+# slots at batch time / generation time).
+_EOS_TEMPLATE = torch.tensor(
+    [0.0] + list(_M_INTERO) + list(_EOS_CANAL) + [0.0] * N_SIGNAL,
+    dtype=torch.float32)
 
 # Channels tracked for static detection:
 #   - animal: proprioception (tokens 0..3) and touch (tokens 8..9)
-#   - environnement: vision (tokens 4, 6), cursor/sound (tokens 5, 7), touch (tokens 8..9)
+#   - environnement: vision (tokens 4, 6), ball/sound (tokens 5, 7), touch (tokens 8..9)
 #   - consignes: action (tokens 13..15)
 # Excludes reward/cost accumulators (tokens 10, 11) and interoception (token 12).
-_STATIC_SOURCES = {"proprio", "touch", "cursor", "vision", "action"}
+_STATIC_SOURCES = {"proprio", "touch", "ball", "vision", "action"}
 _STATIC_TOKENS = tuple(ch.idx for ch in _LAYOUT if ch.source in _STATIC_SOURCES)
 
 
@@ -728,12 +772,40 @@ class ExperienceBuffer:
             samples.append(seq)
         return samples
 
-    def sample_for_policy(self, batch: int, beta: float = 2.0,
-                          fatigue_weight: float = 0.25) -> list[list[list[float]]]:
-        """Sample ``batch`` sequences prioritized by suffering and fatigue reduction.
+    def _sequence_relief(self, seq: list) -> float:
+        """Relief score of one stored sequence: innate-cost-hierarchy-weighted
+        mean over the EOS channels of (flat mean over the decision window
+        s0..s4) - (time-weighted mean over the consequence window s5..s10,
+        weights _EOS_TIME_W). Positive = the long-term denouement is cheaper
+        than the pre-decision window. Returns 0.0 for short or malformed
+        sequences."""
+        if len(seq) < SEQ_STEPS + 1:
+            return 0.0
+        try:
+            early = [0.0] * _EOS_NSLOTS
+            for salve in seq[:_N_CTX + 1]:
+                for j in range(5):
+                    early[j] += salve[_COST_IDX][SIG_OFFSET + j] / (_N_CTX + 1)
+                early[5] += salve[_REWARD_IDX][SIG_OFFSET] / (_N_CTX + 1)
+            late = [0.0] * _EOS_NSLOTS
+            for i, salve in enumerate(seq[_N_CTX + 1:]):
+                w = _EOS_TIME_W[i]
+                for j in range(5):
+                    late[j] += w * salve[_COST_IDX][SIG_OFFSET + j]
+                late[5] += w * salve[_REWARD_IDX][SIG_OFFSET]
+            # scalar relief under the usual innate cost hierarchy
+            return sum(w * (e - l) for w, e, l in
+                       zip(_EOS_CHANNEL_W, early, late)) / sum(_EOS_CHANNEL_W)
+        except (IndexError, TypeError):
+            return 0.0
 
-        Higher probability is given to sequences where suffering (and secondarily fatigue)
-        decreased across the sequence window (delta = end - start < 0).
+    def sample_for_policy(self, batch: int, beta: float = 2.0) -> list[list[list[float]]]:
+        """Sample ``batch`` sequences prioritized by long-term cost relief.
+
+        Higher probability is given to sequences whose consequence window
+        (s5..s10, time-weighted like the EOS — the long term dominates) is
+        cheaper than the decision window before it (s0..s4): recovery
+        trajectories. Channels carry equally (no salve_cost weighting).
         Uses weighted stochastic sampling without replacement (Efraimidis-Spirakis).
         """
         pool = list(self._coreset) + self._addendum
@@ -745,14 +817,7 @@ class ExperienceBuffer:
         k = min(batch, len(pool))
         weights = []
         for seq in pool:
-            if len(seq) >= 2 and len(seq[0]) > _INTERO_IDX and len(seq[0][_INTERO_IDX]) > SIG_OFFSET + 1:
-                s0_int = seq[0][_INTERO_IDX]
-                send_int = seq[-1][_INTERO_IDX]
-                d_fat = send_int[SIG_OFFSET] - s0_int[SIG_OFFSET]
-                d_sf = send_int[SIG_OFFSET + 1] - s0_int[SIG_OFFSET + 1]
-                relief = -d_sf - fatigue_weight * d_fat
-            else:
-                relief = 0.0
+            relief = self._sequence_relief(seq)
             relief_clamped = max(-1.0, min(1.0, relief))
             weights.append(math.exp(beta * relief_clamped))
 
@@ -802,6 +867,8 @@ class Brain:
         self.mask = _MASK.to(self.device)
         self.mask_lookahead = _MASK_LOOKAHEAD.to(self.device)
         self._eos_tmpl = _EOS_TEMPLATE.to(self.device)
+        self._eos_w = _EOS_TIME_W_T.to(self.device)     # hyperbolic time weights
+        self._eos_cw = _EOS_CHANNEL_W_T.to(self.device)  # innate channel weights
         self.target_valid = _target_valid.to(self.device)
         self.target_weight = _target_weight.to(self.device)
         # WM training step: eager by default, optionally compiled as one
@@ -877,8 +944,9 @@ class Brain:
     @torch.inference_mode()
     def wake_tick(self, salve) -> None:
         """World model tick: run a forward pass on the rolling history +
-        current salve to produce a fresh latent for the policy. Also journals
-        the transition into the experience buffer."""
+        current salve to produce a fresh latent for the policy. This is the
+        perceptual pass — it runs every WM tick, brain on or off, so the
+        policy's observation is never stale (journaling is done by record)."""
         self.mode = "wake"
         cur_state = state_tokens(salve)
         a_toks = action_tokens(salve)
@@ -1064,23 +1132,40 @@ class Brain:
                     pos += ACTION_TOKENS
             assert pos == _SEQ_LEN, f"Expected pos={_SEQ_LEN}, got {pos}"
 
-            # Zero-padding for intermediate Token 12 (interoception) in salves 0..SEQ_STEPS-1
+            # Zero-padding for intermediate Token 12 (interoception) in salves
+            # 0..SEQ_STEPS-1. The fatigue/souffrance absolute level is the
+            # CARRIER (onde porteuse) of the outcome signal: a slow baseline
+            # with no effect on the simulation (excluded from the policy
+            # inputs). Masking it from every input keeps the carrier from
+            # leaking back in as a spurious baseline.
             for k in range(SEQ_STEPS):
                 p_intero = k * SALVE_TOKENS + _INTERO_IDX
                 vals[b, p_intero, SIG_OFFSET:] = 0.0
 
-            # Terminal Token 12 in salve SEQ_STEPS: compute delta between s_last and s_0
+            # Terminal EOS token (position _EOS_POS): the DENOUEMENT DELTA the
+            # hindsight mechanism conditions on — per innate cost channel,
+            # the time-weighted consequence window (s5..s10, hyperbolic
+            # weights: the long term dominates) minus the flat decision
+            # window (s0..s4). Slots normalized 0.5 = neutre, < 0.5 =
+            # rétablissement, > 0.5 = aggravation.
             p_final = SEQ_STEPS * SALVE_TOKENS + _INTERO_IDX
-            s0_intero = seq[0][_INTERO_IDX]
-            s_last_intero = seq[-1][_INTERO_IDX]
-            f0, sf0 = s0_intero[SIG_OFFSET], s0_intero[SIG_OFFSET + 1]
-            f_last, sf_last = s_last_intero[SIG_OFFSET], s_last_intero[SIG_OFFSET + 1]
-            # Signed delta normalized to [0, 1]: (delta + 1.0) / 2.0
-            d_fat = max(0.0, min(1.0, (f_last - f0 + 1.0) / 2.0))
-            d_sf = max(0.0, min(1.0, (sf_last - sf0 + 1.0) / 2.0))
-            vals[b, p_final, SIG_OFFSET] = d_fat
-            vals[b, p_final, SIG_OFFSET + 1] = d_sf
-            vals[b, p_final, SIG_OFFSET + 2:] = 0.0
+            early_cost = [k * SALVE_TOKENS + _COST_IDX for k in range(_N_CTX + 1)]
+            late_cost = [k * SALVE_TOKENS + _COST_IDX
+                         for k in range(_N_CTX + 1, SEQ_STEPS + 1)]
+            early_rew = [k * SALVE_TOKENS + _REWARD_IDX for k in range(_N_CTX + 1)]
+            late_rew = [k * SALVE_TOKENS + _REWARD_IDX
+                        for k in range(_N_CTX + 1, SEQ_STEPS + 1)]
+            vals[b, p_final, :SIG_OFFSET] = self._eos_tmpl[:SIG_OFFSET]
+            early_c = vals[b, early_cost, SIG_OFFSET:SIG_OFFSET + 5].mean(dim=0)
+            late_c = (vals[b, late_cost, SIG_OFFSET:SIG_OFFSET + 5]
+                      * self._eos_w[:, None]).sum(dim=0)
+            d_c = ((late_c - early_c) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
+            vals[b, p_final, SIG_OFFSET:SIG_OFFSET + 5] = (d_c + 1.0) / 2.0
+            early_k = vals[b, early_rew, SIG_OFFSET].mean()
+            late_k = (vals[b, late_rew, SIG_OFFSET] * self._eos_w).sum()
+            d_k = ((late_k - early_k) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
+            vals[b, p_final, SIG_OFFSET + 5] = (d_k + 1.0) / 2.0
+            vals[b, p_final, SIG_OFFSET + _EOS_NSLOTS:] = 0.0
         return vals
 
     def _wm_loss_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -1220,10 +1305,12 @@ class Brain:
     def compute_saliency_weights(self, sequences: list[list[list[float]]] | None = None,
                                  batch_size: int = 32,
                                  floor_pct: float = 0.05) -> torch.Tensor:
-        """Compute sequence feature sensitivity weights [2816] backpropagated from terminal EOS delta.
+        """Compute sequence feature sensitivity weights [2816] backpropagated
+        from the terminal EOS token.
 
-        Uses the World Model's autograd gradients on the terminal interoception token
-        (position _SEQ_LEN - 2, predicting token 172: delta fatigue and delta pain).
+        Uses the World Model's autograd gradients on the terminal EOS
+        prediction (position _SEQ_LEN - 2, predicting token 172: the
+        time-weighted innate cost aggregate, 6 slots).
 
         Returns a 1D tensor of shape [2816] with mean == 1.0, suitable for weighted RMSE distance.
         If buffer is empty and no sequences provided, returns uniform ones tensor.
@@ -1244,9 +1331,11 @@ class Brain:
         vals = self._batch_tensors(seqs_sample).detach().requires_grad_(True)
         pred = self.world(vals, attn_mask=self.mask)
 
-        # Target: terminal EOS delta predictions (position _SEQ_LEN - 2 predicts token 172)
-        # slot 0 = delta fatigue, slot 1 = delta souffrance
-        eos_delta = pred[:, _SEQ_LEN - 2, 0] + pred[:, _SEQ_LEN - 2, 1]
+        # Target: the terminal EOS token prediction (position _SEQ_LEN - 2
+        # predicts token 172) — the denouement delta, scalarized as the
+        # channel-hierarchy-weighted deviation from neutral (0.5).
+        eos_delta = ((pred[:, _SEQ_LEN - 2, :_EOS_NSLOTS] * self._eos_cw).sum(dim=-1)
+                     - 0.5)
 
         # Vectorized backward pass across all sample sequences
         grad_out = torch.autograd.grad(eos_delta.sum(), vals)[0]  # [B, 173, 25]
@@ -1531,11 +1620,11 @@ class Brain:
 
         ``eos_lookahead=True`` (default) — efficient hindsight supervision: the
         policy's own action is rolled out to get the baseline cost C_pi and
-        the imagined terminal EOS; a slightly more favorable EOS is forced
-        (graduated relative forcing); the WM's lookahead mode generates the
-        action associated with that outcome; a causal verification rollout
-        accepts it only if it actually reduces the imagined cost. ~3
-        rollout-equivalents per batch instead of the legacy 6.
+        the imagined denouement delta (EOS); its deviation from neutral is
+        forced eps-proportionally more favorable; the WM's lookahead mode
+        generates the action associated with that outcome; a causal
+        verification rollout accepts it only if it actually reduces the
+        imagined cost. ~3 rollout-equivalents per batch instead of the legacy 6.
 
         ``eos_lookahead=False`` — legacy stochastic-candidate machinery,
         kept alive as a fallback. Also selected automatically when the
@@ -1599,12 +1688,13 @@ class Brain:
         return steps
 
     def _build_eos_token(self, eos_vals: torch.Tensor) -> torch.Tensor:
-        """Terminal EOS (interoception delta) token [B, 25] from normalized
-        (delta fatigue, delta souffrance) values in [0, 1]."""
+        """Terminal EOS token [B, 25] from normalized cost-aggregate slots in
+        [0, 1] (lower = better): [effort, douleur, courbature, instabilite,
+        vertige, confort]."""
         B = eos_vals.shape[0]
         tok = self._eos_tmpl.unsqueeze(0).expand(B, -1).clone()
-        tok[:, SIG_OFFSET] = eos_vals[:, 0]
-        tok[:, SIG_OFFSET + 1] = eos_vals[:, 1]
+        n = min(_EOS_NSLOTS, eos_vals.shape[1])
+        tok[:, SIG_OFFSET:SIG_OFFSET + n] = eos_vals[:, :n]
         return tok
 
     def _rollout_candidate(self, ctx, base_cache, action, s4_toks, n_imagine,
@@ -1614,16 +1704,25 @@ class Brain:
         sliding window and latent as live wake, avoiding out-of-distribution
         latents) for n_imagine - 1 more steps.
 
-        Returns (cost [B], predicted terminal EOS [B, 2] or None, dream steps).
-        The cost is C = c(s5) + sum_k gamma^k c(s_{5+k}); the predicted EOS is
-        read from the imagined salve-10 interoception token (the head
-        prediction at position 171, the same slot the WM is trained on with
-        the reward boost) — available only when the rollout reaches the
-        terminal salve (n_imagine >= _EOS_IMAGINE)."""
+        Returns (cost [B], predicted terminal EOS [B, _EOS_NSLOTS] or None,
+        dream steps). The cost is C = c(s5) + sum_k gamma^k c(s_{5+k}); the
+        predicted EOS is the DENOUEMENT DELTA: the time-weighted aggregate of
+        the imagined salves' innate cost channels (s5 carries _EOS_TIME_W[0],
+        ..., s10 carries _EOS_TIME_W[5]) minus the flat decision-window
+        baseline read from the real context (s0..s4) — the same delta the WM
+        is trained to predict at position 171 with the reward boost.
+        Available only when the rollout reaches the terminal salve
+        (n_imagine >= _EOS_IMAGINE)."""
         action_toks = self._encode_action_batch(action)
         dream_steps = [DreamStep(state_tokens=s4_toks, action=action[0].tolist(),
                                  label="s4+cand")]
         eos_pred = None
+        # flat decision-window baseline (s0..s4) from the real context
+        e_cost = [k * SALVE_TOKENS + _COST_IDX for k in range(_N_CTX + 1)]
+        e_rew = [k * SALVE_TOKENS + _REWARD_IDX for k in range(_N_CTX + 1)]
+        eos_early = torch.zeros(ctx.shape[0], _EOS_NSLOTS, device=ctx.device)
+        eos_early[:, :5] = ctx[:, e_cost, SIG_OFFSET:SIG_OFFSET + 5].mean(dim=1)
+        eos_early[:, 5] = ctx[:, e_rew, SIG_OFFSET].mean(dim=1)
         if use_kv_cache:
             cache = base_cache.clone()
             with torch.inference_mode():
@@ -1635,14 +1734,25 @@ class Brain:
                 s = self.world.predict_next_state(cand_ctx)
         c0 = self._salve_cost_batch(s)
         cost = c0.clone()
+        # time-weighted accumulation over the imagined salves (s5 = first
+        # imagined state, weight _EOS_TIME_W[0] — the long term dominates)
+        eos_acc = torch.zeros(s.shape[0], _EOS_NSLOTS, device=s.device)
+        eos_acc[:, :5] += self._eos_w[0] * s[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+        eos_acc[:, 5] += self._eos_w[0] * s[:, _REWARD_IDX, SIG_OFFSET]
+        eos_wsum = self._eos_w[0]
+
+        def _eos_finalize():
+            d = ((eos_acc / eos_wsum - eos_early) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
+            return ((d + 1.0) / 2.0).clamp(0.0, 1.0)
+
         s_zeroed = s.clone()
         s_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
         if use_kv_cache:
             hist = torch.cat([ctx, action_toks, s_zeroed], dim=1)
         else:
             cand_ctx = torch.cat([cand_ctx, s_zeroed], dim=1)
-        if 1 == _EOS_IMAGINE:
-            eos_pred = s[:, _INTERO_IDX, SIG_OFFSET:SIG_OFFSET + 2].clamp(0.0, 1.0)
+        if n_imagine == 1:
+            eos_pred = _eos_finalize()
         cur_state = s
         cur_state_toks = s[0].tolist()
         cur_cost_val = c0[0].item()
@@ -1674,8 +1784,11 @@ class Brain:
                 hist = torch.cat([hist, next_a_toks, gen_zeroed], dim=1)
             else:
                 cand_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
+            eos_acc[:, :5] += self._eos_w[k] * gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+            eos_acc[:, 5] += self._eos_w[k] * gen[:, _REWARD_IDX, SIG_OFFSET]
+            eos_wsum = eos_wsum + self._eos_w[k]
             if k + 1 == _EOS_IMAGINE:
-                eos_pred = gen[:, _INTERO_IDX, SIG_OFFSET:SIG_OFFSET + 2].clamp(0.0, 1.0)
+                eos_pred = _eos_finalize()
             cur_state = gen
             cur_state_toks = gen[0].tolist()
             cur_cost_val = sc[0].item()
@@ -1735,11 +1848,11 @@ class Brain:
                                 step_idx, total_steps):
         """One policy step under hindsight supervision (see ``train_policy``).
 
-        Baseline rollout of the policy action -> (C_pi, imagined EOS);
-        graduated relative forcing of the EOS; hindsight generation of a4;
-        causal verification rollout; purely comparative acceptance. Returns
-        (updated, loss): updated=False means no sample was accepted and no
-        optimizer step was taken."""
+        Baseline rollout of the policy action -> (C_pi, imagined EOS delta);
+        multiplicative forcing of its deviation from neutral; hindsight
+        generation of a4; causal verification rollout; purely comparative
+        acceptance. Returns (updated, loss): updated=False means no sample
+        was accepted and no optimizer step was taken."""
         sequences = self.buffer.sample_for_policy(batch)
         if not sequences:
             return True, 0.0
@@ -1772,12 +1885,15 @@ class Brain:
             ctx, base_cache, policy_action, s4_toks, n_imagine, gamma,
             ctx_len, ctx_mask, use_kv_cache)
 
-        # 3. graduated relative forcing: ask for a slightly more favorable
-        #    outcome than the policy's own prediction (automatic curriculum:
-        #    the target tightens as the policy improves)
+        # 3. multiplicative forcing on the deviation from neutral: make the
+        #    predicted denouement deviation eps-proportionally more favorable
+        #    (worsening shrinks toward 0.5, recovery deepens below it) — the
+        #    request scales with what the policy itself predicts, at any
+        #    delta magnitude (automatic curriculum)
         lo, hi = _EOS_FORCE_EPS
-        eps = torch.rand(B, 2, device=device) * (hi - lo) + lo
-        eos_forced = (eos_pi - eps).clamp(0.0, 1.0)
+        eps = torch.rand(B, _EOS_NSLOTS, device=device) * (hi - lo) + lo
+        d = eos_pi - 0.5
+        eos_forced = (eos_pi - eps * d.abs()).clamp(0.0, 1.0)
 
         # 4. hindsight generation of a4 under the forced EOS + causal
         #    verification rollout (causality, reachability and graceful
@@ -1850,7 +1966,7 @@ class Brain:
             eos_forced=eos_forced[0].tolist(),
             lived_steps=lived_steps,
             predicted_steps=predicted_steps,
-            eos_realized=vals[0, _EOS_POS, SIG_OFFSET:SIG_OFFSET + 2].tolist(),
+            eos_realized=vals[0, _EOS_POS, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS].tolist(),
         )
         return updated, loss_val
 

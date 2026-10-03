@@ -26,6 +26,15 @@ spring to a moving target point is the stable, faithful realisation of the
 two-DOF (angle, length) consigne; the separate k_theta / k_d gains of the doc
 are approximated here by the spring's stiffness and damping and can be split
 into independent angular/radial gains in a later stage.
+
+Motor smoothing (consigne convergence):
+  The physics never follows the raw consigne directly. Each actuator carries
+  an *effective* value (theta_eff, d_eff) that is what actually enters the
+  physics; it converges linearly toward the consigne, closing CONSIGNE_RATE
+  of the remaining gap per policy period (POLICY_DT = 1/6 s). A brutal scalar
+  change (joystick grab, policy spike) therefore ramps into the physics
+  instead of yanking it. apply_consignes(dt <= 0) snaps the effective values
+  onto the consignes (initial pose, reset).
 """
 from __future__ import annotations
 
@@ -106,6 +115,13 @@ TORSO_TYPE = 3
 # the tail/head/ears back and forth.
 FACING_DEADZONE = math.radians(15.0)
 
+# --- consigne convergence (motor smoothing) ----------------------------------
+# Fraction of the remaining gap between the effective (applied) value and the
+# consigne that is closed per policy period. 0.5 = linear convergence: half
+# the remaining error every 1/6 s (t90 ≈ 0.5 s, t99 ≈ 1 s).
+CONSIGNE_RATE = 0.5
+POLICY_DT = 1.0 / 6.0          # policy cadence — 6 Hz
+
 
 def _animat_filter() -> pymunk.ShapeFilter:
     return pymunk.ShapeFilter(group=ANIMAT_GROUP)
@@ -118,9 +134,13 @@ class LimbActuator:
     theta_star: target angle of the limb, radians, measured from torso's
         downward axis (so 0 = foot straight down, pi/2 = foot forward).
     d_star: target foot distance from the hip.
+    theta_eff / d_eff: effective (applied) values actually pushed into the
+        physics; they converge toward the consignes in apply_consignes.
     """
     theta_star: float = 0.0    # straight down
     d_star: float = 20.0
+    theta_eff: float = 0.0
+    d_eff: float = 20.0
 
     def clamp(self) -> None:
         if self.d_star < LIMB_MIN:
@@ -132,6 +152,7 @@ class LimbActuator:
 @dataclass
 class TailActuator:
     theta_star: float = 0.0   # radians relative to torso
+    theta_eff: float = 0.0
 
 
 @dataclass
@@ -362,8 +383,42 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
     return skel
 
 
-def apply_consignes(skel: Skeleton) -> None:
+def _converge_angle(eff: float, star: float, f: float) -> float:
+    """Advance eff toward star by fraction f of the gap, shortest-path across
+    the +/-pi seam so a wrap-around jump never sweeps the actuator the long
+    way around."""
+    delta = (star - eff + math.pi) % (2.0 * math.pi) - math.pi
+    return eff + f * delta
+
+
+def converge_consignes(skel: Skeleton, dt: float) -> None:
+    """Advance the effective (applied) actuator values toward the consignes.
+
+    dt > 0 closes CONSIGNE_RATE of the remaining gap per policy period,
+    scaled to dt. dt <= 0 snaps the effective values onto the consignes
+    (initial pose, reset). The consignes themselves are never modified."""
+    if dt <= 0.0:
+        for act in (skel.limb_l, skel.limb_r):
+            act.theta_eff = act.theta_star
+            act.d_eff = act.d_star
+        skel.tail_act.theta_eff = skel.tail_act.theta_star
+        return
+    f = 1.0 - CONSIGNE_RATE ** (dt / POLICY_DT)
+    for act in (skel.limb_l, skel.limb_r):
+        act.theta_eff = _converge_angle(act.theta_eff, act.theta_star, f)
+        act.d_eff += f * (act.d_star - act.d_eff)
+    skel.tail_act.theta_eff = _converge_angle(skel.tail_act.theta_eff,
+                                              skel.tail_act.theta_star, f)
+
+
+def apply_consignes(skel: Skeleton, dt: float = 0.0) -> None:
     """Push the current consignes into the physics.
+
+    The consignes are first converged into the effective values (motor
+    smoothing, see module docstring); the physics follows theta_eff / d_eff
+    — never the raw consigne. The recorded action tokens (tokenize) read
+    these effective values, so the world model learns the dynamics of what
+    was actually applied.
 
     For each hind limb we compute the target foot point in the torso frame and
     move the torso-side spring anchor there, with rest_length 0 so the spring
@@ -371,6 +426,7 @@ def apply_consignes(skel: Skeleton) -> None:
     directly (servo): ±90° from the torso depending on facing direction, plus
     theta_star as offset. Infinite moment means no torque perturbs it.
     """
+    converge_consignes(skel, dt)
     skel.limb_l.clamp()
     skel.limb_r.clamp()
     # lock foot rotation: infinite moment + force angle to 0 each frame
@@ -382,17 +438,17 @@ def apply_consignes(skel: Skeleton) -> None:
         (skel.limb_l, skel.foot_shape_l),
         (skel.limb_r, skel.foot_shape_r),
     ):
-        # friction proportional to leg extension: a fully extended leg (d_star
-        # near LIMB_MAX) grips hard, a retracted leg (d_star near LIMB_MIN)
+        # friction proportional to leg extension: a fully extended leg (d_eff
+        # near LIMB_MAX) grips hard, a retracted leg (d_eff near LIMB_MIN)
         # slips. This makes forward locomotion possible.
-        t = (act.d_star - LIMB_MIN) / (LIMB_MAX - LIMB_MIN)
+        t = (act.d_eff - LIMB_MIN) / (LIMB_MAX - LIMB_MIN)
         shape.friction = 0.2 + t * 16.0
     for hip_local, act, spring in (
         (HIP_L, skel.limb_l, skel.spring_l),
         (HIP_R, skel.limb_r, skel.spring_r),
     ):
-        tx = hip_local[0] + act.d_star * -math.sin(act.theta_star)
-        ty = hip_local[1] + act.d_star * -math.cos(act.theta_star)
+        tx = hip_local[0] + act.d_eff * -math.sin(act.theta_eff)
+        ty = hip_local[1] + act.d_eff * -math.cos(act.theta_eff)
         spring.anchor_a = (tx, ty)
         spring.rest_length = 0.0
     # facing direction: thermostat hysteresis on ±15°. Only flip when the torso
@@ -403,7 +459,7 @@ def apply_consignes(skel: Skeleton) -> None:
     elif skel.facing == -1 and skel.torso.angle < -FACING_DEADZONE:
         skel.facing = 1
     sgn = -skel.facing
-    skel.tail_spring.rest_angle = -sgn * (math.pi / 2) + skel.facing * skel.tail_act.theta_star
+    skel.tail_spring.rest_angle = -sgn * (math.pi / 2) + skel.facing * skel.tail_act.theta_eff
     # front legs: instant angular servo toward facing direction
     front_base = -sgn * (math.pi / 2 - FRONT_REST)
     skel.front_l.angle = skel.torso.angle + front_base + sgn * 0.12

@@ -267,11 +267,12 @@ def test_lookahead_generation_is_eos_conditioned():
                           salve_positions=salve_pos)
             return out[:, brain_mod._DECISION_POS, :]
 
-        logits_good = decision_logits(torch.full((B, 2), 0.2))
-        logits_bad = decision_logits(torch.full((B, 2), 0.9))
+        logits_good = decision_logits(torch.full((B, brain_mod._EOS_NSLOTS), 0.2))
+        logits_bad = decision_logits(torch.full((B, brain_mod._EOS_NSLOTS), 0.9))
         assert (logits_good - logits_bad).abs().max().item() > 1e-3
 
-        toks_good = b._lookahead_generate(ctx, base_cache, torch.full((B, 2), 0.2), True)
+        toks_good = b._lookahead_generate(
+            ctx, base_cache, torch.full((B, brain_mod._EOS_NSLOTS), 0.2), True)
         act_good = b._decode_action_batch(toks_good)
 
     assert toks_good.shape == (B, 3, 25)
@@ -292,6 +293,7 @@ def test_policy_eos_lookahead_step_and_kv_equivalence():
     Dream record, acceptance stats exposed, and numerical equivalence
     between the cached and full-recomputation paths."""
     import torch
+    from . import brain as brain_mod
 
     def run_case(use_kv: bool):
         torch.manual_seed(7)
@@ -310,7 +312,7 @@ def test_policy_eos_lookahead_step_and_kv_equivalence():
         assert abs(r.total_cost - g.total_cost) < 1e-4, (r.total_cost, g.total_cost)
     for a, b_ in zip(rec_ref.candidate_actions, rec_got.candidate_actions):
         assert len(a) == len(b_) == 5
-    assert rec_got.eos_forced is not None and len(rec_got.eos_forced) == 2
+    assert rec_got.eos_forced is not None and len(rec_got.eos_forced) == brain_mod._EOS_NSLOTS
     for st in (st_ref, st_got):
         assert st["total"] == 2 and 0 <= st["accepted"] <= 2
     # dream record structure: 2 candidates x 1 regime, rollouts reach s10
@@ -318,7 +320,7 @@ def test_policy_eos_lookahead_step_and_kv_equivalence():
     assert len(rec_got.trajectories) == 2
     for traj in rec_got.trajectories:
         assert len(traj.steps) == 1 + 6          # s4+cand + 6 imagined steps
-        assert traj.eos_pred is not None and len(traj.eos_pred) == 2
+        assert traj.eos_pred is not None and len(traj.eos_pred) == brain_mod._EOS_NSLOTS
         assert traj.regime_name == "Policy"
     assert out_got[0][0] == "pol"
 
@@ -343,7 +345,7 @@ def test_dream_theater_hindsight_view_and_browsing():
     rec = b.last_dream_record
     assert rec.lived_steps is not None and len(rec.lived_steps) == 11      # s0..s10
     assert rec.predicted_steps is not None and len(rec.predicted_steps) == 11
-    assert rec.eos_realized is not None and len(rec.eos_realized) == 2
+    assert rec.eos_realized is not None and len(rec.eos_realized) == 6
     assert len(theater.history) == 3
     assert theater.hist_idx == 2 and theater.follow
 
@@ -480,7 +482,7 @@ def test_brain_drives_real_sim_and_sleeps():
     B.apply_consignes(skel)
     proprio = S.Proprio(space, skel)
     reward = S.Reward(skel)
-    cursor = E.Cursor(skel)
+    ball_sensor = E.Ball(skel)
     vision = E.Vision(skel, space)
     touch = E.Touch(space, skel)
     intero = I.Intero()
@@ -497,7 +499,7 @@ def test_brain_drives_real_sim_and_sleeps():
         ts = touch.update(skel, 1 / 60)
         rs = reward.update(skel, signals, ts, 1 / 60)
         isg = intero.update(rs, 1 / 60)
-        cs = cursor.update(skel, mouse, 1 / 60)
+        cs = ball_sensor.update(skel, mouse, 1 / 60)
         vs = vision.update(skel, 1 / 60)
         accum += 1 / 60
         if accum >= DT:
@@ -1315,12 +1317,12 @@ def test_ball_physics_gravity_and_sensors():
     assert abs(space.ball.position.y - W.BALL_SPAWN[1]) < 1e-4
     assert space.ball.velocity.length < 1e-4
 
-    # 3. Cursor sensor tracks ball position
-    cursor = E.Cursor(skel)
-    cs = cursor.update(skel, space.ball, 1.0 / 60.0)
-    assert "curseur_dir" in cs and "curseur_prox" in cs
-    assert "curseur_vx" in cs and "curseur_vy" in cs
-    assert cs["curseur_prox"] > 0.0
+    # 3. Ball sensor tracks ball position
+    ball_sensor = E.Ball(skel)
+    cs = ball_sensor.update(skel, space.ball, 1.0 / 60.0)
+    assert "ball_dir" in cs and "ball_prox" in cs
+    assert "ball_vr" in cs and "ball_va" in cs
+    assert cs["ball_prox"] > 0.0
 
     # 4. Vision detects the ball in field of view
     vision = E.Vision(skel, space)
@@ -1351,26 +1353,33 @@ def test_ball_physics_gravity_and_sensors():
 
 
 def test_sample_for_policy_prioritizes_relief():
-    from .brain import ExperienceBuffer
-    from .tokenize import _INTERO_IDX, SIG_OFFSET
+    from .brain import ExperienceBuffer, SEQ_STEPS
+    from .tokenize import _COST_IDX, _REWARD_IDX, SIG_OFFSET
     buf = ExperienceBuffer(seq_len=11, seed=42)
 
-    def make_seq(f0, sf0, f_end, sf_end):
-        tok0 = [0.0] * 25
-        tok0[SIG_OFFSET] = f0
-        tok0[SIG_OFFSET + 1] = sf0
-        tok_end = [0.0] * 25
-        tok_end[SIG_OFFSET] = f_end
-        tok_end[SIG_OFFSET + 1] = sf_end
-        s0 = [[0.0] * 25 for _ in range(16)]
-        s0[_INTERO_IDX] = tok0
-        s_end = [[0.0] * 25 for _ in range(13)]
-        s_end[_INTERO_IDX] = tok_end
-        return [s0] + [[[0.0] * 25 for _ in range(16)] for _ in range(9)] + [s_end]
+    def make_seq(early_cost, late_cost):
+        # 11 salves: s0..s4 carry the pre-decision cost level, s5..s10 the
+        # consequence level. All 5 innate cost channels at the same slot value,
+        # confort neutral (same value everywhere: cancels in early - late).
+        seq = []
+        for i in range(SEQ_STEPS + 1):
+            cost = early_cost if i <= 4 else late_cost
+            n_tok = 16 if i < SEQ_STEPS else 13
+            salve = [[0.0] * 25 for _ in range(n_tok)]
+            for j in range(5):
+                salve[_COST_IDX][SIG_OFFSET + j] = cost
+            salve[_REWARD_IDX][SIG_OFFSET] = 1.0     # no comfort (neutral)
+            seq.append(salve)
+        return seq
 
-    seq_relief = make_seq(0.5, 0.8, 0.3, 0.2)
-    seq_neutral = make_seq(0.2, 0.2, 0.2, 0.2)
-    seq_pain = make_seq(0.1, 0.1, 0.4, 0.8)
+    seq_relief = make_seq(0.8, 0.2)     # costs drop after the decision
+    seq_neutral = make_seq(0.5, 0.5)
+    seq_pain = make_seq(0.2, 0.8)       # costs rise after the decision
+
+    # relief score sanity: long-term cheaper than pre-decision = positive
+    assert buf._sequence_relief(seq_relief) > 0.4
+    assert abs(buf._sequence_relief(seq_neutral)) < 1e-6
+    assert buf._sequence_relief(seq_pain) < -0.4
 
     buf._addendum = [seq_relief, seq_neutral, seq_pain]
     counts = {0: 0, 1: 0, 2: 0}
