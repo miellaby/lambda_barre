@@ -29,6 +29,8 @@ def generate_balance_dataset(
     target_transitions: int = 3000,
     seed: int = 42,
     progress_callback: callable | None = None,
+    seq_steps: int = 10,
+    n_ctx: int = 4,
 ) -> ExperienceBuffer:
     """Run headless physical simulation to collect ``target_transitions`` of
     diverse balancing experience.
@@ -51,7 +53,8 @@ def generate_balance_dataset(
     intero = I.Intero()
     encoder = DenseEncoder()
 
-    buffer = ExperienceBuffer(capacity=1000, pool_capacity=1000, seed=seed)
+    buffer = ExperienceBuffer(seq_len=seq_steps + 1, n_ctx=n_ctx,
+                              capacity=1000, pool_capacity=1000, seed=seed)
 
     collected = 0
     falls = 0
@@ -159,6 +162,10 @@ def main() -> None:
     parser.add_argument("--out", type=str, default=default_out,
                         help=f"output file path (default: {default_out})")
     parser.add_argument("--seed", type=int, default=42, help="random seed (default: 42)")
+    parser.add_argument("--seq-steps", type=int, default=10,
+                        help="number of multi-step transitions per sequence (default: 10)")
+    parser.add_argument("--n-ctx", type=int, default=4,
+                        help="decision context step index (default: 4)")
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -169,7 +176,8 @@ def main() -> None:
             print(f"  [{cur}/{total}] ({cur/total*100:.0f}%) transitions collected...", flush=True)
 
     buf = generate_balance_dataset(target_transitions=args.transitions, seed=args.seed,
-                                  progress_callback=on_progress)
+                                  progress_callback=on_progress,
+                                  seq_steps=args.seq_steps, n_ctx=args.n_ctx)
     buf.save(args.out)
     elapsed = time.perf_counter() - t0
     file_mb = os.path.getsize(args.out) / (1024 * 1024)

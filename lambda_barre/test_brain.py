@@ -374,26 +374,30 @@ def test_dream_theater_hindsight_view_and_browsing():
     assert theater.hist_idx == 2 and theater.follow
 
 
-def test_policy_lookahead_fallback_on_systematic_rejection():
-    """When every hindsight generation is rejected, train_policy falls back to
-    the legacy stochastic candidates after _LOOKAHEAD_FALLBACK_STREAK
-    batches: the dream record switches to the 3 x 2 structure."""
-    import lambda_barre.brain as brain_mod
-
+def test_policy_lookahead_stays_in_lookahead_on_rejections():
+    """When hindsight generations are rejected, train_policy stays in lookahead
+    mode without auto-fallback: loss is 0.0 and the 2-candidate structure is maintained."""
     b = Brain(seed=42)
     for i in range(20):
         salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
         b.record(salve)
-    orig = brain_mod._EXPLORE_MARGIN_PCT
-    brain_mod._EXPLORE_MARGIN_PCT = 1e9   # impossible margin: all rejected
-    try:
-        out = list(b.train_policy(steps=7, batch=2, n_imagine=6))
-    finally:
-        brain_mod._EXPLORE_MARGIN_PCT = orig
-    assert len(out) == 7
+    call_count = [0]
+    orig_rollout = b._rollout_candidate
+    def mock_rollout(*args, **kwargs):
+        call_count[0] += 1
+        c, eos, steps = orig_rollout(*args, **kwargs)
+        if call_count[0] % 2 == 0:  # gen_action rollout: make it artificially worse
+            return c + 1000.0, eos, steps
+        return c, eos, steps
+    b._rollout_candidate = mock_rollout
+    out = list(b.train_policy(steps=5, batch=2, n_imagine=6))
+    assert len(out) == 5
+    assert all(loss == 0.0 for _, loss in out)
     rec = b.last_dream_record
-    assert len(rec.trajectories) == 6      # legacy machinery took over
-    assert len(rec.candidate_actions) == 3
+    assert len(rec.trajectories) == 2      # stayed in lookahead mode
+    assert len(rec.candidate_actions) == 2
+    assert rec.best_candidate_idx == -1    # rejected
+
 
 
 def test_wm_lookahead_training_pass_in_sleep():
@@ -1353,7 +1357,7 @@ def test_ball_physics_gravity_and_sensors():
 
 
 def test_sample_for_policy_prioritizes_relief():
-    from .brain import ExperienceBuffer, SEQ_STEPS
+    from .brain import ExperienceBuffer, SEQ_STEPS, sequence_relief, sequence_impact
     from .tokenize import _COST_IDX, _REWARD_IDX, SIG_OFFSET
     buf = ExperienceBuffer(seq_len=11, seed=42)
 
@@ -1381,6 +1385,17 @@ def test_sample_for_policy_prioritizes_relief():
     assert abs(buf._sequence_relief(seq_neutral)) < 1e-6
     assert buf._sequence_relief(seq_pain) < -0.4
 
+    # standalone sequence_relief matches buffer method
+    assert abs(sequence_relief(seq_relief) - buf._sequence_relief(seq_relief)) < 1e-6
+    assert abs(sequence_relief(seq_pain) - buf._sequence_relief(seq_pain)) < 1e-6
+
+    # sequence_impact is symmetric |relief|: relief and pain carry identical high impact
+    impacts = sequence_impact([seq_relief, seq_neutral, seq_pain])
+    assert impacts[0] > 0.4
+    assert impacts[1] < 1e-6
+    assert impacts[2] > 0.4
+    assert abs(impacts[0] - impacts[2]) < 1e-5
+
     buf._addendum = [seq_relief, seq_neutral, seq_pain]
     counts = {0: 0, 1: 0, 2: 0}
     for _ in range(600):
@@ -1398,7 +1413,64 @@ def test_sample_for_policy_prioritizes_relief():
     assert counts[0] > 3 * counts[2], f"Relief ({counts[0]}) should dominate pain ({counts[2]})"
 
 
+def test_brain_custom_seq_steps_and_n_ctx():
+    """Verify that Brain supports parameterized seq_steps and n_ctx (e.g. 20 and 5)."""
+    import torch
+    from .brain import compute_seq_layout
+
+    layout = compute_seq_layout(seq_steps=20, n_ctx=5)
+    assert layout["seq_steps"] == 20
+    assert layout["n_ctx"] == 5
+    assert layout["n_imagine"] == 15
+    assert layout["seq_len"] == 20 * 16 + 13  # 333
+    assert layout["decision_pos"] == 5 * 16 + 12  # 92
+    assert layout["eos_pos"] == 20 * 16 + 12  # 332
+
+    b = Brain(seq_steps=20, n_ctx=5)
+    assert b.seq_steps == 20
+    assert b.n_ctx == 5
+    assert b.n_imagine == 15
+    assert b.seq_len == 333
+    assert b.decision_pos == 92
+    assert b.eos_pos == 332
+    assert b.mask.shape == (333, 333)
+    assert b.mask_lookahead.shape == (333, 333)
+    assert b.target_valid.shape == (332, 16)
+    assert b.target_weight.shape == (332, 16)
+    assert b._eos_w.shape == (15,)
+    assert b.buffer.seq_len == 21
+    assert b.buffer.n_ctx == 5
+    assert b.buffer.n_imagine == 15
+
+    # Push 30 salves: sliding window gives 30 - 21 + 1 = 10 sequences of length 21
+    for i in range(30):
+        salve = _make_salve([0.05 * (i % 7)] * 53, [0.2 * (i % 5)] * 5)
+        b.buffer.push(salve)
+
+    assert b.buffer.journal_len == 10
+    extracted = b.buffer.extract_addendum()
+    assert extracted == 10
+    assert len(b.buffer._addendum) == 10
+    assert len(b.buffer._addendum[0]) == 21
+
+    # Evaluate surprise across the custom 21-salve sequences
+    surprises = b.evaluate_sequences_surprise(b.buffer._addendum)
+    assert len(surprises) == 10
+    assert not any(torch.isnan(torch.tensor(s)).item() for s in surprises)
+
+    # Train WM batch
+    wm_loss = b._train_wm_batch(b.buffer._addendum[:4])
+    assert isinstance(wm_loss, float)
+    assert not torch.isnan(torch.tensor(wm_loss))
+
+    # Run sleep
+    stats = _run_sleep(b, wm_epochs=1, pol_steps=1)
+    assert stats is not None
+    assert b.buffer.coreset_size > 0
+
+
 if __name__ == "__main__":
+    test_brain_custom_seq_steps_and_n_ctx()
     test_sample_for_policy_prioritizes_relief()
     test_ball_physics_gravity_and_sensors()
 
@@ -1436,7 +1508,7 @@ if __name__ == "__main__":
     test_lookahead_generation_matches_training_mask()
     test_lookahead_generation_is_eos_conditioned()
     test_policy_eos_lookahead_step_and_kv_equivalence()
-    test_policy_lookahead_fallback_on_systematic_rejection()
+    test_policy_lookahead_stays_in_lookahead_on_rejections()
     test_wm_lookahead_training_pass_in_sleep()
     test_dream_theater_hindsight_view_and_browsing()
     print("all brain tests passed")

@@ -118,7 +118,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         wm_target_loss: float = 0.01,
         use_kv_cache: bool = True,
         pol_eos_lookahead: bool = True,
-        compile_wm: bool = False) -> None:
+        compile_wm: bool = False,
+        seq_steps: int = 10,
+        n_ctx: int = 4) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
@@ -157,7 +159,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     touch = E.Touch(space, skel)
     intero = I.Intero()
     encoder = DenseEncoder()
-    brain = Brain(device=device, compile_wm=compile_wm)
+    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx)
     auto = False                 # brain drives the consignes when True
     if reset:
         for p in (_WM_CKPT, _POL_CKPT, _BUF_CKPT):
@@ -175,7 +177,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     if bootstrap_dataset > 0:
         from .dataset import generate_balance_dataset
         print(f"[bootstrap] Generating {bootstrap_dataset} transitions of physical experience...")
-        brain.buffer = generate_balance_dataset(target_transitions=bootstrap_dataset)
+        brain.buffer = generate_balance_dataset(target_transitions=bootstrap_dataset,
+                                               seq_steps=seq_steps, n_ctx=n_ctx)
         brain.buffer.save(_BUF_CKPT)
         status = f"dataset bootstrapped ({len(brain.buffer)} seqs)"
     smoother = Smoother()
@@ -603,6 +606,10 @@ def main() -> None:
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the World Model training step "
                         "(fused fwd+bwd; one-time warm-up at first batch)")
+    p.add_argument("--seq-steps", type=int, default=10,
+                   help="number of multi-step transitions per sequence (default: 10)")
+    p.add_argument("--n-ctx", type=int, default=4,
+                   help="decision context step index (default: 4)")
     args = p.parse_args()
     if args.headless and not args.steps:
         p.error("--headless requires --steps")
@@ -615,7 +622,9 @@ def main() -> None:
             wm_target_loss=args.wm_target_loss,
             use_kv_cache=not args.no_kv_cache,
             pol_eos_lookahead=not args.no_eos_lookahead,
-            compile_wm=args.compile)
+            compile_wm=args.compile,
+            seq_steps=args.seq_steps,
+            n_ctx=args.n_ctx)
     except KeyboardInterrupt:
         pygame.quit()
 

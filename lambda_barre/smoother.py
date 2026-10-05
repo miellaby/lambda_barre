@@ -8,7 +8,7 @@ synthesizes the last second of sensory experience into a single token set.
 Smoothing is a per-scalar decision: only noisy *derived* quantities (finite
 differences, impulse-based forces, thresholded cost spikes) are smoothed.
 Direct physical reads (positions, angles), signals already filtered or
-integrated inside their sensor (vertige, courbature, sons, fatigue), and
+integrated inside their sensor (vertige, courbature, douleur, sons, fatigue), and
 reactivity-critical geometric signals (ball_dir/prox) pass through raw —
 smoothing them would only add lag.
 
@@ -36,24 +36,24 @@ _SENSOR_KEYS = [k for k in _BY_KEY if k not in _ACTION_KEYS]
 # Scalars that actually benefit from the IIR: noisy derived quantities where
 # the filter acts as a ~1/3 s perceptual integration window.
 #   proprio: finite-difference accelerations + impulse-based forces
-#   reward: effort (power = force × velocity) and douleur (thresholded spikes)
+#   reward: effort (power = force × velocity)
 #   ball: radial/angular velocity of the line of sight (finite difference,
 #     head-relative, sampled at 30 Hz)
 #   vision: optical flow (platform-rect differencing at 6 Hz)
 # Touch signals (contact_sol_*, collision_tronc_*) are deliberately NOT
 # smoothed: they must be instantaneous. Brief events falling between two WM
 # ticks are lost by design — their effect still reaches the WM through the
-# smoothed douleur channel (computed from the raw collisions every frame).
+# internally-smoothed douleur channel (computed from the raw collisions every frame).
 _SMOOTHED_KEYS = {
     "accel_tete_avant", "accel_tete_haut",
     "force_actuateur_avant", "force_actuateur_arriere", "couple_queue",
-    "effort", "douleur",
+    "effort",
     "ball_vr", "ball_va",
     "flux_surface", "flux_x", "flux_y",
 }
 # Everything else passes through raw (no lag): direct physics reads
 # (tronc_angle, queue_angle, membre_*, contact_sol_*, collision_tronc_*),
-# already-slow internal integrators (courbature, vertige, fatigue,
+# already-slow internal integrators (courbature, vertige, douleur, fatigue,
 # souffrance), direct geometric functions (instabilite, confort,
 # ball_dir, ball_prox), spatially-averaged retina cells (vis_c*), and
 # internally IIR-filtered sounds (son_*).

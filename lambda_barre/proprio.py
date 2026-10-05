@@ -25,6 +25,7 @@ EFFORT_SCALE = 6000.0             # power at which effort = 0.5
 DOULEUR_SEUIL_COLLISION = 800.0   # impulse/dt threshold for trunk collision
 DOULEUR_SEUIL_ACCEL = 1500.0      # accel threshold for head
 DOULEUR_SCALE = 6000.0            # douleur at which pain = 0.5
+DOULEUR_DECAY_TAU = 0.15          # seconds — nociceptive decay time constant (~150 ms)
 COURBATURE_WINDOW = 1.0           # seconds — proprio variance window
 COURBATURE_SEUIL_VAR = 5.0        # below this variance, courbature accrues
 COURBATURE_ACCRUE = 0.005          # accrual rate when immobile (~4 min to saturate)
@@ -173,11 +174,14 @@ class Reward:
         self._courbature = 0.0
         # vertige: smoothed angular velocity
         self._omega_smooth = 0.0
+        # douleur: persistent peak with exponential decay envelope
+        self._douleur = 0.0
 
     def reset(self) -> None:
         self._history.clear()
         self._courbature = 0.0
         self._omega_smooth = 0.0
+        self._douleur = 0.0
 
     def update(self, skel: "B.Skeleton", proprio: dict, touch: dict,
                dt: float) -> dict:
@@ -202,15 +206,21 @@ class Reward:
         effort = power / (power + EFFORT_SCALE)
 
         # --- douleur ---
+        # Immediate nociceptive attack on contact impulse / acceleration spikes,
+        # with exponential decay envelope (~150 ms half-life) to prevent visual
+        # flickering and provide biological persistence across frames.
         coll = abs(touch.get("collision_tronc_x", 0.0)) + abs(
             touch.get("collision_tronc_y", 0.0))
         accel = abs(proprio.get("accel_tete_avant", 0.0)) + abs(
             proprio.get("accel_tete_haut", 0.0))
-        douleur = (
+        raw_d = (
             max(0.0, coll - DOULEUR_SEUIL_COLLISION)
             + max(0.0, accel - DOULEUR_SEUIL_ACCEL)
         )
-        douleur = douleur / (douleur + DOULEUR_SCALE)
+        instant_d = raw_d / (raw_d + DOULEUR_SCALE)
+        decay = math.exp(-dt / DOULEUR_DECAY_TAU) if dt > 0 else 0.0
+        self._douleur = max(instant_d, self._douleur * decay)
+        douleur = self._douleur
 
         # --- courbature ---
         # Clamped to [0, 1]. Accrues when proprio variance is low (immobile),

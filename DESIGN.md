@@ -70,9 +70,10 @@ and crisis spikes saturate.
   saliency anchor, Dream Theater display), the usual innate cost hierarchy
   applies: douleur above vertige above courbature/instabilité above
   effort/confort.
-- Time is weighted inversely to the remaining time-to-denouement
-  (hyperbolic), so the long-term outcome dominates and transient
-  post-action costs count little.
+- Time is averaged uniformly over the consequence window s5..s10 (flat 1/N
+  weight per step), integrating cumulative suffering and recovery over the full
+  2-second horizon so transient effort peaks can be sustained to achieve long-term stability.
+- Pre-decision baseline: s0..s4 is weighted exponentially towards s4 (decay factor 0.5 backwards in time), so the immediate crisis state at s4 dominates (~52%) over earlier history while retaining past momentum.
 - The interoception levels (fatigue, souffrance) are slow carriers at this
   horizon — quasi-static over a decision window — and are masked from every
   WM input.
@@ -95,10 +96,9 @@ survives as an explicit fallback.
 
 - **Real Context Sampling** (both paths):
   - Batches are drawn from the buffer by prioritized sampling
-    (`sample_for_policy`). Priority = the relief score: the flat mean of
-    the cost channels over the decision window s0..s4 minus the
-    time-weighted aggregate over s5..s10 (the same time weights as the
-    EOS), scalarized under the usual innate cost hierarchy — i.e. the
+    (`sample_for_policy`). Priority = the relief score: the decision-weighted
+    mean over s0..s4 (biased towards s4) minus the uniform mean over s5..s10 (the same
+    time weights as the EOS), scalarized under the usual innate cost hierarchy — i.e. the
     realized denouement delta; recovery trajectories dominate.
   - Context: 4 real past transitions plus the decision state s4 (77
     tokens). The WM inference extracts and normalizes the latent at s4 —
