@@ -54,6 +54,35 @@ Options passées par l'environnement :
 * **`LAMBDA_TORCH_MKLDNN=1`** : `--device cpu-fast`
 * **`SDL_VIDEODRIVER=dummy`** : Idéal pour le mode headless.
 
+### Fichier de configuration (`config.toml`)
+
+Les options de structure des checkpoints ne sont **pas** exposées en ligne de
+commande. Elles définissent la forme de `wm_ckpt.pt`, `pol_ckpt.pt` et
+`buf_ckpt.pt` — modifier l'une d'elles invalide les checkpoints existants.
+Configurez-les dans `config.toml`.
+
+| Clé TOML | Paramètre | Checkpoint affecté |
+|---|---|---|
+| `[transformer] d_model` | Dimension latente du transformer | `wm_ckpt.pt`, `pol_ckpt.pt` |
+| `[transformer] nhead` | Nombre de têtes d'attention | `wm_ckpt.pt` |
+| `[transformer] layers` | Nombre de couches encodeur | `wm_ckpt.pt` |
+| `[transformer] dim_ff` | Dimension cachée du feed-forward | `wm_ckpt.pt` |
+| `[transformer] dropout` | Taux de dropout | `wm_ckpt.pt` (comportement d'entraînement) |
+| `[policy] hidden` | Largeur des couches cachées de la policy | `pol_ckpt.pt` |
+| `[sequence] seq_steps` | Transitions par séquence d'entraînement | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] n_ctx` | Longueur du contexte de décision | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] wm_hz` | Cadence d'enregistrement du World Model (Hz) | `buf_ckpt.pt` (sémantique temporelle) |
+| `[sequence] pol_hz` | Cadence de la Policy (Hz, typiquement 2× wm_hz) | `buf_ckpt.pt` (sémantique temporelle) |
+| `[buffer] capacity` | Capacité du journal de session (séquences) | `buf_ckpt.pt` (troncature) |
+| `[buffer] pool_capacity` | Capacité long terme du Coreset (séquences) | `buf_ckpt.pt` (troncature) |
+
+Après avoir modifié l'une de ces options, lancez avec `--reset` pour supprimer
+les anciens checkpoints et repartir à zéro :
+
+```bash
+.venv/bin/python -m lambda_barre.main --reset
+```
+
 ## Contrôles (GUI)
 
 | Touche / Action | Fonction |

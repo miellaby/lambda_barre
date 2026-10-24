@@ -870,7 +870,11 @@ class Brain:
                  explore_std: float = 0.2, device: str | None = None, seed: int = 0,
                  compile_wm: bool = False,
                  seq_steps: int = DEFAULT_SEQ_STEPS,
-                 n_ctx: int = DEFAULT_N_CTX):
+                 n_ctx: int = DEFAULT_N_CTX,
+                 d_model: int = 64, nhead: int = 4, layers: int = 3,
+                 dim_ff: int = 384, dropout: float = 0.0,
+                 pol_hidden: int = 256,
+                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
         # Intra-op parallelism cap: 2 threads wins or ties in both regimes on
@@ -886,10 +890,10 @@ class Brain:
         self.eos_pos = layout["eos_pos"]
         self.n_imagine = layout["n_imagine"]
 
-        d_model = 64
-        self.world = M.WorldModel(d_model=d_model, nhead=4, layers=3,
-                                  dim_ff=384).to(self.device)
-        self.policy = M.Policy(n_state=N_POLICY_STATE + d_model).to(self.device)
+        self.world = M.WorldModel(d_model=d_model, nhead=nhead, layers=layers,
+                                  dim_ff=dim_ff, dropout=dropout).to(self.device)
+        self.policy = M.Policy(n_state=N_POLICY_STATE + d_model,
+                               hidden=pol_hidden).to(self.device)
         # Normalizes the world model's intermediate latent before feeding it
         # to the policy, so scalars [0,1] and latent are on the same scale.
         self.latent_norm = torch.nn.LayerNorm(d_model).to(self.device)
@@ -897,7 +901,9 @@ class Brain:
         self.opt_pol = torch.optim.Adam(
             list(self.policy.parameters()) + list(self.latent_norm.parameters()),
             lr=lr_pol, weight_decay=1e-4)
-        self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx)
+        self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
+                                       capacity=buffer_capacity,
+                                       pool_capacity=buffer_pool_capacity)
         if seq_steps == DEFAULT_SEQ_STEPS and n_ctx == DEFAULT_N_CTX:
             self.mask = _MASK.to(self.device)
             self.mask_lookahead = _MASK_LOOKAHEAD.to(self.device)
@@ -988,14 +994,12 @@ class Brain:
             torch.mps.synchronize()
 
     @torch.inference_mode()
-    def wake_tick(self, salve) -> None:
-        """World model tick: run a forward pass on the rolling history +
-        current salve to produce a fresh latent for the policy. This is the
-        perceptual pass — it runs every WM tick, brain on or off, so the
-        policy's observation is never stale (journaling is done by record)."""
+    def _wm_forward(self, salve) -> None:
+        """Run the World Model forward on the rolling 3 Hz history + current
+        state, updating the cached latent and scalars. Does NOT modify the
+        wake history — that is done by record_tick() at WM cadence."""
         self.mode = "wake"
         cur_state = state_tokens(salve)
-        a_toks = action_tokens(salve)
         ctx = self._build_context(cur_state)
         self.world.eval()
         t0 = time.perf_counter()
@@ -1014,10 +1018,52 @@ class Brain:
         self._cached_scalars = self._policy_scalars_batch(
             torch.tensor(cur_state, dtype=torch.float32,
                          device=self.device).unsqueeze(0))   # [1, 47]
-        # update history with this transition's state + action
+
+    @torch.inference_mode()
+    def wake_tick(self, salve) -> None:
+        """WM forward + append to wake history. (Legacy entry point, kept
+        for tests and the act() fallback.)"""
+        self._wm_forward(salve)
+        cur_state = state_tokens(salve)
+        a_toks = action_tokens(salve)
         self._wake_history.append((cur_state, a_toks))
         if len(self._wake_history) > self.n_ctx:
             self._wake_history.pop(0)
+
+    @torch.inference_mode()
+    def brain_tick(self, salve) -> tuple[float, float, float, float, float]:
+        """One brain tick at policy cadence: WM forward pass + policy action.
+
+        The WM runs on the rolling 3 Hz history + current state to produce a
+        fresh latent; the policy then produces an action from (scalars, latent).
+        The latent is always fresh — never stale. Does NOT modify the wake
+        history; call record_tick() at WM cadence to journal the saline.
+
+        Returns 5 consignes: (theta_front, d_front, theta_back, d_back, tail_t).
+        """
+        self._wm_forward(salve)
+        pol_in = torch.cat([self._cached_scalars, self._cached_latent], dim=1)
+        t0 = time.perf_counter()
+        action, _, _ = self.policy.sample(pol_in, self.act_std)
+        self._sync_device()
+        dt_ms = (time.perf_counter() - t0) * 1000
+        if self._pol_time <= 0.0:
+            self._pol_time = dt_ms
+        else:
+            self._pol_time = (1 - self._time_alpha) * self._pol_time \
+                + self._time_alpha * dt_ms
+        a = action[0].tolist()
+        return a[0], a[1], a[2], a[3], a[4]
+
+    def record_tick(self, salve) -> None:
+        """Record a salve at WM cadence (3 Hz): append (state, action) to the
+        wake history and journal to the experience buffer."""
+        cur_state = state_tokens(salve)
+        a_toks = action_tokens(salve)
+        self._wake_history.append((cur_state, a_toks))
+        if len(self._wake_history) > self.n_ctx:
+            self._wake_history.pop(0)
+        self.record(salve)
 
     @torch.inference_mode()
     def act(self, salve, std=None) -> tuple[float, float, float, float, float]:

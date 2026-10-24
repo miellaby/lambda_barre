@@ -1,2 +1,4 @@
 [console_scripts]
+dream-theater = lambda_barre.dream_theater:main
 lambda-barre = lambda_barre.main:main
+wm-theater = lambda_barre.wm_theater:main

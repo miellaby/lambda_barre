@@ -23,6 +23,7 @@ import pygame
 import torch
 
 from . import body as B
+from . import config as CFG
 from .brain import Brain, ExperienceBuffer, sequence_relief, compute_context_time_weights
 from .dream import (
     CARD_BG,
@@ -1053,7 +1054,18 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
                 pol_path: str = "pol_ckpt.pt",
                 initial_index: int = 0,
                 device: str = "cpu",
-                initial_sort: str = "relief_desc") -> None:
+                initial_sort: str = "relief_desc",
+                # Architecture / training params (from config.toml or defaults)
+                d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
+                dim_ff: int = 384, wm_dropout: float = 0.0,
+                pol_hidden: int = 256,
+                lr_wm: float = 3e-4, lr_pol: float = 2e-4,
+                act_std: float = 0.05, explore_std: float = 0.2,
+                wm_batch: int = 64,
+                seed: int = 0,
+                buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
+                seq_steps: int = 10, n_ctx: int = 4,
+                compile_wm: bool = False) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     try:
         import ctypes
@@ -1072,7 +1084,15 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
     font_small = pygame.font.SysFont(FONT_NAME, 11)
     font_tiny = pygame.font.SysFont(FONT_NAME, 10)
 
-    brain = Brain(device=device)
+    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
+                  d_model=d_model, nhead=nhead, layers=wm_layers,
+                  dim_ff=dim_ff, dropout=wm_dropout,
+                  pol_hidden=pol_hidden,
+                  lr_wm=lr_wm, lr_pol=lr_pol,
+                  act_std=act_std, explore_std=explore_std,
+                  seed=seed,
+                  buffer_capacity=buffer_capacity,
+                  buffer_pool_capacity=buffer_pool_capacity)
     if os.path.exists(wm_path) or os.path.exists(pol_path):
         brain.load_checkpoint(
             wm_path=wm_path if os.path.exists(wm_path) else "nonexistent.pt",
@@ -1085,7 +1105,8 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
     else:
         print("Warning: World Model or Policy checkpoints not found, using initialized weights.")
 
-    buf = ExperienceBuffer(capacity=1000, pool_capacity=1000)
+    buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
+                           seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed)
     if os.path.exists(buffer_path):
         buf.load(buffer_path)
         print(f"Loaded {len(buf._coreset)} sequences from {buffer_path}")
@@ -1117,30 +1138,89 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
 
 
 def main() -> None:
+    cfg = CFG.load_config()
+
+    # Built-in defaults
+    params: dict = {
+        "buffer_path": "buf_ckpt.pt",
+        "wm_path": "wm_ckpt.pt",
+        "pol_path": "pol_ckpt.pt",
+        "initial_index": 0,
+        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
+        "initial_sort": "relief_desc",
+        "accel": bool(os.environ.get("LAMBDA_ACCEL")),
+        "d_model": 64, "nhead": 4, "wm_layers": 3,
+        "dim_ff": 384, "wm_dropout": 0.0,
+        "pol_hidden": 256,
+        "lr_wm": 3e-4, "lr_pol": 2e-4,
+        "act_std": 0.05, "explore_std": 0.2,
+        "wm_batch": 64,
+        "seed": 0,
+        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
+        "seq_steps": 10, "n_ctx": 4,
+        "compile_wm": False,
+    }
+
+    # Override with config.toml
+    CFG.apply_toml(params, cfg)
+
     parser = argparse.ArgumentParser(description="World Model Theater GUI")
-    parser.add_argument("--buffer", type=str, default="buf_ckpt.pt",
+    parser.add_argument("--buffer", type=str, default=argparse.SUPPRESS,
+                        dest="buffer_path",
                         help="Path to ExperienceBuffer checkpoint (default: buf_ckpt.pt)")
-    parser.add_argument("--wm", type=str, default="wm_ckpt.pt",
+    parser.add_argument("--wm", type=str, default=argparse.SUPPRESS,
+                        dest="wm_path",
                         help="Path to WorldModel checkpoint (default: wm_ckpt.pt)")
-    parser.add_argument("--pol", type=str, default="pol_ckpt.pt",
+    parser.add_argument("--pol", type=str, default=argparse.SUPPRESS,
+                        dest="pol_path",
                         help="Path to Policy checkpoint (default: pol_ckpt.pt)")
-    parser.add_argument("--index", type=int, default=0,
+    parser.add_argument("--index", type=int, default=argparse.SUPPRESS,
+                        dest="initial_index",
                         help="Initial sequence index to display (default: 0)")
-    parser.add_argument("--device", type=str, default="cpu",
+    parser.add_argument("--device", type=str, default=argparse.SUPPRESS,
+                        choices=["cpu", "cuda", "auto", "cpu-fast"],
                         help="Torch device (default: cpu)")
-    parser.add_argument("--sort", type=str, default="relief_desc",
+    parser.add_argument("--accel", action="store_true", default=argparse.SUPPRESS,
+                        help="enable maximum hardware acceleration (CUDA if available, else CPU)")
+    parser.add_argument("--sort", type=str, default=argparse.SUPPRESS,
+                        dest="initial_sort",
                         choices=["relief_desc", "relief_asc", "abs_desc", "coreset"],
                         help="Sort mode: 'relief_desc' (default: recovery first), 'relief_asc' (falls first), 'abs_desc' (extremes first), or 'coreset' (raw)")
-    args = parser.parse_args()
+    # NOTE: checkpoint-structure options (--d-model, --nhead, --wm-layers,
+    # --dim-ff, --wm-dropout, --pol-hidden, --seq-steps, --n-ctx,
+    # --buffer-capacity, --buffer-pool-capacity) are intentionally NOT
+    # exposed on the CLI.  They define the shape of wm_ckpt.pt, pol_ckpt.pt
+    # and buf_ckpt.pt — changing any of them invalidates existing checkpoints.
+    # Set them in config.toml instead.
+    # Training hyperparameters (safe to override per-invocation)
+    parser.add_argument("--lr-wm", type=float, default=argparse.SUPPRESS,
+                        help="World Model learning rate")
+    parser.add_argument("--lr-pol", type=float, default=argparse.SUPPRESS,
+                        help="Policy learning rate")
+    parser.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
+                        help="action sampling std during wake")
+    parser.add_argument("--explore-std", type=float, default=argparse.SUPPRESS,
+                        help="action sampling std during imagination")
+    parser.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
+                        help="World Model training batch size")
+    parser.add_argument("--seed", type=int, default=argparse.SUPPRESS,
+                        help="random seed")
+    parser.add_argument("--compile", action="store_true", default=argparse.SUPPRESS,
+                        dest="compile_wm",
+                        help="torch.compile the World Model training step")
 
-    run_theater(
-        buffer_path=args.buffer,
-        wm_path=args.wm,
-        pol_path=args.pol,
-        initial_index=args.index,
-        device=args.device,
-        initial_sort=args.sort,
-    )
+    args = parser.parse_args()
+    cli = vars(args)
+
+    # CLI overrides config
+    CFG.merge_cli(params, cli)
+
+    # Resolve device: --accel overrides --device
+    accel = params.pop("accel", False)
+    if accel:
+        params["device"] = "auto"
+
+    run_theater(**params)
 
 
 if __name__ == "__main__":

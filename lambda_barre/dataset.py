@@ -19,11 +19,9 @@ import time
 import torch
 
 from . import body as B, world as W, proprio as S, extero as E, intero as I
+from . import config as CFG
 from .brain import Brain, ExperienceBuffer
 from .tokenize import DenseEncoder
-
-WM_DT = 1.0 / 3.0  # 3 Hz world model recording cadence
-
 
 def generate_balance_dataset(
     target_transitions: int = 3000,
@@ -31,6 +29,9 @@ def generate_balance_dataset(
     progress_callback: callable | None = None,
     seq_steps: int = 10,
     n_ctx: int = 4,
+    wm_hz: float = 3.0,
+    buffer_capacity: int = 1000,
+    buffer_pool_capacity: int = 1000,
 ) -> ExperienceBuffer:
     """Run headless physical simulation to collect ``target_transitions`` of
     diverse balancing experience.
@@ -38,6 +39,7 @@ def generate_balance_dataset(
     Returns an ``ExperienceBuffer`` pre-populated with sliding-window
     training sequences in its persistent replay pool.
     """
+    WM_DT = 1.0 / wm_hz  # world model recording cadence
     random.seed(seed)
     torch.manual_seed(seed)
 
@@ -54,7 +56,8 @@ def generate_balance_dataset(
     encoder = DenseEncoder()
 
     buffer = ExperienceBuffer(seq_len=seq_steps + 1, n_ctx=n_ctx,
-                              capacity=1000, pool_capacity=1000, seed=seed)
+                              capacity=buffer_capacity,
+                              pool_capacity=buffer_pool_capacity, seed=seed)
 
     collected = 0
     falls = 0
@@ -153,37 +156,65 @@ def generate_balance_dataset(
 
 
 def main() -> None:
+    cfg = CFG.load_config()
+
     default_out = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "buf_ckpt.pt"
     )
+
+    # Built-in defaults
+    params: dict = {
+        "transitions": 3000,
+        "out": default_out,
+        "seed": 42,
+        "seq_steps": 10,
+        "n_ctx": 4,
+        "wm_hz": 3.0,
+        "buffer_capacity": 1000,
+        "buffer_pool_capacity": 1000,
+    }
+
+    # Override with config.toml
+    CFG.apply_toml(params, cfg)
+
     parser = argparse.ArgumentParser(description="Generate 100x balance dataset for lambda_barre")
-    parser.add_argument("--transitions", type=int, default=3000,
+    parser.add_argument("--transitions", type=int, default=argparse.SUPPRESS,
                         help="number of transitions to record (default: 3000 = ~2500 sequences, 100x bigger)")
-    parser.add_argument("--out", type=str, default=default_out,
+    parser.add_argument("--out", type=str, default=argparse.SUPPRESS,
                         help=f"output file path (default: {default_out})")
-    parser.add_argument("--seed", type=int, default=42, help="random seed (default: 42)")
-    parser.add_argument("--seq-steps", type=int, default=10,
-                        help="number of multi-step transitions per sequence (default: 10)")
-    parser.add_argument("--n-ctx", type=int, default=4,
-                        help="decision context step index (default: 4)")
+    parser.add_argument("--seed", type=int, default=argparse.SUPPRESS,
+                        help="random seed")
+    # NOTE: checkpoint-structure options (--seq-steps, --n-ctx, --wm-hz,
+    # --buffer-capacity, --buffer-pool-capacity) are intentionally NOT
+    # exposed on the CLI.  They define the shape of buf_ckpt.pt — changing
+    # any of them invalidates existing checkpoints.  Set them in config.toml.
     args = parser.parse_args()
+    cli = vars(args)
+
+    # CLI overrides config
+    CFG.merge_cli(params, cli)
 
     t0 = time.perf_counter()
-    print(f"Generating {args.transitions} transitions of physical experience...", flush=True)
+    print(f"Generating {params['transitions']} transitions of physical experience...", flush=True)
 
     def on_progress(cur, total):
         if cur % 500 == 0 or cur == total:
             print(f"  [{cur}/{total}] ({cur/total*100:.0f}%) transitions collected...", flush=True)
 
-    buf = generate_balance_dataset(target_transitions=args.transitions, seed=args.seed,
+    buf = generate_balance_dataset(target_transitions=params["transitions"],
+                                  seed=params["seed"],
                                   progress_callback=on_progress,
-                                  seq_steps=args.seq_steps, n_ctx=args.n_ctx)
-    buf.save(args.out)
+                                  seq_steps=params["seq_steps"],
+                                  n_ctx=params["n_ctx"],
+                                  wm_hz=params["wm_hz"],
+                                  buffer_capacity=params["buffer_capacity"],
+                                  buffer_pool_capacity=params["buffer_pool_capacity"])
+    buf.save(params["out"])
     elapsed = time.perf_counter() - t0
-    file_mb = os.path.getsize(args.out) / (1024 * 1024)
+    file_mb = os.path.getsize(params["out"]) / (1024 * 1024)
     print(f"Dataset generated in {elapsed:.2f}s:", flush=True)
     print(f"  Replay pool sequences: {buf.pool_size}", flush=True)
-    print(f"  Saved to: {args.out} ({file_mb:.2f} MB)", flush=True)
+    print(f"  Saved to: {params['out']} ({file_mb:.2f} MB)", flush=True)
 
 
 if __name__ == "__main__":

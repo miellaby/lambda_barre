@@ -1,0 +1,67 @@
+# Lambda Barre — example configuration
+#
+# Copy this file to config.toml and edit the values you want to change:
+#   cp config.example.toml config.toml
+#
+# Precedence: CLI arguments > config.toml > built-in defaults.
+# Any key omitted from config.toml falls back to the built-in default.
+
+# ---------------------------------------------------------------------------
+# World Model transformer architecture
+# ---------------------------------------------------------------------------
+[transformer]
+d_model   = 64    # latent dimension (must be divisible by nhead)
+nhead     = 4     # number of attention heads
+layers    = 3     # number of transformer encoder layers
+dim_ff    = 384   # feed-forward hidden dimension (typically 4-6x d_model)
+dropout   = 0.0   # dropout rate (0 = disabled; only active during training)
+
+# ---------------------------------------------------------------------------
+# Policy network architecture
+# ---------------------------------------------------------------------------
+[policy]
+hidden    = 256   # width of each hidden layer (3 hidden layers)
+
+# ---------------------------------------------------------------------------
+# Optimizer and exploration hyperparameters
+# ---------------------------------------------------------------------------
+[training]
+lr_wm         = 3.0e-4   # World Model learning rate (Adam)
+lr_pol        = 2.0e-4   # Policy learning rate (Adam, weight_decay=1e-4)
+act_std       = 0.05     # action sampling std during wake (exploitation)
+explore_std   = 0.20     # action sampling std during imagined rollouts (exploration)
+
+# Sleep cycle training
+wm_epochs       = 512    # World Model training epochs per sleep cycle
+wm_batch        = 64     # World Model training batch size
+wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
+pol_steps       = 32     # Policy training steps per sleep cycle
+
+# ---------------------------------------------------------------------------
+# Experience buffer capacities (in number of sequences)
+# ---------------------------------------------------------------------------
+[buffer]
+capacity        = 1000   # session journal: max extractable sequences during wake
+pool_capacity   = 1000   # coreset: max long-term consolidated sequences
+
+# ---------------------------------------------------------------------------
+# Sequence geometry
+# ---------------------------------------------------------------------------
+[sequence]
+seq_steps = 10   # number of transitions (salves) per training sequence
+n_ctx     = 4    # decision context length — must be strictly less than seq_steps
+                 # The policy decides at step n_ctx; consequences are evaluated
+                 # from n_ctx+1 to seq_steps.
+
+# ---------------------------------------------------------------------------
+# Runtime options
+# ---------------------------------------------------------------------------
+[runtime]
+device            = "cpu"     # cpu | cuda | auto | cpu-fast
+accel             = false     # true = auto (CUDA if available, else CPU)
+seed              = 0         # random seed (0 = default)
+compile_wm        = false     # torch.compile the WM training step (faster, one-time warm-up)
+use_kv_cache      = true      # persistent KV-cache for imagined policy rollouts (faster)
+pol_eos_lookahead = true      # hindsight (EOS-lookahead) policy supervision
+freeze_physics    = false     # freeze physics (useful for debugging token recordings)
+no_smooth         = false     # bypass IIR sensor smoother (use raw snapshots)

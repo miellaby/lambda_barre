@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import pygame
 import torch
@@ -32,11 +33,10 @@ from . import proprio as S
 from . import extero as E
 from . import intero as I
 from .tokenize import DenseEncoder, salve_cost
+from . import config as CFG
 from .brain import Brain
 from .smoother import Smoother
 from .dream import CAND_COLORS, DreamStep, DreamTheater, draw_thumbnail
-
-import os
 
 # Brain parameter checkpoints — saved after each sleep cycle, loaded at startup
 # unless --reset is passed. World model and policy are stored separately so a
@@ -48,7 +48,6 @@ _BUF_CKPT = os.path.join(_CKPT_DIR, "buf_ckpt.pt")
 
 
 SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
-
 
 def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
         freeze_physics: bool = False, no_smooth: bool = False):
@@ -94,6 +93,111 @@ def _wm_view_step(brain: Brain, salve: list) -> DreamStep:
                      step_cost=salve_cost(salve))
 
 
+def _apply_consignes(skel, theta_front, d_front, theta_back, d_back, tail_t):
+    """Push the policy's normalized consignes into the skeleton as physical
+    targets (theta_star / d_star) in the anatomical frame."""
+    theta_front_phys = theta_front * THETA_RANGE
+    theta_back_phys = theta_back * THETA_RANGE
+    d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
+    d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
+    tail_t_phys = tail_t * THETA_RANGE
+    if skel.facing == 1:
+        # limb_front = limb_r (right side: outward is right (+x), so theta_r = -theta_front)
+        # limb_back = limb_l (left side: outward is left (-x), so theta_l = +theta_back)
+        skel.limb_r.theta_star = -theta_front_phys
+        skel.limb_r.d_star = d_front_phys
+        skel.limb_l.theta_star = +theta_back_phys
+        skel.limb_l.d_star = d_back_phys
+    else:
+        # limb_front = limb_l (left side: outward is left (-x), so theta_l = +theta_front)
+        # limb_back = limb_r (right side: outward is right (+x), so theta_r = -theta_back)
+        skel.limb_l.theta_star = +theta_front_phys
+        skel.limb_l.d_star = d_front_phys
+        skel.limb_r.theta_star = -theta_back_phys
+        skel.limb_r.d_star = d_back_phys
+    skel.tail_act.theta_star = tail_t_phys
+
+
+def _synthesize_consigne(samples: list[float], threshold: float = 0.0) -> float:
+    """Synthesize one representative consigne from the series of samples
+    captured between two WM ticks.
+
+    Returns the raw sample with the maximum absolute value (the extreme
+    excursion). Ties prefer the last occurrence.
+
+    - Monotonic progression → the extreme endpoint
+    - Peak / trough (any position) → the peak / trough sample
+    - Noise around a mean → the mean (if |extremum − mean| < threshold)
+
+    The returned value is always a raw sample — never an extrapolated
+    curve value. The recorded value is the *intent* (extreme), not the
+    *effect* (smoothed) — the motor smoothing (theta_eff) is a separate
+    physical layer that the WM must learn to bridge.
+    """
+    if not samples:
+        return 0.0
+    if len(samples) == 1:
+        return samples[0]
+
+    extremum = max(enumerate(samples),
+                   key=lambda iv: (abs(iv[1]), iv[0]))[1]
+
+    if threshold > 0.0:
+        mean = sum(samples) / len(samples)
+        if abs(extremum - mean) < threshold:
+            return mean
+
+    return extremum
+
+
+def _sample_raw_consignes(skel) -> tuple:
+    """Extract raw consigne values from the skeleton (facing-independent).
+    Returns (theta_l, d_l, theta_r, d_r, tail_theta)."""
+    return (
+        skel.limb_l.theta_star, skel.limb_l.d_star,
+        skel.limb_r.theta_star, skel.limb_r.d_star,
+        skel.tail_act.theta_star,
+    )
+
+
+def _override_consignes(skel, record: tuple) -> tuple:
+    """Override the skeleton's consignes with synthesized record values.
+    Returns the original values for restoration."""
+    orig = _sample_raw_consignes(skel)
+    skel.limb_l.theta_star, skel.limb_l.d_star = record[0], record[1]
+    skel.limb_r.theta_star, skel.limb_r.d_star = record[2], record[3]
+    skel.tail_act.theta_star = record[4]
+    return orig
+
+
+def _restore_consignes(skel, orig: tuple) -> None:
+    """Restore the skeleton's consignes after an override."""
+    skel.limb_l.theta_star, skel.limb_l.d_star = orig[0], orig[1]
+    skel.limb_r.theta_star, skel.limb_r.d_star = orig[2], orig[3]
+    skel.tail_act.theta_star = orig[4]
+
+
+def _synthesize_record(buffer: list) -> tuple | None:
+    """Synthesize a single representative consigne tuple from the buffer of
+    raw samples captured between two WM ticks. Returns None if the buffer
+    is empty (no override needed).
+
+    Thresholds (10% of actuator range) distinguish noise (→ mean) from
+    real excursions (→ extremum)."""
+    if not buffer:
+        return None
+
+    theta_thresh = 0.1 * THETA_RANGE
+    d_thresh = 0.1 * (B.LIMB_MAX - B.LIMB_MIN)
+    thresholds = (theta_thresh, d_thresh, theta_thresh, d_thresh, theta_thresh)
+
+    n = len(buffer[0])
+    return tuple(
+        _synthesize_consigne([sample[i] for sample in buffer], thresholds[i])
+        for i in range(n)
+    )
+
+
 def _platform_hit(space, world_pos):
     """Return the (body, shape) of the platform under world_pos, or None."""
     for plat, seg, w, h in space._platforms:
@@ -111,7 +215,7 @@ def _platform_hit(space, world_pos):
     return None
 
 
-def run(headless: bool = False, steps: int = 0, reset: bool = False,
+def run(headless: bool = False, steps: int = 0,
         device: str | None = None, bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_epochs: int = 512,
         freeze_physics: bool = False, no_smooth: bool = False,
@@ -120,7 +224,20 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
         pol_eos_lookahead: bool = True,
         compile_wm: bool = False,
         seq_steps: int = 10,
-        n_ctx: int = 4) -> None:
+        n_ctx: int = 4,
+        wm_hz: float = 3.0,
+        pol_hz: float = 6.0,
+        # Transformer architecture (from config.toml or defaults)
+        d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
+        dim_ff: int = 384, wm_dropout: float = 0.0,
+        pol_hidden: int = 256,
+        # Training hyperparameters
+        lr_wm: float = 3e-4, lr_pol: float = 2e-4,
+        act_std: float = 0.05, explore_std: float = 0.2,
+        wm_batch: int = 64,
+        seed: int = 0,
+        # Buffer capacities
+        buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
@@ -159,20 +276,22 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     touch = E.Touch(space, skel)
     intero = I.Intero()
     encoder = DenseEncoder()
-    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx)
+    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
+                  d_model=d_model, nhead=nhead, layers=wm_layers,
+                  dim_ff=dim_ff, dropout=wm_dropout,
+                  pol_hidden=pol_hidden,
+                  lr_wm=lr_wm, lr_pol=lr_pol,
+                  act_std=act_std, explore_std=explore_std,
+                  seed=seed,
+                  buffer_capacity=buffer_capacity,
+                  buffer_pool_capacity=buffer_pool_capacity)
     auto = False                 # brain drives the consignes when True
-    if reset:
-        for p in (_WM_CKPT, _POL_CKPT, _BUF_CKPT):
-            if os.path.exists(p):
-                os.remove(p)
-        status = "brain CLEARED"
-    else:
-        try:
-            brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
-            status = f"brain restored (coreset {brain.buffer.coreset_size})"
-        except Exception as e:
-            print(f"[warning] Checkpoint load: {e}")
-            status = "brain restored partially"
+    try:
+        brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
+        status = f"brain restored (coreset {brain.buffer.coreset_size})"
+    except Exception as e:
+        print(f"[warning] Checkpoint load: {e}")
+        status = "brain restored partially"
 
     if bootstrap_dataset > 0:
         from .dataset import generate_balance_dataset
@@ -184,10 +303,11 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
     smoother = Smoother()
     salves: list = []       # buffer of last 10 salves (for display, disabled)
     wm_view: DreamStep | None = None  # egocentric thumbnail of the last WM tick (wake)
-    WM_DT = 1.0 / 3.0       # world model cadence — 3 Hz
-    POL_DT = 1.0 / 6.0      # policy cadence — 6 Hz
-    wm_accum = WM_DT        # world model tick accumulator (1 Hz)   - starts full to produce a first salve on the first frame
-    pol_accum = 0.0         # policy tick accumulator (6 Hz)
+    WM_DT = 1.0 / wm_hz       # world model cadence
+    POL_DT = 1.0 / pol_hz     # policy cadence
+    wm_accum = 0.0            # WM record accumulator (fires at wm_hz, every other brain tick)
+    pol_accum = 0.0           # brain tick accumulator (fires at pol_hz)
+    consigne_buffer: list = []  # raw consigne samples between WM ticks (for synthesis)
     show_overlays = True   # G: toggle targets, egocentric view, and token panel
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
@@ -256,8 +376,9 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     smoother.reinit(sig_r, ts_r, cs_r, vs_r, isg_r, rs_r)
                     brain.clear_history()
                     salves.clear()
+                    consigne_buffer.clear()
                     wm_view = None
-                    wm_accum = WM_DT
+                    wm_accum = 0.0
                     pol_accum = 0.0
                     prev_facing = skel.facing
                     status = "reset"
@@ -281,7 +402,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         dream_theater.clear()
                         brain.last_dream_record = None
                         dream_theater.is_paused = False
-                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps,
+                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, wm_batch=wm_batch,
+                                                pol_steps=pol_steps,
                                                 wm_target_loss=wm_target_loss,
                                                 use_kv_cache=use_kv_cache,
                                                 pol_eos_lookahead=pol_eos_lookahead)
@@ -396,13 +518,17 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
 
         def sim_step():
             nonlocal prev_facing, wm_accum, pol_accum, wm_view, drag_ball_vel
-            # manual mode; in brain (auto) mode the policy drives them instead.
+
+            def encode_salve():
+                return encoder.encode(sig, ts, cs, vs, isg, rs, skel) if no_smooth else smoother.salve(skel)
+
+            # 1. Controls (manual joystick or brain sync)
             if auto:
                 controls.sync(skel)
             else:
                 controls.drive(skel)
 
-            # fixed timestep physics (3 substeps of 1/180s = 1/60s per sim step)
+            # 2. Physics (60 Hz, 3 substeps of 1/180s)
             touch.reset_contacts()
             if not freeze_physics:
                 for _ in range(3):
@@ -412,6 +538,8 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                         space.ball.position = drag_ball_prev_pos
                     space.ball.velocity = drag_ball_vel
                     drag_ball_vel = (drag_ball_vel[0] * 0.5, drag_ball_vel[1] * 0.5)
+
+            # 3. Sensors
             sig = proprio.update(skel, 1.0 / 60.0)
             ts = touch.update(skel, 1.0 / 60.0)
             rs = reward.update(skel, sig, ts, 1.0 / 60.0)
@@ -420,96 +548,68 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
             cs = ball_sensor.update(skel, ball_target if ball_target is not None else (400, 300), 1.0 / 60.0)
             vs = vision.update(skel, 1.0 / 60.0)
 
-            # detect instantaneous facing direction flip (frame of reference change)
+            # 4. Smoother + facing flip
             if skel.facing != prev_facing:
                 prev_facing = skel.facing
-                # 1. Re-initialize smoother without EMA blending to prevent cross-facing signal corruption
                 smoother.reinit(sig, ts, cs, vs, isg, rs)
                 if sleep_gen is None:
-                    # 2. Clear pre-flip wake context history
                     brain.clear_history()
-                    # 3. Produce clean salve in new frame, record it, and update WM latent immediately
-                    salve = encoder.encode(sig, ts, cs, vs, isg, rs, skel) if no_smooth else smoother.salve(skel)
-                    salves.append(salve)
-                    if len(salves) > 3:
-                        salves.pop(0)
-                    brain.record(salve)
-                    wm_view = _wm_view_step(brain, salve)
-                    brain.wake_tick(salve)
-                    if auto:
-                        # 4. Immediately re-evaluate policy in the new reference frame
-                        theta_front, d_front, theta_back, d_back, tail_t = brain.act(salve)
-                        facing = skel.facing
-                        theta_front_phys = theta_front * THETA_RANGE
-                        theta_back_phys = theta_back * THETA_RANGE
-                        d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
-                        d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
-                        tail_t_phys = tail_t * THETA_RANGE
-                        if facing == 1:
-                            skel.limb_r.theta_star = -theta_front_phys
-                            skel.limb_r.d_star = d_front_phys
-                            skel.limb_l.theta_star = +theta_back_phys
-                            skel.limb_l.d_star = d_back_phys
-                        else:
-                            skel.limb_l.theta_star = +theta_front_phys
-                            skel.limb_l.d_star = d_front_phys
-                            skel.limb_r.theta_star = -theta_back_phys
-                            skel.limb_r.d_star = d_back_phys
-                        skel.tail_act.theta_star = tail_t_phys
-                        # re-anchor in the new frame without snapping the
-                        # effective values: keep the motor smoothing alive
-                        B.apply_consignes(skel, 1.0 / 180.0)
+                    consigne_buffer.clear()
                     wm_accum = 0.0
                     pol_accum = 0.0
             else:
-                # update IIR smoother normally every sim step (60 Hz)
                 smoother.update(sig, ts, cs, vs, isg, rs, 1.0 / 60.0)
 
-            if sleep_gen is None:  # brain is offline when not sleeping
-                # world model tick at 3 Hz (every 20 physics frames, WM_DT = 1/3 s)
-                wm_accum += 1.0 / 60.0
-                if wm_accum >= WM_DT:
-                    wm_accum -= WM_DT
-                    salve = encoder.encode(sig, ts, cs, vs, isg, rs, skel) if no_smooth else smoother.salve(skel)
-                    salves.append(salve)
-                    if len(salves) > 3:
-                        salves.pop(0)
-                    # even with the brain offline, we record the salve for the next sleep cycle
-                    brain.record(salve)
-                    wm_view = _wm_view_step(brain, salve)
-                    # perceptual pass: always refresh the latent, brain on or
-                    # off, so the policy's observation is never stale
-                    brain.wake_tick(salve)
+            # 5. Brain — offline during sleep
+            if sleep_gen is not None:
+                return sig, ts, rs, isg, cs, vs
 
-                # policy tick at 6 Hz (every 10 physics frames, POL_DT = 1/6 s)
+            # Sample raw consignes for synthesis (before brain tick may change them)
+            consigne_buffer.append(_sample_raw_consignes(skel))
+
+            if auto:
+                # Brain tick at policy cadence (6 Hz): WM forward + policy action.
+                # The latent is always fresh — never stale.
                 pol_accum += 1.0 / 60.0
                 if pol_accum >= POL_DT:
                     pol_accum -= POL_DT
-                    if auto:
-                        theta_front, d_front, theta_back, d_back, tail_t = brain.act(smoother.salve(skel))
-                        # put the consignes back into the skeleton for the next physics step
-                        facing = skel.facing
-                        theta_front_phys = theta_front * THETA_RANGE
-                        theta_back_phys = theta_back * THETA_RANGE
-                        d_front_phys = B.LIMB_MIN + d_front * (B.LIMB_MAX - B.LIMB_MIN)
-                        d_back_phys = B.LIMB_MIN + d_back * (B.LIMB_MAX - B.LIMB_MIN)
-                        tail_t_phys = tail_t * THETA_RANGE
-                        if facing == 1:
-                            # limb_front = limb_r (right side: outward is right (+x), so theta_r = -theta_front)
-                            # limb_back = limb_l (left side: outward is left (-x), so theta_l = +theta_back)
-                            skel.limb_r.theta_star = -theta_front_phys
-                            skel.limb_r.d_star = d_front_phys
-                            skel.limb_l.theta_star = +theta_back_phys
-                            skel.limb_l.d_star = d_back_phys
-                        else:
-                            # limb_front = limb_l (left side: outward is left (-x), so theta_l = +theta_front)
-                            # limb_back = limb_r (right side: outward is right (+x), so theta_r = -theta_back)
-                            skel.limb_l.theta_star = +theta_front_phys
-                            skel.limb_l.d_star = d_front_phys
-                            skel.limb_r.theta_star = -theta_back_phys
-                            skel.limb_r.d_star = d_back_phys
+                    salve = encode_salve()
+                    theta_front, d_front, theta_back, d_back, tail_t = brain.brain_tick(salve)
+                    _apply_consignes(skel, theta_front, d_front, theta_back, d_back, tail_t)
+                    # Re-encode so the action tokens carry the fresh consigne
+                    salve = encode_salve()
 
-                        skel.tail_act.theta_star = tail_t_phys
+                    # Record at WM cadence (3 Hz = every other brain tick)
+                    wm_accum += POL_DT
+                    if wm_accum >= WM_DT:
+                        wm_accum -= WM_DT
+                        consigne_buffer.clear()
+                        brain.record_tick(salve)
+                        salves.append(salve)
+                        if len(salves) > 3:
+                            salves.pop(0)
+                        wm_view = _wm_view_step(brain, salve)
+            else:
+                # Manual mode: WM tick at 3 Hz — synthesize the consigne from
+                # the buffer (the user may have changed it many times between
+                # two records; the snapshot alone is not representative).
+                wm_accum += 1.0 / 60.0
+                if wm_accum >= WM_DT:
+                    wm_accum -= WM_DT
+                    record = _synthesize_record(consigne_buffer)
+                    if record is not None:
+                        orig = _override_consignes(skel, record)
+                        salve = encode_salve()
+                        _restore_consignes(skel, orig)
+                    else:
+                        salve = encode_salve()
+                    consigne_buffer.clear()
+                    brain.wake_tick(salve)
+                    salves.append(salve)
+                    if len(salves) > 3:
+                        salves.pop(0)
+                    brain.record(salve)
+                    wm_view = _wm_view_step(brain, salve)
 
             return sig, ts, rs, isg, cs, vs
 
@@ -555,7 +655,7 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
                     screen.blit(surf, (12, 10 + i * 20))
                 if show_overlays and wm_view is not None:
                     # egocentric subjective view (reception + action tokens) of
-                    # the last WM tick, refreshed at WM cadence (3 Hz)
+                    # the last WM tick, refreshed at WM cadence (wm_hz)
                     th_rect = pygame.Rect(12, 10 + len(hud_surfs) * 20 + 6, 92, 68)
                     draw_thumbnail(screen, th_rect, wm_view, font_small,
                                    facing=skel.facing, cand_color=CAND_COLORS[0],
@@ -571,60 +671,113 @@ def run(headless: bool = False, steps: int = 0, reset: bool = False,
 
 
 def main() -> None:
+    cfg = CFG.load_config()
+
+    # Defaults matching run() signature
+    params: dict = {
+        "headless": False, "steps": 0, "reset": False,
+        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
+        "accel": bool(os.environ.get("LAMBDA_ACCEL")),
+        "bootstrap_dataset": 0,
+        "pol_steps": 32, "wm_epochs": 512, "wm_batch": 64,
+        "freeze_physics": False, "no_smooth": False,
+        "wm_target_loss": 0.01,
+        "use_kv_cache": True, "pol_eos_lookahead": True,
+        "compile_wm": False,
+        "seq_steps": 10, "n_ctx": 4,
+        "wm_hz": 3.0, "pol_hz": 6.0,
+        "d_model": 64, "nhead": 4, "wm_layers": 3,
+        "dim_ff": 384, "wm_dropout": 0.0,
+        "pol_hidden": 256,
+        "lr_wm": 3e-4, "lr_pol": 2e-4,
+        "act_std": 0.05, "explore_std": 0.2,
+        "seed": 0,
+        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
+    }
+
+    # Override with config.toml
+    CFG.apply_toml(params, cfg)
+
+    # CLI arguments — SUPPRESS default so we can detect which were explicitly set
     p = argparse.ArgumentParser(description="lambda barre — Stage 1")
-    p.add_argument("--headless", action="store_true",
+    p.add_argument("--headless", action="store_true", default=argparse.SUPPRESS,
                    help="run without a window (smoke test); requires --steps")
-    p.add_argument("--steps", type=int, default=0,
+    p.add_argument("--steps", type=int, default=argparse.SUPPRESS,
                    help="in headless mode, stop after this many frames")
-    p.add_argument("--reset", action="store_true",
-                   help="discard saved brain parameters and start fresh")
-    p.add_argument("--device", type=str, default=os.environ.get("LAMBDA_DEVICE", "cpu"),
+    p.add_argument("--reset", action="store_true", default=argparse.SUPPRESS,
+                   help="delete brain checkpoints and exit (does not start the app)")
+    p.add_argument("--device", type=str, default=argparse.SUPPRESS,
                    choices=["cpu", "cuda", "auto", "cpu-fast"],
                    help="computation device: 'cpu' (default safe), 'cuda', 'auto', or 'cpu-fast'")
-    p.add_argument("--accel", action="store_true", default=bool(os.environ.get("LAMBDA_ACCEL")),
+    p.add_argument("--accel", action="store_true", default=argparse.SUPPRESS,
                    help="enable maximum hardware acceleration (CUDA if available, else CPU)")
-    p.add_argument("--bootstrap-dataset", type=int, default=0, nargs="?", const=3000,
-                   help="generate a large physical experience dataset (default: 3000 transitions, 100x bigger) before running")
-    p.add_argument("--pol-steps", type=int, default=32,
-                   help="policy training steps per sleep cycle (default: 32)")
-    p.add_argument("--wm-epochs", type=int, default=512,
-                   help="world model training epochs per sleep cycle (default: 512)")
-    p.add_argument("--wm-target-loss", type=float, default=0.01,
-                   help="target loss for World Model coreset training (default: 0.01)")
-    p.add_argument("--freeze-physics", action="store_true",
+    p.add_argument("--bootstrap-dataset", type=int, default=argparse.SUPPRESS,
+                   nargs="?", const=3000,
+                   help="generate a large physical experience dataset before running")
+    p.add_argument("--pol-steps", type=int, default=argparse.SUPPRESS,
+                   help="policy training steps per sleep cycle")
+    p.add_argument("--wm-epochs", type=int, default=argparse.SUPPRESS,
+                   help="world model training epochs per sleep cycle")
+    p.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
+                   help="world model training batch size")
+    p.add_argument("--wm-target-loss", type=float, default=argparse.SUPPRESS,
+                   help="target loss for World Model coreset training")
+    p.add_argument("--freeze-physics", action="store_true", default=argparse.SUPPRESS,
                    help="freeze physics simulation (for debugging token recordings)")
-    p.add_argument("--no-smooth", action="store_true",
+    p.add_argument("--no-smooth", action="store_true", default=argparse.SUPPRESS,
                    help="bypass IIR sensor smoother (use raw snapshots)")
-    p.add_argument("--no-kv-cache", action="store_true",
-                   help="disable the persistent KV-cache for the imagined "
-                        "policy rollouts (enabled by default; inference-only, "
-                        "numerically equivalent, faster when on)")
-    p.add_argument("--no-eos-lookahead", action="store_true",
-                   help="disable the EOS-lookahead (hindsight) policy "
-                        "supervision and fall back to the legacy stochastic "
-                        "candidates (enabled by default)")
-    p.add_argument("--compile", action="store_true",
-                   help="torch.compile the World Model training step "
-                        "(fused fwd+bwd; one-time warm-up at first batch)")
-    p.add_argument("--seq-steps", type=int, default=10,
-                   help="number of multi-step transitions per sequence (default: 10)")
-    p.add_argument("--n-ctx", type=int, default=4,
-                   help="decision context step index (default: 4)")
+    p.add_argument("--no-kv-cache", action="store_true", default=argparse.SUPPRESS,
+                   help="disable the persistent KV-cache for imagined policy rollouts")
+    p.add_argument("--no-eos-lookahead", action="store_true", default=argparse.SUPPRESS,
+                   help="disable EOS-lookahead policy supervision (fall back to stochastic candidates)")
+    p.add_argument("--compile", action="store_true", default=argparse.SUPPRESS,
+                   dest="compile_wm",
+                   help="torch.compile the World Model training step")
+    # NOTE: checkpoint-structure options (--seq-steps, --n-ctx, --wm-hz,
+    # --pol-hz, --d-model, --nhead, --wm-layers, --dim-ff, --wm-dropout,
+    # --pol-hidden, --buffer-capacity, --buffer-pool-capacity) are
+    # intentionally NOT exposed on the CLI.  They define the shape of
+    # wm_ckpt.pt, pol_ckpt.pt and buf_ckpt.pt — changing any of them
+    # invalidates existing checkpoints.  Set them in config.toml instead;
+    # after a change, run with --reset to discard old checkpoints and
+    # start fresh.
+    # Training hyperparameters
+    p.add_argument("--lr-wm", type=float, default=argparse.SUPPRESS,
+                   help="World Model learning rate")
+    p.add_argument("--lr-pol", type=float, default=argparse.SUPPRESS,
+                   help="Policy learning rate")
+    p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
+                   help="action sampling std during wake")
+    p.add_argument("--explore-std", type=float, default=argparse.SUPPRESS,
+                   help="action sampling std during imagination")
+    p.add_argument("--seed", type=int, default=argparse.SUPPRESS,
+                   help="random seed")
+
     args = p.parse_args()
-    if args.headless and not args.steps:
+    cli = vars(args)
+
+    # CLI overrides config
+    CFG.merge_cli(params, cli)
+
+    # Resolve device: --accel overrides --device
+    accel = params.pop("accel")
+    if accel:
+        params["device"] = "auto"
+
+    # --reset: delete checkpoints and exit without starting the app
+    if params.pop("reset", False):
+        for ckpt in (_WM_CKPT, _POL_CKPT, _BUF_CKPT):
+            if os.path.exists(ckpt):
+                os.remove(ckpt)
+                print(f"removed {os.path.basename(ckpt)}")
+        print("brain checkpoints cleared")
+        return
+
+    if params["headless"] and not params["steps"]:
         p.error("--headless requires --steps")
-    dev = "auto" if args.accel else args.device
+
     try:
-        run(headless=args.headless, steps=args.steps, reset=args.reset, device=dev,
-            bootstrap_dataset=args.bootstrap_dataset, pol_steps=args.pol_steps,
-            wm_epochs=args.wm_epochs,
-            freeze_physics=args.freeze_physics, no_smooth=args.no_smooth,
-            wm_target_loss=args.wm_target_loss,
-            use_kv_cache=not args.no_kv_cache,
-            pol_eos_lookahead=not args.no_eos_lookahead,
-            compile_wm=args.compile,
-            seq_steps=args.seq_steps,
-            n_ctx=args.n_ctx)
+        run(**params)
     except KeyboardInterrupt:
         pygame.quit()
 

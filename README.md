@@ -37,6 +37,35 @@ uv pip install -e .
 .venv/bin/python -m lambda_barre.main --device cpu-fast # MKL-DNN
 ```
 
+The console script `lambda-barre` is equivalent to `.venv/bin/python -m lambda_barre.main`.
+
+### Dream Theater (standalone)
+
+Runs sleep cycles offline, straight from the checkpoints, without the physics simulation: the brain is restored, then a full sleep cycle unfolds in the Dream Theater (press `S` to start a cycle, `SPACE` to pause).
+
+```bash
+.venv/bin/python -m lambda_barre.dream_theater
+dream-theater --accel               # console script equivalent
+dream-theater --no-save             # view-only: checkpoints are not written back
+```
+
+| Option | Description | Possible values |
+|---|---|---|
+| `--wm-epochs N` | World Model training epochs per sleep cycle. | Integer *(default: 512)* |
+| `--pol-steps N` | Policy training steps per sleep cycle. | Integer *(default: 32)* |
+| `--no-save` | Skips writing the trained checkpoints back at the end of the cycle. | Boolean flag |
+| `--no-eos-lookahead` | Falls back to the legacy stochastic candidates. | Boolean flag |
+| `--wm` / `--pol` / `--buffer` | Checkpoint paths (defaults: repo `wm_ckpt.pt`, `pol_ckpt.pt`, `buf_ckpt.pt`). | Path |
+
+### WM Theater
+
+The World Model Theater (Coreset sequence inspection against WM rollouts) is available as `wm-theater`, equivalent to `.venv/bin/python -m lambda_barre.wm_theater`.
+
+```bash
+wm-theater                          # default checkpoints, relief sort
+wm-theater --sort abs_desc          # extreme sequences first
+```
+
 ### Options
 
 | Option | Description | Possible values |
@@ -53,6 +82,34 @@ Options passed through the environment:
 * **`LAMBDA_DEVICE=cuda`**: `--device cuda`
 * **`LAMBDA_TORCH_MKLDNN=1`**: `--device cpu-fast`
 * **`SDL_VIDEODRIVER=dummy`**: Ideal for headless mode.
+
+### Configuration file (`config.toml`)
+
+Checkpoint-structure options are **not** exposed on the CLI. They define the
+shape of `wm_ckpt.pt`, `pol_ckpt.pt`, and `buf_ckpt.pt` — changing any of them
+invalidates existing checkpoints. Set them in `config.toml` instead.
+
+| TOML key | Parameter | Affected checkpoint |
+|---|---|---|
+| `[transformer] d_model` | Transformer latent dimension | `wm_ckpt.pt`, `pol_ckpt.pt` |
+| `[transformer] nhead` | Attention heads | `wm_ckpt.pt` |
+| `[transformer] layers` | Transformer encoder layers | `wm_ckpt.pt` |
+| `[transformer] dim_ff` | Feed-forward hidden dimension | `wm_ckpt.pt` |
+| `[transformer] dropout` | Dropout rate | `wm_ckpt.pt` (training behaviour) |
+| `[policy] hidden` | Policy hidden layer width | `pol_ckpt.pt` |
+| `[sequence] seq_steps` | Transitions per training sequence | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] n_ctx` | Decision context length | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] wm_hz` | World Model recording cadence (Hz) | `buf_ckpt.pt` (temporal semantics) |
+| `[sequence] pol_hz` | Policy cadence (Hz, typically 2× wm_hz) | `buf_ckpt.pt` (temporal semantics) |
+| `[buffer] capacity` | Session journal capacity (sequences) | `buf_ckpt.pt` (truncation) |
+| `[buffer] pool_capacity` | Coreset long-term capacity (sequences) | `buf_ckpt.pt` (truncation) |
+
+After changing any of these, run with `--reset` to discard old checkpoints
+and start fresh:
+
+```bash
+.venv/bin/python -m lambda_barre.main --reset
+```
 
 ## Controls (GUI)
 

@@ -4,6 +4,9 @@ pyproject.toml
 lambda_barre/__init__.py
 lambda_barre/body.py
 lambda_barre/brain.py
+lambda_barre/dataset.py
+lambda_barre/dream.py
+lambda_barre/dream_theater.py
 lambda_barre/extero.py
 lambda_barre/intero.py
 lambda_barre/main.py
@@ -14,6 +17,7 @@ lambda_barre/smoother.py
 lambda_barre/test_brain.py
 lambda_barre/tokenize.py
 lambda_barre/ui.py
+lambda_barre/wm_theater.py
 lambda_barre/world.py
 lambda_barre.egg-info/PKG-INFO
 lambda_barre.egg-info/SOURCES.txt

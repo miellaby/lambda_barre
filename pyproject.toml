@@ -11,3 +11,5 @@ dependencies = [
 
 [project.scripts]
 lambda-barre = "lambda_barre.main:main"
+dream-theater = "lambda_barre.dream_theater:main"
+wm-theater = "lambda_barre.wm_theater:main"

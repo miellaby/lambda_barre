@@ -509,7 +509,6 @@ def test_brain_drives_real_sim_and_sleeps():
         if accum >= DT:
             accum -= DT
             salve = encoder.encode(signals, ts, cs, vs, isg, rs, skel)
-            brain.record(salve)
             tl, dl, tr, dr, tq = brain.act(salve)
             tf_phys = tl * THETA_RANGE
             tb_phys = tr * THETA_RANGE
@@ -529,6 +528,10 @@ def test_brain_drives_real_sim_and_sleeps():
                 skel.limb_r.d_star = db_phys
 
             skel.tail_act.theta_star = tq_phys
+            # the salve's action tokens carry the consigne responding to its
+            # state (a_i answers S_i) — same convention as the wake loop
+            salve[13:16] = T.encode_action(tf_phys, df_phys, tb_phys, db_phys, tq_phys)
+            brain.record(salve)
             B.apply_consignes(skel)
     assert len(brain.buffer) >= 1  # at least one complete sequence from 4s sim
     # wm_target_loss=None: quota-only — real-sim data rarely reaches the 0.01
