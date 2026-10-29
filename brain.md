@@ -40,18 +40,18 @@ bootstrap de données d'équilibre). Le pipeline complet est documenté dans
                 nouvel état
 ```
 
-Pendant l'**éveil**, la physique tourne à 60 Hz. À 3 Hz, chaque tick du world
-model produit une **salve** : 16 tokens denses (13 d'état + 3 d'action) qui
-résume la dernière seconde d'expérience sensorielle (lissée par IIR). La
-salve est journalisée dans la mémoire (`Brain.record`, avec pause
-d'enregistrement quand plus rien ne bouge) et un forward pass du world model
-rafraîchit le **latent** observé par la politique (`Brain.wake_tick`) — que
-le cerveau pilote ou non : c'est le passe perceptif, l'observation de la
-politique ne doit jamais être périmée. À 6 Hz (brain on), la politique
-échantillonne 5 consignes à partir des scalaires sensoriels frais et du
-latent caché (`Brain.act`) ; les consignes ne rentrent pas directement dans la physique :
-des **valeurs effectives** convergent vers elles (50 % de l'écart par période
-policy, voir `body.py`), amortissant les changements brutaux.
+Pendant l'**éveil**, la physique tourne à 60 Hz. À la cadence world model
+(5 Hz), chaque tick produit une **salve** : 16 tokens denses (13 d'état +
+3 d'action) qui résume la dernière seconde d'expérience sensorielle (lissée
+par IIR). La salve est journalisée dans la mémoire (`Brain.record_tick`, avec
+pause d'enregistrement quand plus rien ne bouge) et alimente l'historique de
+contexte. À la cadence policy (10 Hz, brain on), un forward pass du world
+model produit un **latent** frais à chaque tick — l'observation de la
+politique n'est jamais périmée — et la politique échantillonne 5 consignes
+à partir des scalaires sensoriels frais et de ce latent (`Brain.brain_tick`) ;
+les consignes ne rentrent pas directement dans la physique : des **valeurs
+effectives** convergent vers elles (50 % de l'écart par période policy, voir
+`body.py`), amortissant les changements brutaux.
 
 Pendant le **sommeil** (`Brain.sleep`, déclenché par `S`), tout se passe
 hors-ligne et en générateur (l'UI consomme un pas par frame) : optimisation
@@ -205,8 +205,7 @@ world model (3 Hz) et conservé entre les ticks.
 
 Un MLP : 3 couches cachées de 256 (ReLU), puis une tête linéaire 256 → 5.
 L'échantillonnage se fait dans l'espace pré-squash avec une gaussienne
-isotrope de std fixe (`act_std` = 0.05 ; `explore_std` = 0.2 pendant
-l'exploration en sommeil).
+isotrope de std fixe (`act_std` = 0.05).
 
 ### Sorties
 
@@ -243,18 +242,17 @@ interpolation.
 
 ### Éveil
 
-* `record(salve)` (3 Hz) journalise la salve dans les segments linéaires
-  de la mémoire ; l'enregistrement se met en pause après 6 ticks
-  successifs où animal, environnement et consignes sont immobiles (tolérance
-  1e-4), et reprend dès qu'un signal bouge sans vider le contexte.
-* `wake_tick(salve)` (3 Hz) forward du world model sur l'historique
-  glissant (4 dernières transitions + état courant), rafraîchit le latent
-  normalisé et les scalaires cachés.
-* `act(salve)` (6 Hz) échantillonne les 5 consignes
-  (scalaires frais + latent caché) et les renvoie à la boucle, qui les écrit
-  comme consignes dans le squelette ; Ce sont des valeurs lissées
-  de ces consignes qui sont entrées dans la physique et journalisées
-  (convergence à 50 % de l'écart par période policy).
+* `record_tick(salve)` (cadence WM, 5 Hz) journalise la salve dans les
+  segments linéaires de la mémoire et alimente l'historique de contexte ;
+  l'enregistrement se met en pause après 6 ticks successifs où animal,
+  environnement et consignes sont immobiles (tolérance 1e-4), et reprend
+  dès qu'un signal bouge sans vider le contexte.
+* `brain_tick(salve)` (cadence policy, 10 Hz) : forward du world model sur
+  l'historique glissant (4 dernières transitions + état courant), produisant
+  un latent frais ; la politique échantillonne les 5 consignes (scalaires
+  frais + latent) que la boucle écrit comme consignes dans le squelette.
+  Ce sont des valeurs lissées de ces consignes qui sont entrées dans la
+  physique et journalisées (convergence à 50 % de l'écart par période policy).
 
 La policy (act) peut être désactivée pendant l'éveil (*brain off*).
 Les consignes sont alors contrôlés par l'utisateur.

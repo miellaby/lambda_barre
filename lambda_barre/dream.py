@@ -330,6 +330,14 @@ class DreamTheater:
         self.tab_names = ["All (6 Rows)", "0: Policy", "1: Replay", "2: Noise 30%"]
         self._btn_rects: dict[str, pygame.Rect] = {}
 
+        # Sleep cycle progress tracking (fed by dream_theater.py / main.py)
+        self.sleep_active = False
+        self.sleep_phase = ""           # "prune" | "filter" | "wm" | "pol" | "done" | ""
+        self.sleep_step = 0
+        self.sleep_total = 0
+        self.coreset_size = 0
+        self.addendum_size = 0
+
         # Geometry
         self.header_h = 56
         self.thumb_w = 92
@@ -375,6 +383,12 @@ class DreamTheater:
         self.target_scroll_y = 0
         self.tab_idx = 0
         self.step_once = False
+
+    def set_sleep_progress(self, phase: str, step: int = 0, total: int = 0) -> None:
+        """Update the sleep-cycle progress overlay (called by the host loop)."""
+        self.sleep_phase = phase
+        self.sleep_step = step
+        self.sleep_total = total
 
     def toggle_pause(self) -> bool:
         self.is_paused = not self.is_paused
@@ -477,37 +491,110 @@ class DreamTheater:
     def _draw_wm_training(self, screen: pygame.Surface, font: pygame.font.Font,
                           font_small: pygame.font.Font, status: str,
                           brain) -> None:
-        """Sleep screen shown before the first policy step of the cycle."""
-        # World Model training screen (no "Phase 1")
+        """Sleep screen shown before the first policy step of the cycle.
+        Shows an accueil screen when no sleep is running, or a progress
+        overlay with phase + step/total when a sleep cycle is active."""
         pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h))
         pygame.draw.line(screen, CARD_BORDER, (0, self.header_h), (self.width, self.header_h), 1)
-        title_str = "World Model Training"
+
+        # --- Écran d'accueil : aucun sleep actif, pas d'historique ---
+        if not self.sleep_active:
+            title_str = "DREAM THEATER"
+            s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
+            screen.blit(s_title, (16, 16))
+            sub = font_small.render("Sleep Cycle Visualizer", FONT_AA, TEXT_MUTED)
+            screen.blit(sub, (16, 38))
+
+            cw, ch = 560, 280
+            cx = (self.width - cw) // 2
+            cy = (self.height - ch) // 2
+            card_rect = pygame.Rect(cx, cy, cw, ch)
+            pygame.draw.rect(screen, CARD_BG, card_rect, border_radius=8)
+            pygame.draw.rect(screen, CARD_BORDER, card_rect, 1, border_radius=8)
+
+            # Bouton "Press S"
+            btn_w, btn_h = 220, 44
+            btn_x = cx + (cw - btn_w) // 2
+            btn_y = cy + 24
+            btn_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+            pygame.draw.rect(screen, (60, 130, 220), btn_rect, border_radius=6)
+            s_btn = font.render("Press S to start", FONT_AA, TEXT_WHITE)
+            screen.blit(s_btn, (btn_x + (btn_w - s_btn.get_width()) // 2,
+                                btn_y + (btn_h - s_btn.get_height()) // 2))
+
+            # Infos checkpoints
+            info_lines = []
+            if brain is not None:
+                cs = getattr(brain.buffer, "coreset_size", 0)
+                buf_len = len(brain.buffer)
+                dev = getattr(brain, "device_desc", "cpu")
+                info_lines.append((f"Coreset: {cs} sequences", TEXT_WHITE))
+                info_lines.append((f"Buffer:  {buf_len} sequences", TEXT_WHITE))
+                info_lines.append((f"Device:  {dev}", TEXT_MUTED))
+            else:
+                info_lines.append(("No brain loaded", TEXT_MUTED))
+
+            for idx, (s_line, s_col) in enumerate(info_lines):
+                s_rend = font_small.render(s_line, FONT_AA, s_col)
+                screen.blit(s_rend, (cx + 36, btn_y + btn_h + 20 + idx * 22))
+
+            # Contrôles
+            ctrl_y = cy + ch - 60
+            ctrls = [
+                "S: Start sleep cycle    Space: Pause/Resume    N: Next step",
+                "Esc: Quit    Alt+Enter: Fullscreen",
+            ]
+            for idx, c in enumerate(ctrls):
+                s_c = font_small.render(c, FONT_AA, TEXT_MUTED)
+                screen.blit(s_c, (cx + (cw - s_c.get_width()) // 2, ctrl_y + idx * 20))
+            return
+
+        # --- Sleep actif : barre de progression + stats ---
+        phase_labels = {
+            "prune":  "Pruning & deduplication",
+            "filter": "Surprise filter",
+            "wm":     "World Model training",
+            "pol":    "Policy training (hindsight)",
+            "done":   "Sleep cycle complete",
+        }
+        phase_label = phase_labels.get(self.sleep_phase, self.sleep_phase or "Sleep cycle")
+        title_str = f"Sleep Cycle — {phase_label}"
         s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
         screen.blit(s_title, (16, 16))
 
-        cw, ch = 560, 236
+        cw, ch = 560, 260
         cx = (self.width - cw) // 2
         cy = (self.height - ch) // 2
         card_rect = pygame.Rect(cx, cy, cw, ch)
         pygame.draw.rect(screen, CARD_BG, card_rect, border_radius=8)
         pygame.draw.rect(screen, CARD_BORDER, card_rect, 1, border_radius=8)
 
-        msg = status if status else "World Model optimization in progress..."
-        txt = font.render(msg, FONT_AA, TEXT_WHITE)
-        screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 14))
+        # Barre de progression
+        pb_w, pb_h = cw - 60, 8
+        pb_x = cx + 30
+        pb_y = cy + 18
+        pct = 0.0
+        if self.sleep_total > 0:
+            pct = min(1.0, max(0.0, self.sleep_step / self.sleep_total))
+        elif self.sleep_phase == "done":
+            pct = 1.0
+        pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=4)
+        pygame.draw.rect(screen, (70, 180, 120), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=4)
 
-        import re
-        m = re.search(r"(\d+)/(\d+)", msg)
-        if m:
-            step, total = int(m.group(1)), int(m.group(2))
-            pct = min(1.0, max(0.0, step / max(1, total)))
-            pb_w, pb_h = cw - 60, 6
-            pb_x = cx + 30
-            pb_y = cy + 36
-            pygame.draw.rect(screen, (30, 36, 50), (pb_x, pb_y, pb_w, pb_h), border_radius=3)
-            pygame.draw.rect(screen, (70, 140, 230), (pb_x, pb_y, int(pb_w * pct), pb_h), border_radius=3)
+        # Step / total
+        if self.sleep_total > 0:
+            step_txt = f"{self.sleep_step} / {self.sleep_total}"
+        else:
+            step_txt = self.sleep_phase
+        s_step = font_small.render(step_txt, FONT_AA, TEXT_ACCENT)
+        screen.blit(s_step, (cx + 30, pb_y + 14))
 
-        # Replicate console print lines in the GUI
+        # Status text
+        msg = status if status else "Optimization in progress..."
+        txt = font_small.render(msg, FONT_AA, TEXT_WHITE)
+        screen.blit(txt, (cx + (cw - txt.get_width()) // 2, cy + 48))
+
+        # Stats du cycle
         print_lines: list[tuple[str, tuple[int, int, int]]] = []
         if brain is not None:
             cycle = getattr(brain, "sleep_cycle_stats", {})
@@ -537,7 +624,12 @@ class DreamTheater:
 
         for idx, (s_line, s_col) in enumerate(print_lines):
             s_rend = font_small.render(s_line, FONT_AA, s_col)
-            screen.blit(s_rend, (cx + 36, cy + 52 + idx * 21))
+            screen.blit(s_rend, (cx + 36, cy + 76 + idx * 21))
+
+        # Hint pause
+        pause_hint = " [PAUSED — N: next step]" if self.is_paused else " [Running — Space: pause]"
+        s_hint = font_small.render(pause_hint, FONT_AA, TEXT_MUTED)
+        screen.blit(s_hint, (self.width - s_hint.get_width() - 16, 38))
 
     def _draw_legacy(self, screen: pygame.Surface, rec: DreamRecord,
                      font: pygame.font.Font, font_small: pygame.font.Font) -> None:

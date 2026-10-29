@@ -417,7 +417,7 @@ def test_wm_lookahead_training_pass_in_sleep():
     assert math.isfinite(loss_causal) and loss_causal >= 0.0
     assert math.isfinite(loss_look) and loss_look >= 0.0
 
-    stats = _run_sleep(b, wm_epochs=8, wm_batch=16, pol_steps=1, pol_batch=4)
+    stats = _run_sleep(b, wm_coreset_epoch=8, wm_addendum_epoch=8, wm_batch=16, pol_steps=1, pol_batch=4)
     assert stats is not None
     assert math.isfinite(stats["wm_lookahead_loss"])   # epochs 4 and 8 are lookahead passes
 
@@ -455,9 +455,9 @@ def test_sleep_trains_both_models_and_world_loss_decreases():
     # wm_target_loss=None: quota-only — the data is i.i.d. random, its
     # irreducible loss floor (~0.08) can never reach the 0.01 target and the
     # overtime loop would never terminate.
-    s1 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12,
+    s1 = _run_sleep(b, wm_coreset_epoch=4, wm_addendum_epoch=4, wm_batch=32, pol_steps=8, pol_batch=12,
                     clear_buffer=False, wm_target_loss=None)
-    s2 = _run_sleep(b, wm_epochs=4, wm_batch=32, pol_steps=8, pol_batch=12,
+    s2 = _run_sleep(b, wm_coreset_epoch=4, wm_addendum_epoch=4, wm_batch=32, pol_steps=8, pol_batch=12,
                     wm_target_loss=None)
     # losses are finite
     for k in ("wm_loss", "pol_loss"):
@@ -536,7 +536,7 @@ def test_brain_drives_real_sim_and_sleeps():
     assert len(brain.buffer) >= 1  # at least one complete sequence from 4s sim
     # wm_target_loss=None: quota-only — real-sim data rarely reaches the 0.01
     # target within a test's time budget, and the overtime loop has no cap.
-    stats = _run_sleep(brain, wm_epochs=2, wm_batch=24, pol_steps=4, pol_batch=12,
+    stats = _run_sleep(brain, wm_coreset_epoch=2, wm_addendum_epoch=2, wm_batch=24, pol_steps=4, pol_batch=12,
                        wm_target_loss=None)
     for k in ("wm_loss", "pol_loss"):
         assert stats[k] == stats[k]   # finite
@@ -651,7 +651,6 @@ def test_brain_boundary_and_history_isolation():
     b.boundary()
     assert len(b.buffer) == 15 - (b.buffer.seq_len) + 1  # preserved in completed segments
     assert len(b._wake_history) == 0                     # wake context cleared
-    assert b._cached_latent is None
 
 
 def test_experience_buffer_two_tier_consolidation_and_persistence():
@@ -749,20 +748,17 @@ def test_sleep_preserves_wake_history_context():
     # Record and tick several transitions
     for i in range(15):
         salve = _make_salve([0.1 * (i % 5)] * 53, [0.5] * 5)
-        b.record(salve)
-        b.wake_tick(salve)
+        b.record_tick(salve)
 
     wake_len_before = len(b._wake_history)
     assert wake_len_before > 0
-    assert b._cached_latent is not None
 
     # Run sleep (quota-only: the 0.01 target is not the point of this test)
-    _run_sleep(b, wm_epochs=1, wm_batch=8, pol_steps=1, pol_batch=4,
+    _run_sleep(b, wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=8, pol_steps=1, pol_batch=4,
                wm_target_loss=None)
 
-    # Wake history and cached latent must be preserved across sleep
+    # Wake history must be preserved across sleep
     assert len(b._wake_history) == wake_len_before
-    assert b._cached_latent is not None
 
 
 def test_reset_restores_limb_distances():
@@ -1267,7 +1263,7 @@ def test_sleep_wm_coreset_stopping_condition():
 
     # Case 1: Target loss is already satisfied (10.0) -> completes full quota (4 epochs)
     steps_core = 0
-    for label, val in b.sleep(wm_epochs=4, wm_batch=16, pol_steps=1, pol_batch=8,
+    for label, val in b.sleep(wm_coreset_epoch=4, wm_addendum_epoch=4, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_coreset_target_loss=10.0, prune_pct=0.0):
         if label == "wm_coreset":
             steps_core += 1
@@ -1277,7 +1273,7 @@ def test_sleep_wm_coreset_stopping_condition():
     # The loop MUST continue past epoch 1 in overtime until loss <= 0.05
     steps_overtime = 0
     final_loss = 1.0
-    for label, val in b.sleep(wm_epochs=1, wm_batch=16, pol_steps=1, pol_batch=8,
+    for label, val in b.sleep(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_target_loss=0.05, prune_pct=0.0):
         if label == "wm_coreset":
             steps_overtime += 1
@@ -1293,7 +1289,7 @@ def test_sleep_wm_coreset_stopping_condition():
         b.record(salve)
     steps_add_overtime = 0
     final_add_loss = 1.0
-    for label, val in b.sleep(wm_epochs=1, wm_batch=16, pol_steps=1, pol_batch=8,
+    for label, val in b.sleep(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_target_loss=0.05, prune_pct=0.0, surprise_factor=0.0):
         if label == "wm_addendum":
             steps_add_overtime += 1
@@ -1467,7 +1463,7 @@ def test_brain_custom_seq_steps_and_n_ctx():
     assert not torch.isnan(torch.tensor(wm_loss))
 
     # Run sleep
-    stats = _run_sleep(b, wm_epochs=1, pol_steps=1)
+    stats = _run_sleep(b, wm_coreset_epoch=1, wm_addendum_epoch=1, pol_steps=1)
     assert stats is not None
     assert b.buffer.coreset_size > 0
 

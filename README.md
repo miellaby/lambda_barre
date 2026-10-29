@@ -51,7 +51,8 @@ dream-theater --no-save             # view-only: checkpoints are not written bac
 
 | Option | Description | Possible values |
 |---|---|---|
-| `--wm-epochs N` | World Model training epochs per sleep cycle. | Integer *(default: 512)* |
+| `--wm-coreset-epoch N` | World Model training epochs per sleep cycle (Coreset phase). | Integer *(default: 512)* |
+| `--wm-addendum-epoch N` | World Model training epochs per sleep cycle (Addendum phase). | Integer *(default: 128)* |
 | `--pol-steps N` | Policy training steps per sleep cycle. | Integer *(default: 32)* |
 | `--no-save` | Skips writing the trained checkpoints back at the end of the cycle. | Boolean flag |
 | `--no-eos-lookahead` | Falls back to the legacy stochastic candidates. | Boolean flag |

@@ -84,6 +84,8 @@ class WMTheaterRecord:
     early_cost: float = 0.0
     late_cost_real: float = 0.0
     late_cost_pred: float = 0.0
+    # Hindsight (forced-EOS) comparison info — populated when lookahead=True
+    hindsight_info: dict | None = None
 
 
 def compute_posture_rmse(real_toks: list[list[float]], pred_toks: list[list[float]]) -> float:
@@ -116,6 +118,7 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
     device = brain.device
     num_salves = len(seq)
     steps: list[WMStepData] = []
+    hindsight_info: dict | None = None
 
     # 1. Decode ground truth steps and costs
     real_steps: list[DreamStep] = []
@@ -224,6 +227,21 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         gen_toks = res["gen_toks"]
         gen_action = res["gen_action"]
 
+        # Comparison info: baseline vs hindsight (forced-EOS)
+        c_pi_val = float(res["c_pi"][0].item())
+        c_gen_val = float(res["c_gen"][0].item())
+        hindsight_info = {
+            "c_pi": c_pi_val,
+            "c_gen": c_gen_val,
+            "delta_cost": c_gen_val - c_pi_val,
+            "accepted": bool(c_gen_val < c_pi_val),
+            "eos_pi": res["eos_pi"][0].tolist(),
+            "eos_forced": res["eos_forced"][0].tolist(),
+            "eos_gen": res["eos_gen"][0].tolist(),
+            "recorded_a4": res["recorded_a4"][0].tolist(),
+            "gen_a4": gen_action[0].tolist(),
+        }
+
         # Steps 0..3: pure context
         for i in range(4):
             steps.append(WMStepData(
@@ -316,6 +334,7 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         early_cost=early_cost,
         late_cost_real=late_cost_real,
         late_cost_pred=late_cost_pred,
+        hindsight_info=hindsight_info,
     )
 
 
@@ -464,6 +483,7 @@ class WMTheater:
 
         self.num_seqs = len(self.buffer._coreset)
         self.show_lookahead: bool = False
+        self.show_comparison: bool = False
         self.cache: dict[tuple[int, bool], WMTheaterRecord] = {}
 
         # Compute reliefs across all coreset sequences for instant sorting
@@ -514,6 +534,12 @@ class WMTheater:
         """Toggle between teacher-forced autoregressive rollout and lookahead imagination."""
         self.show_lookahead = not self.show_lookahead
         self._load_record(self.seq_idx)
+
+    def toggle_comparison(self) -> None:
+        """Toggle the forced-EOS comparison overlay (only meaningful in lookahead mode)."""
+        if not self.show_lookahead:
+            return
+        self.show_comparison = not self.show_comparison
 
     def _update_sorted_indices(self) -> None:
         if self.sort_mode == "relief_desc":
@@ -612,6 +638,9 @@ class WMTheater:
             elif ev.key == pygame.K_l:
                 self.toggle_lookahead()
                 return True
+            elif ev.key == pygame.K_f:
+                self.toggle_comparison()
+                return True
             elif ev.key == pygame.K_HOME:
                 self.set_sorted_idx(0)
                 return True
@@ -688,6 +717,104 @@ class WMTheater:
             return True
 
         return False
+
+    def _draw_comparison_overlay(self, screen: pygame.Surface,
+                                  font: pygame.font.Font,
+                                  font_small: pygame.font.Font,
+                                  font_tiny: pygame.font.Font,
+                                  rec: WMTheaterRecord) -> None:
+        """Overlay panel showing baseline vs hindsight (forced-EOS) comparison:
+        recorded action a4 vs generated a4*, cost C_pi vs C_gen, EOS predicted
+        vs forced vs realized, and the accept/reject verdict."""
+        info = rec.hindsight_info
+        if info is None:
+            return
+
+        # Panel on the right side
+        pw, ph = 360, 300
+        px = self.width - pw - 16
+        py = 90
+        panel = pygame.Rect(px, py, pw, ph)
+        # Semi-transparent background
+        overlay = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        overlay.fill((20, 24, 36, 235))
+        screen.blit(overlay, (px, py))
+        pygame.draw.rect(screen, (185, 110, 245), panel, 2, border_radius=6)
+
+        y = py + 10
+
+        # Title
+        s = font_small.render("Forced-EOS Comparison  [F]", FONT_AA, (225, 175, 255))
+        screen.blit(s, (px + 12, y))
+        y += 24
+
+        # Verdict badge
+        accepted = info["accepted"]
+        badge_color = (80, 220, 130) if accepted else (240, 110, 120)
+        badge_txt = "ACCEPTED — hindsight beats baseline" if accepted else "REJECTED — baseline is better"
+        s = font_small.render(badge_txt, FONT_AA, badge_color)
+        screen.blit(s, (px + 12, y))
+        y += 26
+
+        # Action comparison: recorded a4 vs generated a4*
+        s = font_tiny.render("Action a4 (recorded vs hindsight):", FONT_AA, TEXT_MUTED)
+        screen.blit(s, (px + 12, y))
+        y += 16
+
+        names = ["θ_front", "d_front", "θ_back", "d_back", "tail"]
+        recorded = info["recorded_a4"]
+        gen = info["gen_a4"]
+        for i, name in enumerate(names):
+            rv = recorded[i]
+            gv = gen[i]
+            # Format: signed dims in degrees, unsigned in physical units
+            if i in (0, 2, 4):  # theta (signed [-1,1] -> degrees)
+                r_str = f"{rv * 180:+.0f}°"
+                g_str = f"{gv * 180:+.0f}°"
+            else:  # d (unsigned [0,1] -> physical)
+                r_str = f"{10 + rv * 22:.1f}"
+                g_str = f"{10 + gv * 22:.1f}"
+            delta = gv - rv
+            d_str = f"{delta:+.3f}" if abs(delta) > 0.001 else "  =  "
+            line = f"  {name:8s}  {r_str:>7s}  →  {g_str:>7s}   ({d_str})"
+            c = (100, 245, 160) if (delta > 0.001 if i in (0, 2, 4) else delta > 0.001) else \
+                ((240, 110, 120) if abs(delta) > 0.001 else TEXT_MUTED)
+            s = font_tiny.render(line, FONT_AA, TEXT_WHITE if abs(delta) < 0.001 else c)
+            screen.blit(s, (px + 12, y))
+            y += 15
+
+        y += 6
+
+        # Cost comparison
+        c_pi = info["c_pi"]
+        c_gen = info["c_gen"]
+        delta_c = info["delta_cost"]
+        s = font_tiny.render("Rollout cost:", FONT_AA, TEXT_MUTED)
+        screen.blit(s, (px + 12, y))
+        y += 16
+        s = font_tiny.render(f"  Baseline (a4)  : {c_pi:.3f}", FONT_AA, TEXT_WHITE)
+        screen.blit(s, (px + 12, y))
+        y += 15
+        s = font_tiny.render(f"  Hindsight (a4*) : {c_gen:.3f}   ({delta_c:+.3f})",
+                             FONT_AA, (100, 245, 160) if delta_c < 0 else (240, 110, 120))
+        screen.blit(s, (px + 12, y))
+        y += 20
+
+        # EOS comparison (6 slots: 5 costs + 1 reward)
+        s = font_tiny.render("EOS slots (lower=better, slot 5 higher=better):", FONT_AA, TEXT_MUTED)
+        screen.blit(s, (px + 12, y))
+        y += 16
+        eos_pi = info["eos_pi"]
+        eos_forced = info["eos_forced"]
+        eos_gen = info["eos_gen"]
+        slot_names = ["EF", "DO", "CO", "IN", "VE", "CF"]
+        for i, sn in enumerate(slot_names):
+            pi_v = eos_pi[i]
+            fo_v = eos_forced[i]
+            ge_v = eos_gen[i]
+            line = f"  {sn}  pred:{pi_v:.2f}  forced:{fo_v:.2f}  gen:{ge_v:.2f}"
+            screen.blit(font_tiny.render(line, FONT_AA, TEXT_WHITE), (px + 12, y))
+            y += 14
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font,
              font_small: pygame.font.Font, font_tiny: pygame.font.Font) -> None:
@@ -1027,7 +1154,10 @@ class WMTheater:
 
         # 4. Footer & Legend
         footer_y = self.height - 24
-        hints = "Nav: [← / →]  |  [S] Sort  |  [L] Lookahead  |  Hover: Tokens  |  [Esc / Q] Quit"
+        if self.show_lookahead:
+            hints = "Nav: [← / →]  |  [S] Sort  |  [L] Rollout  |  [F] Compare  |  Hover: Tokens  |  [Esc / Q] Quit"
+        else:
+            hints = "Nav: [← / →]  |  [S] Sort  |  [L] Lookahead  |  Hover: Tokens  |  [Esc / Q] Quit"
         s_hints = font_small.render(hints, FONT_AA, TEXT_MUTED)
         screen.blit(s_hints, (self.margin_x, footer_y))
 
@@ -1041,6 +1171,10 @@ class WMTheater:
             s_c = font_tiny.render(code, FONT_AA, TEXT_WHITE)
             screen.blit(s_c, (cur_lx + 11, footer_y + 1))
             cur_lx += 42
+
+        # 4b. Forced-EOS comparison overlay (only in lookahead mode)
+        if self.show_comparison and self.show_lookahead and rec is not None:
+            self._draw_comparison_overlay(screen, font, font_small, font_tiny, rec)
 
         # 5. Pop-in overlay on top of everything
         if hover_card_info is not None:
@@ -1060,12 +1194,16 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
                 dim_ff: int = 384, wm_dropout: float = 0.0,
                 pol_hidden: int = 256,
                 lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-                act_std: float = 0.05, explore_std: float = 0.2,
+                act_std: float = 0.05,
                 wm_batch: int = 64,
                 seed: int = 0,
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 10, n_ctx: int = 4,
-                compile_wm: bool = False) -> None:
+                compile_wm: bool = False,
+                eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
+                eos_force_amplify: float = 1.0,
+                wm_hz: float = 3.0, pol_hz: float = 6.0,
+                **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     try:
         import ctypes
@@ -1089,10 +1227,13 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
                   dim_ff=dim_ff, dropout=wm_dropout,
                   pol_hidden=pol_hidden,
                   lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std, explore_std=explore_std,
+                  act_std=act_std,
                   seed=seed,
                   buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity)
+                  buffer_pool_capacity=buffer_pool_capacity,
+                  eos_force_eps_lo=eos_force_eps_lo,
+                  eos_force_eps_hi=eos_force_eps_hi,
+                  eos_force_amplify=eos_force_amplify)
     if os.path.exists(wm_path) or os.path.exists(pol_path):
         brain.load_checkpoint(
             wm_path=wm_path if os.path.exists(wm_path) else "nonexistent.pt",
@@ -1153,12 +1294,14 @@ def main() -> None:
         "dim_ff": 384, "wm_dropout": 0.0,
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05, "explore_std": 0.2,
+        "act_std": 0.05,
         "wm_batch": 64,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 10, "n_ctx": 4,
         "compile_wm": False,
+        "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
+        "eos_force_amplify": 1.0,
     }
 
     # Override with config.toml
@@ -1199,8 +1342,6 @@ def main() -> None:
                         help="Policy learning rate")
     parser.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
                         help="action sampling std during wake")
-    parser.add_argument("--explore-std", type=float, default=argparse.SUPPRESS,
-                        help="action sampling std during imagination")
     parser.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
                         help="World Model training batch size")
     parser.add_argument("--seed", type=int, default=argparse.SUPPRESS,

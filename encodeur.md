@@ -48,5 +48,5 @@ Une **salve** est la séquence complète des **16 tokens** ($13\text{ état} + 3
 ## Cadences temporelles
 
 * **Physique Pymunk** : avance à **60 Hz** (découpée en 3 sous-pas de $1/180\text{ s}$ pour la stabilité numérique).
-* **Politique (`brain.act`)** : intervient à **6 Hz** (`POL_DT = 1/6 s`, toutes les 10 frames de physique) pour réagir promptement et mettre à jour les consignes motrices $(\theta^*, d^*)$ transmises aux actionneurs.
-* **World Model (`brain.record` / `wake_tick`)** : intervient à **3 Hz** (`WM_DT = 1/3 s`, toutes les 20 frames de physique) pour encoder la salve de tokens, enregistrer la mémoire et actualiser la représentation latente.
+* **Politique (`brain.brain_tick`)** : intervient à **10 Hz** (`POL_DT = 1/10 s`, toutes les 6 frames de physique) : forward du world model (latent frais à chaque tick) puis mise à jour des consignes motrices $(\theta^*, d^*)$ transmises aux actionneurs.
+* **World Model (`brain.record_tick`)** : intervient à **5 Hz** (`WM_DT = 1/5 s`, toutes les 12 frames de physique) pour encoder la salve de tokens et enregistrer la mémoire.

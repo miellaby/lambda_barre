@@ -33,7 +33,7 @@ _BUF_CKPT = os.path.join(_CKPT_DIR, "buf_ckpt.pt")
 
 def run(device: str | None = None,
         pol_steps: int = 32,
-        wm_epochs: int = 512,
+        wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
         wm_target_loss: float = 0.01,
         use_kv_cache: bool = True,
         pol_eos_lookahead: bool = True,
@@ -49,10 +49,15 @@ def run(device: str | None = None,
         dim_ff: int = 384, wm_dropout: float = 0.0,
         pol_hidden: int = 256,
         lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-        act_std: float = 0.05, explore_std: float = 0.2,
+        act_std: float = 0.05,
         wm_batch: int = 64,
         seed: int = 0,
-        buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000) -> None:
+        buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
+        eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
+        eos_force_amplify: float = 1.0,
+        wm_impact_floor: float = 0.25,
+        wm_hz: float = 3.0, pol_hz: float = 6.0,
+        **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     try:
         import ctypes
@@ -72,10 +77,14 @@ def run(device: str | None = None,
                   dim_ff=dim_ff, dropout=wm_dropout,
                   pol_hidden=pol_hidden,
                   lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std, explore_std=explore_std,
+                  act_std=act_std,
                   seed=seed,
                   buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity)
+                  buffer_pool_capacity=buffer_pool_capacity,
+                  eos_force_eps_lo=eos_force_eps_lo,
+                  eos_force_eps_hi=eos_force_eps_hi,
+                  eos_force_amplify=eos_force_amplify,
+                  wm_impact_floor=wm_impact_floor)
     try:
         brain.load_checkpoint(wm_path, pol_path, buf_path)
         status = f"brain restored (coreset {brain.buffer.coreset_size})"
@@ -88,6 +97,8 @@ def run(device: str | None = None,
         return
 
     dream_theater = DreamTheater(R.WIDTH, R.HEIGHT)
+    dream_theater.coreset_size = brain.buffer.coreset_size
+    dream_theater.addendum_size = len(brain.buffer) - brain.buffer.coreset_size
     sleep_gen = None       # active sleep generator (None when not sleeping)
 
     running = True
@@ -106,7 +117,11 @@ def run(device: str | None = None,
                 dream_theater.clear()
                 brain.last_dream_record = None
                 dream_theater.is_paused = False
-                sleep_gen = brain.sleep(wm_epochs=wm_epochs, pol_steps=pol_steps,
+                dream_theater.sleep_active = True
+                dream_theater.set_sleep_progress("prune", 0, 0)
+                sleep_gen = brain.sleep(wm_coreset_epoch=wm_coreset_epoch,
+                                        wm_addendum_epoch=wm_addendum_epoch,
+                                        pol_steps=pol_steps,
                                         wm_target_loss=wm_target_loss,
                                         use_kv_cache=use_kv_cache,
                                         pol_eos_lookahead=pol_eos_lookahead)
@@ -122,29 +137,41 @@ def run(device: str | None = None,
                     d_intra = value.get('dedup_intra', 0)
                     d_core = value.get('dedup_coreset', 0)
                     status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
+                    dream_theater.set_sleep_progress("prune", 1, 1)
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
+                    phase = "wm"
                     if label == "wm_addendum":
                         status = f"learning addendum {wm_step}/{wm_total} (loss {value:.2f})"
+                        phase = "wm"
                     elif label == "wm_coreset":
                         status = f"learning coreset {wm_step}/{wm_total} (loss {value:.2f})"
+                        phase = "wm"
                     else:
                         status = f"learning wm {wm_step}/{wm_total} (loss {value:.2f})"
+                        phase = "wm"
+                    dream_theater.set_sleep_progress(phase, wm_step, wm_total)
                 elif label == "filter":
                     status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
+                    dream_theater.set_sleep_progress("filter", 1, 1)
                 elif label == "pol":
                     pol_stats = getattr(brain, "last_pol_stats", None)
+                    pol_step = getattr(brain, "sleep_pol_step", 0)
+                    pol_total = getattr(brain, "sleep_pol_steps", 0)
                     if pol_stats is not None:
                         status = (f"sleeping: pol {value:.2f} "
                                   f"(hindsight {pol_stats['accepted']}/{pol_stats['total']} accepted)")
                     else:
                         status = f"sleeping: pol {value:.2f}"
+                    dream_theater.set_sleep_progress("pol", pol_step, pol_total)
                     if brain.last_dream_record is not None:
                         dream_theater.update(brain.last_dream_record)
                 elif label == "done":
                     stats = value
                     sleep_gen = None
+                    dream_theater.sleep_active = False
+                    dream_theater.set_sleep_progress("done", 1, 1)
                     if save:
                         brain.save_checkpoint(wm_path, pol_path, buf_path)
                     print("[sleep]", stats)
@@ -154,6 +181,7 @@ def run(device: str | None = None,
                               f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
             except StopIteration:
                 sleep_gen = None
+                dream_theater.sleep_active = False
 
         dream_theater.draw(screen, font, font_small, status=status, brain=brain)
         pygame.display.flip()
@@ -168,7 +196,7 @@ def main() -> None:
     params: dict = {
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
         "accel": bool(os.environ.get("LAMBDA_ACCEL")),
-        "pol_steps": 32, "wm_epochs": 512, "wm_target_loss": 0.01,
+        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_target_loss": 0.01,
         "use_kv_cache": True, "pol_eos_lookahead": True,
         "compile_wm": False,
         "seq_steps": 10, "n_ctx": 4,
@@ -176,10 +204,13 @@ def main() -> None:
         "dim_ff": 384, "wm_dropout": 0.0,
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05, "explore_std": 0.2,
+        "act_std": 0.05,
         "wm_batch": 64,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
+        "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
+        "eos_force_amplify": 1.0,
+        "wm_impact_floor": 0.25,
         # CLI-only
         "save": True,
         "wm_path": _WM_CKPT, "pol_path": _POL_CKPT, "buf_path": _BUF_CKPT,
@@ -196,8 +227,10 @@ def main() -> None:
                    help="enable maximum hardware acceleration (CUDA if available, else CPU)")
     p.add_argument("--pol-steps", type=int, default=argparse.SUPPRESS,
                    help="policy training steps per sleep cycle")
-    p.add_argument("--wm-epochs", type=int, default=argparse.SUPPRESS,
-                   help="world model training epochs per sleep cycle")
+    p.add_argument("--wm-coreset-epoch", type=int, default=argparse.SUPPRESS,
+                   help="world model training epochs per sleep cycle (Coreset phase)")
+    p.add_argument("--wm-addendum-epoch", type=int, default=argparse.SUPPRESS,
+                   help="world model training epochs per sleep cycle (Addendum phase)")
     p.add_argument("--wm-target-loss", type=float, default=argparse.SUPPRESS,
                    help="target loss for World Model coreset training")
     p.add_argument("--no-kv-cache", action="store_true", default=argparse.SUPPRESS,
@@ -243,8 +276,6 @@ def main() -> None:
                    help="Policy learning rate")
     p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
                    help="action sampling std during wake")
-    p.add_argument("--explore-std", type=float, default=argparse.SUPPRESS,
-                   help="action sampling std during imagination")
     p.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
                    help="World Model training batch size")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS,

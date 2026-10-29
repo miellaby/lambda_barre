@@ -142,10 +142,10 @@ _EOS_POS = _LAYOUT_DEFAULT["eos_pos"]
 _EOS_IMAGINE = _LAYOUT_DEFAULT["n_imagine"]
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
-_WM_IMPACT_FLOOR = 0.05                                     # floor weight added to every sequence's cost impact
+_WM_IMPACT_FLOOR = 0.25                     # additive floor on every sequence's cost impact (~3x impact/neutral contrast at relief 0.5)
 _WM_REWARD_BOOST = 16.0                                      # gradient boost on S10 reward slots and terminal EOS delta
 _WM_LOOKAHEAD_PERIOD = 4                                     # WM mask alternation: 1 lookahead pass every 4 (3:1 causal:lookahead)
-_EOS_FORCE_EPS = (0.02, 0.10)                                # relative hindsight forcing: eps ~ U(lo, hi) per slot
+_EOS_FORCE_EPS = (0.15, 0.40)                                # default hindsight forcing range (overridable via config.toml)
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
 _EOS_DELTA_SCALE = 0.15
@@ -860,21 +860,25 @@ class Brain:
 
     Lifecycle in the main loop:
 
-        brain.act(salve_t)            -> (theta_l, d_l, theta_r, d_r, tail_t)
+        brain.brain_tick(salve)       -> 5 consignes (WM forward + policy action)
         ... physics steps, sensors ...
-        brain.record(salve_t, salve_next)
+        brain.record_tick(salve)      # at WM cadence: wake history + journal
         brain.sleep()                 # on demand: offline training of both models
     """
 
     def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 2e-4, act_std: float = 0.05,
-                 explore_std: float = 0.2, device: str | None = None, seed: int = 0,
+                 device: str | None = None, seed: int = 0,
                  compile_wm: bool = False,
                  seq_steps: int = DEFAULT_SEQ_STEPS,
                  n_ctx: int = DEFAULT_N_CTX,
                  d_model: int = 64, nhead: int = 4, layers: int = 3,
                  dim_ff: int = 384, dropout: float = 0.0,
                  pol_hidden: int = 256,
-                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000):
+                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
+                 eos_force_eps_lo: float = _EOS_FORCE_EPS[0],
+                 eos_force_eps_hi: float = _EOS_FORCE_EPS[1],
+                 eos_force_amplify: float = 1.0,
+                 wm_impact_floor: float = _WM_IMPACT_FLOOR):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
         # Intra-op parallelism cap: 2 threads wins or ties in both regimes on
@@ -900,7 +904,7 @@ class Brain:
         self.opt_wm = torch.optim.Adam(self.world.parameters(), lr=lr_wm)
         self.opt_pol = torch.optim.Adam(
             list(self.policy.parameters()) + list(self.latent_norm.parameters()),
-            lr=lr_pol, weight_decay=1e-4)
+            lr=lr_pol)
         self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
                                        capacity=buffer_capacity,
                                        pool_capacity=buffer_pool_capacity)
@@ -934,7 +938,10 @@ class Brain:
         self._wm_loss_lookahead = (torch.compile(self._wm_loss_lookahead_impl, dynamic=False)
                                    if compile_wm else self._wm_loss_lookahead_impl)
         self.act_std = act_std
-        self.explore_std = explore_std
+        self.eos_force_eps_lo = eos_force_eps_lo
+        self.eos_force_eps_hi = eos_force_eps_hi
+        self.eos_force_amplify = eos_force_amplify
+        self.wm_impact_floor = wm_impact_floor
         # Precomputed cost tensors, moved to device for the vectorized
         # trajectory-cost in train_policy.
         self._cost_scales = _COST_SCALES.to(self.device)
@@ -954,10 +961,8 @@ class Brain:
         self._kalman_max_v = torch.tensor([0.20, 0.15, 0.20, 0.15, 0.20], device=self.device)
         # Rolling history of recent (state_tokens, action_tokens) for the
         # wake-time world model context. The policy reads the world model's
-        # intermediate latent, which needs the last SEQ_STEPS-1 transitions.
+        # intermediate latent, computed from the last n_ctx transitions.
         self._wake_history: list[tuple[list, list]] = []
-        self._cached_latent = None   # [1, d_model] — refreshed at 1 Hz by wake_tick
-        self._cached_scalars = None  # [1, 47] — scalar state at last wake_tick
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
         self.last_wm_impact = float("nan")
@@ -994,9 +999,9 @@ class Brain:
             torch.mps.synchronize()
 
     @torch.inference_mode()
-    def _wm_forward(self, salve) -> None:
-        """Run the World Model forward on the rolling 3 Hz history + current
-        state, updating the cached latent and scalars. Does NOT modify the
+    def _wm_forward(self, salve) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the World Model forward on the wake history + current state
+        and return (latent, scalars) for the policy. Does NOT modify the
         wake history — that is done by record_tick() at WM cadence."""
         self.mode = "wake"
         cur_state = state_tokens(salve)
@@ -1004,7 +1009,7 @@ class Brain:
         self.world.eval()
         t0 = time.perf_counter()
         self.world(ctx)
-        self._cached_latent = self.latent_norm(self.world.last_latent())  # [1, d_model]
+        latent = self.latent_norm(self.world.last_latent())  # [1, d_model]
         self._sync_device()
         dt_ms = (time.perf_counter() - t0) * 1000
         # seed the EMA with the first measurement: blending into a zero
@@ -1015,36 +1020,27 @@ class Brain:
         else:
             self._wm_time = (1 - self._time_alpha) * self._wm_time \
                 + self._time_alpha * dt_ms
-        self._cached_scalars = self._policy_scalars_batch(
+        scalars = self._policy_scalars_batch(
             torch.tensor(cur_state, dtype=torch.float32,
                          device=self.device).unsqueeze(0))   # [1, 47]
+        return latent, scalars
 
     @torch.inference_mode()
-    def wake_tick(self, salve) -> None:
-        """WM forward + append to wake history. (Legacy entry point, kept
-        for tests and the act() fallback.)"""
-        self._wm_forward(salve)
-        cur_state = state_tokens(salve)
-        a_toks = action_tokens(salve)
-        self._wake_history.append((cur_state, a_toks))
-        if len(self._wake_history) > self.n_ctx:
-            self._wake_history.pop(0)
-
-    @torch.inference_mode()
-    def brain_tick(self, salve) -> tuple[float, float, float, float, float]:
+    def brain_tick(self, salve, std=None) -> tuple[float, float, float, float, float]:
         """One brain tick at policy cadence: WM forward pass + policy action.
 
-        The WM runs on the rolling 3 Hz history + current state to produce a
-        fresh latent; the policy then produces an action from (scalars, latent).
+        The WM runs on the wake history + current state to produce a fresh
+        latent; the policy then produces an action from (scalars, latent).
         The latent is always fresh — never stale. Does NOT modify the wake
-        history; call record_tick() at WM cadence to journal the saline.
+        history; call record_tick() at WM cadence to journal the salve.
 
         Returns 5 consignes: (theta_front, d_front, theta_back, d_back, tail_t).
         """
-        self._wm_forward(salve)
-        pol_in = torch.cat([self._cached_scalars, self._cached_latent], dim=1)
+        latent, scalars = self._wm_forward(salve)
+        pol_in = torch.cat([scalars, latent], dim=1)
         t0 = time.perf_counter()
-        action, _, _ = self.policy.sample(pol_in, self.act_std)
+        action, _, _ = self.policy.sample(
+            pol_in, self.act_std if std is None else std)
         self._sync_device()
         dt_ms = (time.perf_counter() - t0) * 1000
         if self._pol_time <= 0.0:
@@ -1056,7 +1052,7 @@ class Brain:
         return a[0], a[1], a[2], a[3], a[4]
 
     def record_tick(self, salve) -> None:
-        """Record a salve at WM cadence (3 Hz): append (state, action) to the
+        """Record a salve at WM cadence: append (state, action) to the
         wake history and journal to the experience buffer."""
         cur_state = state_tokens(salve)
         a_toks = action_tokens(salve)
@@ -1065,30 +1061,10 @@ class Brain:
             self._wake_history.pop(0)
         self.record(salve)
 
-    @torch.inference_mode()
     def act(self, salve, std=None) -> tuple[float, float, float, float, float]:
-        """Return 5 actuator consignes. Uses fresh scalar sensory readings
-        from ``salve`` directly and reuses the cached latent from the last
-        wake_tick(). If no latent yet (first tick), runs a fallback forward."""
-        if self._cached_latent is None:
-            self.wake_tick(salve)   # has to run wm at least once
-        t0 = time.perf_counter()
-        cur_state = state_tokens(salve)
-        cur_state_t = torch.tensor(cur_state, dtype=torch.float32,
-                                   device=self.device).unsqueeze(0)
-        cur_scalars = self._policy_scalars_batch(cur_state_t)
-        self._cached_scalars = cur_scalars
-        pol_in = torch.cat([cur_scalars, self._cached_latent], dim=1)
-        action, _, _ = self.policy.sample(pol_in, self.act_std if std is None else std)
-        self._sync_device()
-        dt_ms = (time.perf_counter() - t0) * 1000
-        if self._pol_time <= 0.0:
-            self._pol_time = dt_ms
-        else:
-            self._pol_time = (1 - self._time_alpha) * self._pol_time \
-                + self._time_alpha * dt_ms
-        a = action[0].tolist()
-        return a[0], a[1], a[2], a[3], a[4]
+        """Return 5 actuator consignes. Legacy alias for brain_tick(), kept
+        for tests and external callers."""
+        return self.brain_tick(salve, std=std)
 
     @property
     def is_recording(self) -> bool:
@@ -1134,10 +1110,8 @@ class Brain:
         return recorded
 
     def clear_history(self) -> None:
-        """Clear the wake context history, cached latent, and seal the buffer segment."""
+        """Clear the wake context history and seal the buffer segment."""
         self._wake_history.clear()
-        self._cached_latent = None
-        self._cached_scalars = None
         self._recording = True
         self._static_ticks = 0
         self._last_salve = None
@@ -1166,39 +1140,6 @@ class Brain:
             cur_state, dtype=torch.float32, device=self.device)
         ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
         return ctx
-
-    def _refresh_wake_latent(self) -> None:
-        """Recompute _cached_latent and _cached_scalars from _wake_history with
-        the current world model weights (e.g. after sleep training), preventing
-        wake shock from obsolete pre-sleep latents."""
-        if not self._wake_history:
-            return
-        cur_state = self._wake_history[-1][0]
-        n = len(self._wake_history) - 1
-        ctx_len = n * SALVE_TOKENS + STATE_TOKENS
-        ctx = torch.zeros(1, ctx_len, DENSE_DIM, device=self.device)
-        pos = 0
-        for s_toks, a_toks in self._wake_history[:-1]:
-            ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
-                s_toks, dtype=torch.float32, device=self.device)
-            ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
-            pos += STATE_TOKENS
-            ctx[0, pos:pos + ACTION_TOKENS] = torch.tensor(
-                a_toks, dtype=torch.float32, device=self.device)
-            pos += ACTION_TOKENS
-        ctx[0, pos:pos + STATE_TOKENS] = torch.tensor(
-            cur_state, dtype=torch.float32, device=self.device)
-        ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
-        self.world.eval()
-        with torch.inference_mode():
-            self.world(ctx)
-            self._cached_latent = self.latent_norm(self.world.last_latent())
-            self._cached_scalars = self._policy_scalars_batch(
-                torch.tensor(cur_state, dtype=torch.float32,
-                             device=self.device).unsqueeze(0))
-        self._recording = True
-        self._static_ticks = 0
-        self._last_salve = None
 
     # --- sleep: world model training ----------------------------------------
     def _batch_tensors(self, sequences):
@@ -1312,7 +1253,7 @@ class Brain:
         weights = sequence_impact(
             sequences, n_ctx=self.n_ctx,
             eos_time_w=self.buffer._eos_time_w
-        ).to(self.device) + _WM_IMPACT_FLOOR
+        ).to(self.device) + self.wm_impact_floor
         self.last_wm_impact = (weights.sum() / len(sequences)).item()
         if lookahead:
             loss = self._wm_loss_lookahead(vals, weights)
@@ -1551,6 +1492,20 @@ class Brain:
         """
         noise = torch.randn_like(base_action) * sigma
         return torch.clamp(base_action + noise, self._act_min, self._act_max)
+
+    def _amplify_extremes(self, action: torch.Tensor) -> torch.Tensor:
+        """Amplify hindsight actions toward extremes (bold recovery bias).
+        Signed dims (theta) scaled toward ±1, unsigned dims (d) toward 1.
+        factor=1.0 = no-op. Applied to hindsight targets before verification
+        rollout so the policy imitates bolder actions when the WM is too shy."""
+        f = self.eos_force_amplify
+        if f == 1.0:
+            return action
+        out = action.clone()
+        signed = self._act_signed
+        out[:, signed] = torch.clamp(action[:, signed] * f, -1.0, 1.0)
+        out[:, ~signed] = torch.clamp(action[:, ~signed] * f, 0.0, 1.0)
+        return out
 
     # --- sleep: policy training via real context + imagined rollout ----------
     def _gen_state_cached(self, cache) -> torch.Tensor:
@@ -1914,7 +1869,7 @@ class Brain:
         """One policy step under hindsight supervision (see ``train_policy``).
 
         Baseline rollout of the policy action -> (C_pi, imagined EOS delta);
-        multiplicative forcing of its deviation from neutral; hindsight
+        additive EOS forcing (neutrality floor + fixed random eps); hindsight
         generation of a4; causal verification rollout; purely comparative
         acceptance. Returns (updated, loss): updated=False means no sample
         was accepted and no optimizer step was taken."""
@@ -2027,7 +1982,7 @@ class Brain:
                                       use_kv_cache: bool = False) -> dict:
         """Core hindsight lookahead pipeline (shared between policy training and diagnostics/theater):
         1. Baseline rollout of base_action -> (c_pi, eos_pi, steps_pi)
-        2. Multiplicative forcing on the deviation from neutral -> eos_forced
+        2. Additive EOS forcing (neutrality floor, then fixed eps) -> eos_forced
         3. Hindsight action generation under forced EOS -> (gen_toks, gen_action)
         4. Causal verification rollout -> (c_gen, eos_gen, steps_gen)
         """
@@ -2039,13 +1994,12 @@ class Brain:
             ctx, base_cache, base_action, s_dec_toks, n_imagine,
             ctx_len, ctx_mask, use_kv_cache)
 
-        # 2. multiplicative forcing on the deviation from neutral: make the
-        #    predicted denouement deviation eps-proportionally more favorable
-        #    (worsening shrinks toward 0.5, recovery deepens below it) — the
-        #    request scales with what the baseline itself predicts, at any
-        #    delta magnitude (automatic curriculum)
+        # 2. additive forcing toward a more favorable denouement: clamp at
+        #    the neutrality floor (0.5), then push further by a fixed random
+        #    eps (worsening shrinks toward 0.5, recovery deepens below it) —
+        #    the amplitude does NOT scale with the predicted delta
         if eps is None:
-            lo, hi = _EOS_FORCE_EPS
+            lo, hi = self.eos_force_eps_lo, self.eos_force_eps_hi
             eps_val = torch.rand(B, _EOS_NSLOTS, device=device) * (hi - lo) + lo
         elif isinstance(eps, (float, int)):
             eps_val = torch.full((B, _EOS_NSLOTS), float(eps), device=device)
@@ -2070,6 +2024,9 @@ class Brain:
         with torch.inference_mode():
             gen_toks = self._lookahead_generate(ctx, base_cache, eos_forced, use_kv_cache)
             gen_action = self._decode_action_batch(gen_toks)        # [B, 5]
+
+        # 3b. amplify hindsight action toward extremes (bold recovery bias)
+        gen_action = self._amplify_extremes(gen_action)
 
         # 4. causal verification rollout (causality, reachability and graceful
         #    overshoot discovery in one test)
@@ -2110,7 +2067,7 @@ class Brain:
         recorded_a4 = self._decode_action_batch(rec_a_toks)
 
         if eps is None:
-            eps = (_EOS_FORCE_EPS[0] + _EOS_FORCE_EPS[1]) / 2.0
+            eps = (self.eos_force_eps_lo + self.eos_force_eps_hi) / 2.0
 
         hl = self._hindsight_lookahead_pipeline(
             ctx, recorded_a4, s_dec_toks, self.n_imagine,
@@ -2282,7 +2239,8 @@ class Brain:
             yield "pol", loss.item()
 
     # --- sleep entry point ---------------------------------------------------
-    def sleep(self, wm_epochs: int = 128, wm_batch: int = 64,
+    def sleep(self, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
+              wm_batch: int = 64,
               pol_steps: int = 64, pol_batch: int = 32,
               pol_n_imagine: int | None = None, clear_buffer: bool = True,
               prune_pct: float = 0.33, surprise_factor: float = 1.0,
@@ -2375,8 +2333,8 @@ class Brain:
             return
 
         # 3. Target epoch quota for Coreset and Addendum
-        epochs_core = wm_epochs if has_coreset else 0
-        epochs_add = wm_epochs if has_addendum else 0
+        epochs_core = wm_coreset_epoch if has_coreset else 0
+        epochs_add = wm_addendum_epoch if has_addendum else 0
 
         # 4. Phase 1: Train World Model on Coreset
         core_losses = []
@@ -2550,7 +2508,11 @@ class Brain:
             self.sleep_cycle_stats["added"] = cons_stats["added"]
             self.sleep_cycle_stats["evicted"] = cons_stats["evicted"]
 
-        self._refresh_wake_latent()
+        # Resume recording after sleep and restart the static-salve
+        # detection from scratch (the world model changed under us).
+        self._recording = True
+        self._static_ticks = 0
+        self._last_salve = None
         self.mode = "wake"
 
         print("\n" + "=" * 62)

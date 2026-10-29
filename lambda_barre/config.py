@@ -51,11 +51,15 @@ TOML_TO_PARAM: dict[str, str] = {
     "training_lr_wm":          "lr_wm",
     "training_lr_pol":         "lr_pol",
     "training_act_std":        "act_std",
-    "training_explore_std":    "explore_std",
-    "training_wm_epochs":      "wm_epochs",
+    "training_wm_coreset_epoch":   "wm_coreset_epoch",
+    "training_wm_addendum_epoch":  "wm_addendum_epoch",
     "training_wm_batch":       "wm_batch",
     "training_wm_target_loss": "wm_target_loss",
     "training_pol_steps":      "pol_steps",
+    "training_eos_force_eps_lo": "eos_force_eps_lo",
+    "training_eos_force_eps_hi": "eos_force_eps_hi",
+    "training_eos_force_amplify": "eos_force_amplify",
+    "training_wm_impact_floor":  "wm_impact_floor",
     # buffer section
     "buffer_capacity":         "buffer_capacity",
     "buffer_pool_capacity":    "buffer_pool_capacity",
@@ -71,7 +75,6 @@ TOML_TO_PARAM: dict[str, str] = {
     "runtime_compile_wm":        "compile_wm",
     "runtime_use_kv_cache":      "use_kv_cache",
     "runtime_pol_eos_lookahead": "pol_eos_lookahead",
-    "runtime_freeze_physics":    "freeze_physics",
     "runtime_no_smooth":         "no_smooth",
 }
 

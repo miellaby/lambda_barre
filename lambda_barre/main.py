@@ -217,7 +217,10 @@ def _platform_hit(space, world_pos):
 
 def run(headless: bool = False, steps: int = 0,
         device: str | None = None, bootstrap_dataset: int = 0,
-        pol_steps: int = 64, wm_epochs: int = 512,
+        pol_steps: int = 64, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
+        eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
+        eos_force_amplify: float = 1.0,
+        wm_impact_floor: float = 0.25,
         freeze_physics: bool = False, no_smooth: bool = False,
         wm_target_loss: float = 0.01,
         use_kv_cache: bool = True,
@@ -233,7 +236,7 @@ def run(headless: bool = False, steps: int = 0,
         pol_hidden: int = 256,
         # Training hyperparameters
         lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-        act_std: float = 0.05, explore_std: float = 0.2,
+        act_std: float = 0.05,
         wm_batch: int = 64,
         seed: int = 0,
         # Buffer capacities
@@ -281,10 +284,14 @@ def run(headless: bool = False, steps: int = 0,
                   dim_ff=dim_ff, dropout=wm_dropout,
                   pol_hidden=pol_hidden,
                   lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std, explore_std=explore_std,
+                  act_std=act_std,
                   seed=seed,
                   buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity)
+                  buffer_pool_capacity=buffer_pool_capacity,
+                  eos_force_eps_lo=eos_force_eps_lo,
+                  eos_force_eps_hi=eos_force_eps_hi,
+                  eos_force_amplify=eos_force_amplify,
+                  wm_impact_floor=wm_impact_floor)
     auto = False                 # brain drives the consignes when True
     try:
         brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
@@ -317,6 +324,8 @@ def run(headless: bool = False, steps: int = 0,
     drag_ball_vel = (0.0, 0.0)
     sleep_gen = None       # active sleep generator (None when not sleeping)
     dream_theater = DreamTheater(R.WIDTH, R.HEIGHT)
+    dream_theater.coreset_size = brain.buffer.coreset_size
+    dream_theater.addendum_size = len(brain.buffer) - brain.buffer.coreset_size
     show_dream = False     # manual inspection of last dream trajectory
 
     prev_facing = skel.facing
@@ -351,6 +360,25 @@ def run(headless: bool = False, steps: int = 0,
             elif sleep_gen is not None or show_dream:
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_d and sleep_gen is None:
                     show_dream = False
+                    continue
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_s and sleep_gen is None:
+                    if len(brain.buffer) >= 1:
+                        show_dream = False
+                        dream_theater.clear()
+                        brain.last_dream_record = None
+                        dream_theater.is_paused = False
+                        dream_theater.sleep_active = True
+                        dream_theater.set_sleep_progress("prune", 0, 0)
+                        sleep_gen = brain.sleep(wm_coreset_epoch=wm_coreset_epoch,
+                                                wm_addendum_epoch=wm_addendum_epoch,
+                                                wm_batch=wm_batch,
+                                                pol_steps=pol_steps,
+                                                wm_target_loss=wm_target_loss,
+                                                use_kv_cache=use_kv_cache,
+                                                pol_eos_lookahead=pol_eos_lookahead)
+                        status = "sleeping..."
+                    else:
+                        status = "need a complete sequence to sleep"
                     continue
                 if dream_theater.handle_event(ev):
                     continue
@@ -402,7 +430,11 @@ def run(headless: bool = False, steps: int = 0,
                         dream_theater.clear()
                         brain.last_dream_record = None
                         dream_theater.is_paused = False
-                        sleep_gen = brain.sleep(wm_epochs=wm_epochs, wm_batch=wm_batch,
+                        dream_theater.sleep_active = True
+                        dream_theater.set_sleep_progress("prune", 0, 0)
+                        sleep_gen = brain.sleep(wm_coreset_epoch=wm_coreset_epoch,
+                                                wm_addendum_epoch=wm_addendum_epoch,
+                                                wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
                                                 wm_target_loss=wm_target_loss,
                                                 use_kv_cache=use_kv_cache,
@@ -482,6 +514,7 @@ def run(headless: bool = False, steps: int = 0,
                     d_intra = value.get('dedup_intra', 0)
                     d_core = value.get('dedup_coreset', 0)
                     status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
+                    dream_theater.set_sleep_progress("prune", 1, 1)
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
@@ -491,20 +524,27 @@ def run(headless: bool = False, steps: int = 0,
                         status = f"learning coreset {wm_step}/{wm_total} (loss {value:.2f})"
                     else:
                         status = f"learning wm {wm_step}/{wm_total} (loss {value:.2f})"
+                    dream_theater.set_sleep_progress("wm", wm_step, wm_total)
                 elif label == "filter":
                     status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
+                    dream_theater.set_sleep_progress("filter", 1, 1)
                 elif label == "pol":
                     pol_stats = getattr(brain, "last_pol_stats", None)
+                    pol_step = getattr(brain, "sleep_pol_step", 0)
+                    pol_total = getattr(brain, "sleep_pol_steps", 0)
                     if pol_stats is not None:
                         status = (f"sleeping: pol {value:.2f} "
                                   f"(hindsight {pol_stats['accepted']}/{pol_stats['total']} accepted)")
                     else:
                         status = f"sleeping: pol {value:.2f}"
+                    dream_theater.set_sleep_progress("pol", pol_step, pol_total)
                     if brain.last_dream_record is not None:
                         dream_theater.update(brain.last_dream_record)
                 elif label == "done":
                     stats = value
                     sleep_gen = None
+                    dream_theater.sleep_active = False
+                    dream_theater.set_sleep_progress("done", 1, 1)
                     brain.save_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
                     print("[sleep]", stats)
                     f_stats = getattr(brain, "last_filter_stats", None)
@@ -513,6 +553,7 @@ def run(headless: bool = False, steps: int = 0,
                               f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
             except StopIteration:
                 sleep_gen = None
+                dream_theater.sleep_active = False
 
         speed = SPEED_PRESETS[speed_idx] if not headless else 1.0
 
@@ -590,9 +631,11 @@ def run(headless: bool = False, steps: int = 0,
                             salves.pop(0)
                         wm_view = _wm_view_step(brain, salve)
             else:
-                # Manual mode: WM tick at 3 Hz — synthesize the consigne from
-                # the buffer (the user may have changed it many times between
-                # two records; the snapshot alone is not representative).
+                # Manual mode: record tick at WM cadence — synthesize the
+                # consigne from the buffer (the user may have changed it many
+                # times between two records; the snapshot alone is not
+                # representative). No WM inference here: the latent is only
+                # consumed in auto mode, where brain_tick refreshes it.
                 wm_accum += 1.0 / 60.0
                 if wm_accum >= WM_DT:
                     wm_accum -= WM_DT
@@ -604,11 +647,10 @@ def run(headless: bool = False, steps: int = 0,
                     else:
                         salve = encode_salve()
                     consigne_buffer.clear()
-                    brain.wake_tick(salve)
+                    brain.record_tick(salve)
                     salves.append(salve)
                     if len(salves) > 3:
                         salves.pop(0)
-                    brain.record(salve)
                     wm_view = _wm_view_step(brain, salve)
 
             return sig, ts, rs, isg, cs, vs
@@ -679,7 +721,10 @@ def main() -> None:
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
         "accel": bool(os.environ.get("LAMBDA_ACCEL")),
         "bootstrap_dataset": 0,
-        "pol_steps": 32, "wm_epochs": 512, "wm_batch": 64,
+        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_batch": 64,
+        "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
+        "eos_force_amplify": 1.0,
+        "wm_impact_floor": 0.25,
         "freeze_physics": False, "no_smooth": False,
         "wm_target_loss": 0.01,
         "use_kv_cache": True, "pol_eos_lookahead": True,
@@ -690,7 +735,7 @@ def main() -> None:
         "dim_ff": 384, "wm_dropout": 0.0,
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05, "explore_std": 0.2,
+        "act_std": 0.05,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
     }
@@ -716,8 +761,10 @@ def main() -> None:
                    help="generate a large physical experience dataset before running")
     p.add_argument("--pol-steps", type=int, default=argparse.SUPPRESS,
                    help="policy training steps per sleep cycle")
-    p.add_argument("--wm-epochs", type=int, default=argparse.SUPPRESS,
-                   help="world model training epochs per sleep cycle")
+    p.add_argument("--wm-coreset-epoch", type=int, default=argparse.SUPPRESS,
+                   help="world model training epochs per sleep cycle (Coreset phase)")
+    p.add_argument("--wm-addendum-epoch", type=int, default=argparse.SUPPRESS,
+                   help="world model training epochs per sleep cycle (Addendum phase)")
     p.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
                    help="world model training batch size")
     p.add_argument("--wm-target-loss", type=float, default=argparse.SUPPRESS,
@@ -748,8 +795,6 @@ def main() -> None:
                    help="Policy learning rate")
     p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
                    help="action sampling std during wake")
-    p.add_argument("--explore-std", type=float, default=argparse.SUPPRESS,
-                   help="action sampling std during imagination")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS,
                    help="random seed")
 

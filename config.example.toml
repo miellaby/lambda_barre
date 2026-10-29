@@ -27,15 +27,19 @@ hidden    = 256   # width of each hidden layer (3 hidden layers)
 # ---------------------------------------------------------------------------
 [training]
 lr_wm         = 3.0e-4   # World Model learning rate (Adam)
-lr_pol        = 2.0e-4   # Policy learning rate (Adam, weight_decay=1e-4)
+lr_pol        = 2.0e-4   # Policy learning rate (Adam)
 act_std       = 0.05     # action sampling std during wake (exploitation)
-explore_std   = 0.20     # action sampling std during imagined rollouts (exploration)
 
 # Sleep cycle training
-wm_epochs       = 512    # World Model training epochs per sleep cycle
+wm_coreset_epoch   = 512    # World Model training epochs per sleep cycle (Coreset phase)
+wm_addendum_epoch  = 128    # World Model training epochs per sleep cycle (Addendum phase)
 wm_batch        = 64     # World Model training batch size
 wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
 pol_steps       = 32     # Policy training steps per sleep cycle
+eos_force_eps_lo = 0.15  # hindsight forcing: lower bound of eps ~ U(lo, hi)
+eos_force_eps_hi = 0.40  # hindsight forcing: upper bound of eps ~ U(lo, hi)
+eos_force_amplify = 1.0  # hindsight action amplification toward extremes (1.0 = off)
+wm_impact_floor  = 0.25   # additive floor on the per-sequence impact weight (impact/neutral contrast ~3x at relief 0.5)
 
 # ---------------------------------------------------------------------------
 # Experience buffer capacities (in number of sequences)
@@ -63,5 +67,4 @@ seed              = 0         # random seed (0 = default)
 compile_wm        = false     # torch.compile the WM training step (faster, one-time warm-up)
 use_kv_cache      = true      # persistent KV-cache for imagined policy rollouts (faster)
 pol_eos_lookahead = true      # hindsight (EOS-lookahead) policy supervision
-freeze_physics    = false     # freeze physics (useful for debugging token recordings)
 no_smooth         = false     # bypass IIR sensor smoother (use raw snapshots)

@@ -97,3 +97,55 @@ Ce mode exploratoire interactif est une **solution transitoire** avant la mise e
 À terme, le mode exploratoire procédural cédera la place à une pulsion d'exploration intrinsèque :
 - Récompense interne basée sur l'erreur de prédiction ou la nouveauté du World Model (type *Curiosity-driven exploration / Random Network Distillation*).
 - Pulsion de « jeu » lorsque le niveau de souffrance/fatigue est bas et le confort assuré : l'animal teste de nouveaux mouvements et découvre par lui-même ses limites de stabilité.
+
+---
+
+## 4. Externaliser les nombres magiques vers `config.toml`
+
+> **Statut : ouvert** — `wm_impact_floor` externalisé (plancher additif de la pondération d'impact, contraste ~3x). Le reste de la liste est à implémenter au fil de l'eau.
+
+Tout réglage actuellement câblé en dur et candidat à une exposition dans `config.toml`. Pattern à suivre (établi avec `eos_force_*` puis `wm_impact_floor`) : constante par défaut au niveau du module, paramètre du constructeur `Brain` (ou de `run()`), mapping `TOML_TO_PARAM` dans `config.py`, entrée dans `config.example.toml` et `config.toml`.
+
+### `brain.py` — entraînement & sommeil
+
+- `_WM_REWARD_BOOST = 16.0` (`brain.py:146`) — boost du gradient sur les slots récompense/EOS.
+- `_WM_LOOKAHEAD_PERIOD = 4` (`brain.py:147`) — alternance causal:lookahead des passes WM (3:1).
+- `_EXPLORE_MARGIN_PCT = 0.001` (`brain.py:143`) — marge d'acceptation des candidats alternatifs (fallback).
+- `_WM_SALIENCY_MAX_LOSS = 0.02` (`brain.py:144`) — seuil de confiance de la distance pondérée par saliency EOS.
+- `_EOS_DELTA_SCALE = 0.15` (`brain.py:151`) — échelle de normalisation du delta EOS.
+- `compute_context_time_weights(decay=0.5)` (`brain.py:79`) — décroissance de la pondération de la fenêtre de décision.
+- `prune_coreset(pct=0.33, beta=2.0)` (`brain.py:525`) — oubli actif : fraction du Coreset remise en jeu, poids de l'échantillonnage stochastique.
+- `consolidate_addendum_into_coreset(eps=0.04, decay=0.01)` (`brain.py:627`) — rayon ε-net de déduplication croisée et décroissance de vivacité.
+- `sleep(surprise_factor=1.0)` (`brain.py:2245`) — seuil de filtrage par surprise : `max(loss_coreset × facteur, 1e-4)`.
+- `self._kalman_max_v = [0.20, 0.15, 0.20, 0.15, 0.20]` (`brain.py:961`) — clamping de vitesse de l'extrapolation Kalman.
+- `sigma=0.30` (`brain.py:2200`) — écart-type du candidat bruité (fallback candidats).
+- `self._time_alpha = 0.1` (`brain.py:983`) — EMA des temps d'inférence (HUD).
+- `self._static_threshold = 6`, `self._static_tol = 1e-4` (`brain.py:988-989`) — détection de statisme (pause d'enregistrement).
+
+### `proprio.py` — échelles des coûts innés
+
+Normalisation et constantes de temps des six signaux de coût biologique :
+
+- `EFFORT_SCALE = 6000.0`, `DOULEUR_SEUIL_COLLISION = 800.0`, `DOULEUR_SEUIL_ACCEL = 1500.0`, `DOULEUR_SCALE = 6000.0`, `DOULEUR_DECAY_TAU = 0.15` s (`proprio.py:24-28`).
+- `COURBATURE_WINDOW = 1.0` s, `COURBATURE_SEUIL_VAR = 5.0`, `COURBATURE_ACCRUE = 0.005`, `COURBATURE_DECAY = 0.80` (`proprio.py:29-32`).
+- `INSTABILITE_K = 0.01`, `INSTABILITE_SCALE = 1.0` (`proprio.py:33-34`).
+- `VERTIGE_SCALE = 5.0` (`proprio.py:35`).
+- `CONFORT_K = 0.3`, `CONFORT_DEG = 10°` (`proprio.py:36-37`).
+
+### `intero.py` — constantes de temps
+
+- `FATIGUE_RISE`, `FATIGUE_FALL` (demi-vie 100 s), `SOUFFRANCE_RISE`, `SOUFFRANCE_FALL` (demi-vie 240 s) (`intero.py:19-22`).
+
+### `smoother.py`
+
+- `TAU ≈ 0.143 s` (`smoother.py:28`) — constante de temps du filtre IIR.
+
+### Hors périmètre (à garder en dur)
+
+- `models.py` : `LIMB_MIN`, `LIMB_MAX`, `THETA_RANGE` — plages physiques des actionneurs.
+- `main.py` : `SPEED_PRESETS` — liste de vitesses, pas un scalaire de réglage.
+- Poids de canaux innés `[1, 4, 2, 2, 3, 1]` — constante de design du circuit de récompense, pas un hyperparamètre d'entraînement.
+
+### Note d'implémentation
+
+Les constantes de `brain.py` suivent le pattern `Brain.__init__` → `config.toml`. Celles de `proprio.py` / `intero.py` / `smoother.py` sont des constantes de module consommées à la construction des capteurs : les externaliser demandera de passer les valeurs aux constructeurs (ou un chargement config dans ces modules) — à prévoir dans des sections `[costs]` / `[interoception]` / `[smoother]` de `config.toml`.
