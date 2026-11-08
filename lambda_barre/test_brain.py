@@ -173,26 +173,30 @@ def test_train_policy_kv_cache_option_equivalence():
 
 
 def test_lookahead_mask_structure():
-    """The EOS-lookahead training mask is the causal mask plus two deviations:
-    the decision query (position 76) attends the terminal EOS token (172),
-    and the EOS token itself attends only the decision context (0..76) and
-    itself — never the intervening trajectory (which would let the recorded
-    a4 leak into the decision and break compact-generation equivalence)."""
+    """The multi-position EOS-lookahead training mask is the causal mask plus:
+    every action position (the intero token of each salve, whose head predicts
+    a_k) attends the terminal EOS token, and the EOS token itself attends
+    only the decision context (0..76) and itself — never the intervening
+    trajectory (which would let the recorded actions leak into the queries
+    and break compact-generation equivalence)."""
     import torch
     from . import brain as brain_mod
     from .models import build_salve_mask
 
     m = brain_mod._MASK_LOOKAHEAD
     dp, ep = brain_mod._DECISION_POS, brain_mod._EOS_POS
-    assert not bool(m[dp, ep])                       # decision query sees the EOS
+    # every action position sees the EOS
+    for k in range(brain_mod.SEQ_STEPS):
+        assert not bool(m[k * brain_mod.SALVE_TOKENS + brain_mod._INTERO_IDX, ep])
     assert bool(m[dp, ep - 1])                       # ...but nothing else beyond causal
-    assert not bool(m[ep, dp])                       # EOS sees the decision context
-    assert not bool(m[ep, ep])                       # ...and itself
+    assert not bool(m[ep, dp])                           # EOS sees the decision context
+    assert not bool(m[ep, ep])                           # ...and itself
     assert bool(m[ep, dp + 1]) and bool(m[ep, ep - 1])  # ...but not the trajectory in between
     # every other row stays strictly causal
     ref = build_salve_mask(brain_mod._SEQ_LEN, torch.device("cpu"))
     ref = ref.clone()
-    ref[dp, ep] = False
+    for k in range(brain_mod.SEQ_STEPS):
+        ref[k * brain_mod.SALVE_TOKENS + brain_mod._INTERO_IDX, ep] = False
     ref[ep, dp + 1: ep] = True
     assert torch.equal(m, ref)
 
@@ -309,7 +313,9 @@ def test_policy_eos_lookahead_step_and_kv_equivalence():
     rec_ref, st_ref, out_ref = run_case(False)
     rec_got, st_got, out_got = run_case(True)
     for r, g in zip(rec_ref.trajectories, rec_got.trajectories):
-        assert abs(r.total_cost - g.total_cost) < 1e-4, (r.total_cost, g.total_cost)
+        assert r.total_cost is None and g.total_cost is None  # accumulated cost removed
+        assert r.eos_pred is not None and g.eos_pred is not None
+        assert all(abs(a - b_) < 1e-4 for a, b_ in zip(r.eos_pred, g.eos_pred))
     for a, b_ in zip(rec_ref.candidate_actions, rec_got.candidate_actions):
         assert len(a) == len(b_) == 5
     assert rec_got.eos_forced is not None and len(rec_got.eos_forced) == brain_mod._EOS_NSLOTS
@@ -374,9 +380,10 @@ def test_dream_theater_hindsight_view_and_browsing():
     assert theater.hist_idx == 2 and theater.follow
 
 
-def test_policy_lookahead_stays_in_lookahead_on_rejections():
-    """When hindsight generations are rejected, train_policy stays in lookahead
-    mode without auto-fallback: loss is 0.0 and the 2-candidate structure is maintained."""
+def test_policy_lookahead_distills_unconditionally():
+    """Short-term trust in the insight: the generated a4 is always the supervised
+    target — even when its causal completion is maximally unfavorable, the
+    policy step still distills (loss > 0, hindsight candidate marked winner)."""
     b = Brain(seed=42)
     for i in range(20):
         salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
@@ -385,18 +392,21 @@ def test_policy_lookahead_stays_in_lookahead_on_rejections():
     orig_rollout = b._rollout_candidate
     def mock_rollout(*args, **kwargs):
         call_count[0] += 1
-        c, eos, steps = orig_rollout(*args, **kwargs)
-        if call_count[0] % 2 == 0:  # gen_action rollout: make it artificially worse
-            return c + 1000.0, eos, steps
-        return c, eos, steps
+        eos, steps = orig_rollout(*args, **kwargs)
+        if call_count[0] % 2 == 0 and eos is not None:  # gen_action rollout: maximally unfavorable outcome
+            eos = eos.clone()
+            eos[:, :5] = 1.0   # every cost channel worsens
+            eos[:, 5] = 0.0    # comfort drops
+        return eos, steps
     b._rollout_candidate = mock_rollout
     out = list(b.train_policy(steps=5, batch=2, n_imagine=6))
     assert len(out) == 5
-    assert all(loss == 0.0 for _, loss in out)
+    assert all(loss > 0.0 for _, loss in out)   # every step distills — no abstention
     rec = b.last_dream_record
     assert len(rec.trajectories) == 2      # stayed in lookahead mode
     assert len(rec.candidate_actions) == 2
-    assert rec.best_candidate_idx == -1    # rejected
+    assert rec.best_candidate_idx == 1    # hindsight always taken
+    assert b.last_pol_stats["accepted"] == b.last_pol_stats["total"]
 
 
 

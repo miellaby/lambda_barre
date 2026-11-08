@@ -88,50 +88,98 @@ def compute_context_time_weights(n_early: int, decay: float = 0.5) -> list[float
     return [x / total for x in w]
 
 
-def build_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build _target_valid and _target_weight tensors for a given seq_steps."""
+def build_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX,
+                       w_state_post: float = 1.0, w_act_post: float = 1.0,
+                       w_eos: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build _target_valid and _target_weight tensors for a given seq_steps.
+
+    Row weights are relative to the context baseline 1.0: ``w_state_post`` /
+    ``w_act_post`` scale the rows predicting a state / action token of a
+    post-decision salve (k > n_ctx), ``w_eos`` scales the terminal denouement
+    rows (last salve's cost/reward slots and the EOS token). Defaults
+    reproduce the historical "full" weighting (1.0 everywhere, boost on the
+    terminal rows)."""
+    if w_eos is None:
+        w_eos = _WM_REWARD_BOOST
     seq_len = seq_steps * SALVE_TOKENS + STATE_TOKENS
     target_valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
-    for p in range(seq_len - 1):
-        tidx = (p + 1) % SALVE_TOKENS
-        if tidx == _INTERO_IDX and (p + 1) < (seq_len - 1):
-            continue
-        n = _EOS_NSLOTS if (p + 1) == (seq_len - 1) else _N_SIGNALS[tidx]
-        target_valid[p, :n] = True
-
     target_weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
     for p in range(seq_len - 1):
         tidx = (p + 1) % SALVE_TOKENS
         if tidx == _INTERO_IDX and (p + 1) < (seq_len - 1):
             continue
         n = _EOS_NSLOTS if (p + 1) == (seq_len - 1) else _N_SIGNALS[tidx]
-        target_weight[p, :n] = 1.0
-    for tidx in (_COST_IDX, _REWARD_IDX, _INTERO_IDX):
-        p = seq_steps * SALVE_TOKENS + tidx - 1
-        n = _EOS_NSLOTS if tidx == _INTERO_IDX else _N_SIGNALS[tidx]
-        target_weight[p, :n] = _WM_REWARD_BOOST
+        target_valid[p, :n] = True
+        k = (p + 1) // SALVE_TOKENS
+        if p + 1 >= seq_steps * SALVE_TOKENS + _COST_IDX:
+            w = w_eos                     # terminal cost/reward/EOS rows
+        elif k > n_ctx:
+            w = w_act_post if tidx >= STATE_TOKENS else w_state_post
+        else:
+            w = 1.0
+        target_weight[p, :n] = w
 
+    return target_valid, target_weight
+
+
+def build_lookahead_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS,
+                                  n_ctx: int = DEFAULT_N_CTX) -> tuple[torch.Tensor, torch.Tensor]:
+    """Target tables for the lookahead pass: the inversion only — the gap
+    between the estimated a_{n_ctx} and the observed one. The only trained
+    rows are the three predicting the consigne tokens of salve ``n_ctx``.
+    Nothing else is asked of this pass: reconstructing the future after a4
+    serves no consumer (generation queries a4 only, the causal rollout is
+    display), and training it would dilute the inversion back into state
+    prediction. The state dynamics and the dénouement prediction remain the
+    causal pass's job."""
+    layout = compute_seq_layout(seq_steps, n_ctx)
+    seq_len = layout["seq_len"]
+    decision_pos = layout["decision_pos"]
+    target_valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
+    target_weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
+    for i in range(ACTION_TOKENS):
+        p = decision_pos + i                    # row predicting consigne token i of a_{n_ctx}
+        tidx = (p + 1) % SALVE_TOKENS
+        n = _N_SIGNALS[tidx]
+        target_valid[p, :n] = True
+        target_weight[p, :n] = 1.0
     return target_valid, target_weight
 
 
 def build_lookahead_mask(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX,
                          device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Attention mask for training WM with lookahead on a sequence."""
+    """Attention mask for training WM with hindsight on a sequence.
+
+    Every action position — the intero token of each salve, whose head
+    predicts the first consigne token a_k — additionally attends the terminal
+    EOS, so the inversion P(a_k | prefix, EOS) is learned at every alignment
+    of the window, not only the decision position. The EOS token itself
+    attends only the decision context (s0..s_{n_ctx}) and itself: it must
+    never see the recorded actions, whose keys would leak the answers to
+    the action queries.
+    """
     layout = compute_seq_layout(seq_steps, n_ctx)
     mask = build_salve_mask(layout["seq_len"], device).clone()
     dp, ep = layout["decision_pos"], layout["eos_pos"]
-    mask[dp, ep] = False
+    for k in range(seq_steps):
+        mask[k * SALVE_TOKENS + _INTERO_IDX, ep] = False
     mask[ep, dp + 1: ep] = True
     return mask
 
 
 def build_lookahead_gen_mask(ctx_len: int, device, decision_pos: int | None = None) -> torch.Tensor:
     """Attention mask for hindsight generation on a [context, EOS] input of
-    ctx_len + 1 tokens. If decision_pos is None, defaults to _DECISION_POS."""
+    ctx_len + 1 tokens. Every action position of the context (the intero
+    token of each salve s0..s_{n_ctx}) attends the appended EOS token —
+    mirroring the multi-position training mask, so the compact generation is
+    mathematically identical to the training computation at the decision
+    query. If decision_pos is None, defaults to _DECISION_POS."""
     if decision_pos is None:
         decision_pos = _DECISION_POS
     m = build_salve_mask(ctx_len + 1, device).clone()
-    m[decision_pos, ctx_len] = False
+    n_ctx = decision_pos // SALVE_TOKENS
+    for k in range(n_ctx + 1):
+        m[k * SALVE_TOKENS + _INTERO_IDX, ctx_len] = False
     return m
 
 
@@ -144,7 +192,7 @@ _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction
 _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
 _WM_IMPACT_FLOOR = 0.25                     # additive floor on every sequence's cost impact (~3x impact/neutral contrast at relief 0.5)
 _WM_REWARD_BOOST = 16.0                                      # gradient boost on S10 reward slots and terminal EOS delta
-_WM_LOOKAHEAD_PERIOD = 4                                     # WM mask alternation: 1 lookahead pass every 4 (3:1 causal:lookahead)
+_WM_LOOKAHEAD_PERIOD = 2                                     # WM mask alternation: 1 lookahead pass every 2 (1:1 causal:lookahead)
 _EOS_FORCE_EPS = (0.15, 0.40)                                # default hindsight forcing range (overridable via config.toml)
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
@@ -206,6 +254,7 @@ _ACT_TEMPLATE = torch.tensor(
      for i in range(STATE_TOKENS, SALVE_TOKENS)], dtype=torch.float32)
 
 _target_valid, _target_weight = build_target_masks(DEFAULT_SEQ_STEPS)
+_target_valid_look, _target_weight_look = build_lookahead_target_masks(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX)
 _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
 _MASK_LOOKAHEAD = build_lookahead_mask(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX, torch.device("cpu"))
 
@@ -878,7 +927,13 @@ class Brain:
                  eos_force_eps_lo: float = _EOS_FORCE_EPS[0],
                  eos_force_eps_hi: float = _EOS_FORCE_EPS[1],
                  eos_force_amplify: float = 1.0,
-                 wm_impact_floor: float = _WM_IMPACT_FLOOR):
+                 eos_force_amplify_threshold: float = 0.95,
+                 wm_impact_floor: float = _WM_IMPACT_FLOOR,
+                 lookahead_relief_mult: float = 1.0,
+                 wm_w_state_post: float = 1.0,
+                 wm_w_act_post: float = 1.0,
+                 wm_w_eos: float = _WM_REWARD_BOOST,
+                 wm_w_a4_lookahead: float = 1.0):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
         # Intra-op parallelism cap: 2 threads wins or ties in both regimes on
@@ -908,19 +963,31 @@ class Brain:
         self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
                                        capacity=buffer_capacity,
                                        pool_capacity=buffer_pool_capacity)
+        self.wm_w_state_post = wm_w_state_post
+        self.wm_w_act_post = wm_w_act_post
+        self.wm_w_eos = wm_w_eos
+        self.wm_w_a4_lookahead = wm_w_a4_lookahead
+        t_valid, t_weight = build_target_masks(seq_steps, n_ctx,
+                                                w_state_post=wm_w_state_post,
+                                                w_act_post=wm_w_act_post,
+                                                w_eos=wm_w_eos)
         if seq_steps == DEFAULT_SEQ_STEPS and n_ctx == DEFAULT_N_CTX:
             self.mask = _MASK.to(self.device)
             self.mask_lookahead = _MASK_LOOKAHEAD.to(self.device)
-            self.target_valid = _target_valid.to(self.device)
-            self.target_weight = _target_weight.to(self.device)
+            self.target_valid = t_valid.to(self.device)
+            self.target_weight = t_weight.to(self.device)
+            self.target_valid_look = _target_valid_look.to(self.device)
+            self.target_weight_look = _target_weight_look.to(self.device)
             self._eos_w = _EOS_TIME_W_T.to(self.device)
             self._context_w = _CONTEXT_TIME_W_T.to(self.device)
         else:
             self.mask = build_salve_mask(self.seq_len, self.device)
             self.mask_lookahead = build_lookahead_mask(seq_steps, n_ctx, self.device)
-            t_valid, t_weight = build_target_masks(seq_steps)
             self.target_valid = t_valid.to(self.device)
             self.target_weight = t_weight.to(self.device)
+            t_valid_look, t_weight_look = build_lookahead_target_masks(seq_steps, n_ctx)
+            self.target_valid_look = t_valid_look.to(self.device)
+            self.target_weight_look = t_weight_look.to(self.device)
             eos_w = compute_eos_time_weights(self.n_imagine)
             self._eos_w = torch.tensor(eos_w, dtype=torch.float32, device=self.device)
             context_w = compute_context_time_weights(self.n_ctx + 1)
@@ -941,7 +1008,9 @@ class Brain:
         self.eos_force_eps_lo = eos_force_eps_lo
         self.eos_force_eps_hi = eos_force_eps_hi
         self.eos_force_amplify = eos_force_amplify
+        self.eos_force_amplify_threshold = eos_force_amplify_threshold
         self.wm_impact_floor = wm_impact_floor
+        self.lookahead_relief_mult = lookahead_relief_mult
         # Precomputed cost tensors, moved to device for the vectorized
         # trajectory-cost in train_policy.
         self._cost_scales = _COST_SCALES.to(self.device)
@@ -1215,22 +1284,27 @@ class Brain:
         return self._wm_masked_mse(self.world(vals), vals, weights)
 
     def _wm_loss_lookahead_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """Same masked-MSE loss under the EOS-lookahead attention mask: the
-        decision position (76) also attends the realized terminal EOS (172),
-        so the head there learns P(a4 | context, EOS) — the hindsight action —
-        while every other position stays causal. No forcing: each sequence
-        carries its own realized EOS, good or bad outcomes alike."""
+        """The lookahead pass trains the inversion only: the gap between the
+        estimated a_{n_ctx} and the observed one, under the EOS-lookahead
+        attention mask (the decision position attends the realized terminal
+        EOS). Nothing else is asked of this pass — state predictions, the
+        terminal reward slots and the other actions belong to the causal
+        pass. No forcing: each sequence carries its own realized EOS, good
+        or bad outcomes alike."""
         return self._wm_masked_mse(
             self.world(vals, attn_mask=self.mask_lookahead, is_causal=False),
-            vals, weights)
+            vals, weights, weight=self.target_weight_look)
 
     def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor,
-                       weights: torch.Tensor) -> torch.Tensor:
-        """Masked, reward-boosted, impact-weighted MSE over valid signal slots
-        (shared by the causal and lookahead passes)."""
+                       weights: torch.Tensor,
+                       weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Masked, impact-weighted MSE over valid signal slots. ``weight``
+        selects the target table: the full sequence table (default, causal
+        pass) or the inversion-only lookahead table."""
         pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
         tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
-        w_b = self.target_weight.unsqueeze(0).expand_as(pred_signals)  # [B, L-1, 16]
+        w = weight if weight is not None else self.target_weight
+        w_b = w.unsqueeze(0).expand_as(pred_signals)     # [B, L-1, 16]
         sq = (pred_signals - tgt_signals) ** 2
         sqm = (sq * w_b).sum(dim=(1, 2))                  # [B] per-sequence weighted squared error
         wsum = w_b.sum(dim=(1, 2)).clamp(min=1.0)          # [B] total slot weight per sequence
@@ -1247,23 +1321,35 @@ class Brain:
         keeps neutral sequences learning at a trickle and prevents an all-neutral
         batch from yielding a zero loss that would trip the target-loss stopping criterion.
 
-        ``lookahead=True`` runs the same loss under the EOS-lookahead
-        attention mask (see ``_wm_loss_lookahead_impl``)."""
+        ``lookahead=True`` runs the same loss under the multi-position
+        EOS-lookahead attention mask (see ``_wm_loss_lookahead_impl``); the
+        per-sequence relief contrast is then amplified by the configurable
+        multiplier ``lookahead_relief_mult`` (1.0 = same weighting as the
+        causal pass), so the outcome-carrying sequences weigh more in the
+        inversion's descent."""
         vals = self._batch_tensors(sequences)             # [B, L, 25]
-        weights = sequence_impact(
+        impacts = sequence_impact(
             sequences, n_ctx=self.n_ctx,
             eos_time_w=self.buffer._eos_time_w
-        ).to(self.device) + self.wm_impact_floor
+        ).to(self.device)
+        mult = self.lookahead_relief_mult if lookahead else 1.0
+        weights = mult * impacts + self.wm_impact_floor
         self.last_wm_impact = (weights.sum() / len(sequences)).item()
         if lookahead:
-            loss = self._wm_loss_lookahead(vals, weights)
+            # wm_w_a4_lookahead scales the whole hindsight pass (its target
+            # table holds only the a4 rows, where a uniform row weight would
+            # cancel in the wsum normalization — hence a loss-level multiplier).
+            # The reported loss stays unscaled for comparability.
+            raw = self._wm_loss_lookahead(vals, weights)
+            loss = raw * self.wm_w_a4_lookahead
         else:
-            loss = self._wm_loss(vals, weights)
+            raw = self._wm_loss(vals, weights)
+            loss = raw
         self.opt_wm.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
         self.opt_wm.step()
-        return loss.item()
+        return raw.item()
 
     def train_world(self, epochs: int = 512, batch: int = 32):
         """Train the world model. Generator: yields (label, value) after each
@@ -1494,17 +1580,32 @@ class Brain:
         return torch.clamp(base_action + noise, self._act_min, self._act_max)
 
     def _amplify_extremes(self, action: torch.Tensor) -> torch.Tensor:
-        """Amplify hindsight actions toward extremes (bold recovery bias).
-        Signed dims (theta) scaled toward ±1, unsigned dims (d) toward 1.
-        factor=1.0 = no-op. Applied to hindsight targets before verification
-        rollout so the policy imitates bolder actions when the WM is too shy."""
+        """Amplify hindsight actions toward extremes, but only for values
+        already near the extremes (bold recovery bias). Values below the
+        threshold are left unchanged, preventing a positive feedback loop
+        that would push moderate actions toward extremes over successive
+        sleep cycles.
+
+        Signed dims (theta): |v| >= threshold → amplified toward ±1.
+        Unsigned dims (d):   v >= threshold → amplified toward 1.
+        factor=1.0 = no-op."""
         f = self.eos_force_amplify
         if f == 1.0:
             return action
+        thr = self.eos_force_amplify_threshold
         out = action.clone()
         signed = self._act_signed
-        out[:, signed] = torch.clamp(action[:, signed] * f, -1.0, 1.0)
-        out[:, ~signed] = torch.clamp(action[:, ~signed] * f, 0.0, 1.0)
+        # Signed dims: amplify |v| toward 1 only when |v| >= threshold
+        s = action[:, signed]
+        abs_s = s.abs()
+        near = abs_s >= thr
+        amplified_s = torch.sign(s) * torch.clamp(abs_s * f, max=1.0)
+        out[:, signed] = torch.where(near, amplified_s, s)
+        # Unsigned dims: amplify v toward 1 only when v >= threshold
+        u = action[:, ~signed]
+        near_u = u >= thr
+        amplified_u = torch.clamp(u * f, max=1.0)
+        out[:, ~signed] = torch.where(near_u, amplified_u, u)
         return out
 
     # --- sleep: policy training via real context + imagined rollout ----------
@@ -1665,19 +1766,19 @@ class Brain:
         """Policy training by supervised imitation of the WM's hindsight action.
 
         ``eos_lookahead=True`` (default) — efficient hindsight supervision: the
-        policy's own action is rolled out to get the baseline cost C_pi and
-        the imagined denouement delta (EOS); its deviation from neutral is
-        forced eps-proportionally more favorable; the WM's lookahead mode
-        generates the action associated with that outcome; a causal
-        verification rollout accepts it only if it actually reduces the
-        imagined cost. ~3 rollout-equivalents per batch instead of the legacy 6.
+        policy's own action is rolled out to get the imagined denouement delta
+        (EOS); its deviation from neutral is forced eps-proportionally more
+        favorable; the WM's lookahead mode generates the action associated with
+        that outcome; the generated a4 is unconditionally the supervised
+        target (short-term trust — a causal completion by the current policy
+        cannot confirm or refute the suggestion; the verification rollout is
+        Dream Theater display only). ~3 rollout-equivalents per batch
+        instead of the legacy 6.
 
         ``eos_lookahead=False`` — legacy stochastic-candidate machinery,
         kept alive as a fallback. Also selected automatically when the
         imagination horizon cannot reach the terminal salve
-        (n_imagine < self.n_imagine) or when the hindsight generation is
-        systematically rejected (_LOOKAHEAD_FALLBACK_STREAK batches in a
-        row without a single accepted sample).
+        (n_imagine < self.n_imagine).
 
         Generator: yields (label, value) after each step."""
         if n_imagine is None:
@@ -1737,12 +1838,11 @@ class Brain:
         """Single-regime imagined rollout: ``action`` acts on s_{n_ctx}, then the
         policy reacts in closed loop to each imagined state for n_imagine - 1 more steps.
 
-        Returns (cost [B], predicted terminal EOS [B, _EOS_NSLOTS] or None,
-        dream steps). The cost is C = sum_k w_k c(s_{n_ctx+1+k}) weighted by
-        the exact same time weights as the EOS token (self._eos_w); the
-        predicted EOS is the DENOUEMENT DELTA: the time-weighted aggregate of
-        the imagined salves' innate cost channels minus the flat decision-window
-        baseline read from the real context (s0..s_{n_ctx})."""
+        Returns (predicted terminal EOS [B, _EOS_NSLOTS] or None, dream
+        steps). The predicted EOS is the DENOUEMENT DELTA: the time-weighted
+        aggregate of the imagined salves' innate cost channels minus the
+        decision-window baseline (weighted towards s_{n_ctx}) read from the
+        real context (s0..s_{n_ctx})."""
         action_toks = self._encode_action_batch(action)
         dream_steps = [DreamStep(state_tokens=s_dec_toks, action=action[0].tolist(),
                                  label=f"s{self.n_ctx}+cand")]
@@ -1765,7 +1865,6 @@ class Brain:
                 s = self.world.predict_next_state(cand_ctx)
         c0 = self._salve_cost_batch(s)
         w0 = self._eos_w[0] if len(self._eos_w) > 0 else (1.0 / n_imagine)
-        cost = w0 * c0
         eos_acc = torch.zeros(s.shape[0], _EOS_NSLOTS, device=s.device)
         eos_acc[:, :5] += w0 * s[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
         eos_acc[:, 5] += w0 * s[:, _REWARD_IDX, SIG_OFFSET]
@@ -1806,7 +1905,6 @@ class Brain:
             gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
             sc = self._salve_cost_batch(gen)
             wk = self._eos_w[k] if k < len(self._eos_w) else (1.0 / n_imagine)
-            cost = cost + wk * sc
             dream_steps.append(DreamStep(state_tokens=cur_state_toks,
                                          action=next_action[0].tolist(),
                                          step_cost=cur_cost_val, label=f"s{self.n_ctx + k}"))
@@ -1824,7 +1922,7 @@ class Brain:
             cur_cost_val = sc[0].item()
         dream_steps.append(DreamStep(state_tokens=cur_state_toks, action=None,
                                       step_cost=cur_cost_val, label=f"s{self.n_ctx + n_imagine}"))
-        return cost, eos_pred, dream_steps
+        return eos_pred, dream_steps
 
     def _lookahead_generate(self, ctx, base_cache, eos_forced, use_kv_cache):
         """Generate the hindsight action conditioned on the forced terminal EOS."""
@@ -1864,15 +1962,24 @@ class Brain:
                     curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
         return torch.stack(toks, dim=1)                              # [B, 3, 25]
 
+    def _eos_favorability(self, eos: torch.Tensor) -> torch.Tensor:
+        """Scalar denouement favorability of EOS delta slots [B, 6]: the usual
+        innate cost hierarchy applied to the deviation from neutral — higher
+        = better outcome. The same scalarization ``sequence_relief`` applies
+        to realized salves, expressed in EOS slot units."""
+        return ((self._eos_cw[:5] * (0.5 - eos[:, :5])).sum(dim=1)
+                + self._eos_cw[5] * (eos[:, 5] - 0.5))
+
     def _policy_step_lookahead(self, batch, n_imagine, use_kv_cache,
                                 step_idx, total_steps):
         """One policy step under hindsight supervision (see ``train_policy``).
 
-        Baseline rollout of the policy action -> (C_pi, imagined EOS delta);
+        Baseline rollout of the policy action -> (eos_pi, forcing anchor);
         additive EOS forcing (neutrality floor + fixed random eps); hindsight
-        generation of a4; causal verification rollout; purely comparative
-        acceptance. Returns (updated, loss): updated=False means no sample
-        was accepted and no optimizer step was taken."""
+        generation of a4 — unconditionally the supervised target (short-term
+        trust: a causal completion by the current policy cannot confirm or
+        refute the suggestion). The generated action's completion is imagined
+        for sample 0 only, as Dream Theater display. Returns (updated, loss)."""
         sequences = self.buffer.sample_for_policy(batch)
         if not sequences:
             return True, 0.0
@@ -1900,18 +2007,38 @@ class Brain:
         with torch.inference_mode():
             policy_action = self.policy(pol_in)                     # [B, 5]
 
-        # 2-4. Shared hindsight lookahead pipeline
+        # 2-4. Shared hindsight lookahead pipeline — the verification rollout
+        #      is skipped here: it serves nothing (unconditional distillation)
+        #      and is computed for sample 0 only below, for the Dream Theater
         hl = self._hindsight_lookahead_pipeline(
             ctx, policy_action, s_dec_toks, n_imagine,
             ctx_len, ctx_mask, base_cache=base_cache,
-            use_kv_cache=use_kv_cache)
-        c_pi, eos_pi, steps_pi = hl["c_pi"], hl["eos_pi"], hl["steps_pi"]
+            use_kv_cache=use_kv_cache, verify=False)
+        eos_pi, steps_pi = hl["eos_pi"], hl["steps_pi"]
         eos_forced = hl["eos_forced"]
         gen_action = hl["gen_action"]
-        c_gen, eos_gen, steps_gen = hl["c_gen"], hl["eos_gen"], hl["steps_gen"]
 
-        # 5. Purely comparative acceptance: the generated action must beat the baseline cost
-        accepted = c_gen < c_pi                                     # [B]
+        # display-only completion of the generated action, for sample 0 only
+        # (the Dream Theater record) — the rest of the batch needs no imagined
+        # sequence
+        with torch.inference_mode():
+            if use_kv_cache:
+                base_cache_0 = KVCache(len(self.world.transformer.layers),
+                                       self.world.d_model, 1, device)
+                self.world.cache_forward(ctx[:1], base_cache_0)
+            else:
+                base_cache_0 = None
+            eos_gen, steps_gen = self._rollout_candidate(
+                ctx[:1], base_cache_0, gen_action[:1], s_dec_toks,
+                n_imagine, ctx_len, ctx_mask, use_kv_cache)
+
+        # 5. Short-term trust in the insight: the generated a4 is always the
+        #    supervised target. The causal verification cannot confirm
+        #    reachability — its completion is the policy's own current
+        #    behavior, so the outcome gate was a coin flip (measured ~50% on
+        #    every phase); it is dropped until the WM's outcome-conditioned
+        #    completion can serve as verification.
+        accepted = torch.ones(B, dtype=torch.bool, device=device)
         n_accepted = int(accepted.sum().item())
         self.last_pol_stats = {"accepted": n_accepted, "total": B}
 
@@ -1953,11 +2080,11 @@ class Brain:
             candidate_actions=[policy_action[0].tolist(), gen_action[0].tolist()],
             trajectories=[
                 DreamTrajectory(candidate_idx=0, regime_idx=0, regime_name="Policy",
-                                steps=steps_pi, total_cost=c_pi[0].item(),
+                                steps=steps_pi,
                                 is_best_future=False, is_winner=False,
                                 eos_pred=eos_pi[0].tolist() if eos_pi is not None else None),
                 DreamTrajectory(candidate_idx=1, regime_idx=0, regime_name="Policy",
-                                steps=steps_gen, total_cost=c_gen[0].item(),
+                                steps=steps_gen,
                                 is_best_future=True, is_winner=acc0,
                                 eos_pred=eos_gen[0].tolist() if eos_gen is not None else None),
             ],
@@ -1979,18 +2106,20 @@ class Brain:
                                       ctx_mask: torch.Tensor,
                                       base_cache = None,
                                       eps: torch.Tensor | float | None = None,
-                                      use_kv_cache: bool = False) -> dict:
+                                      use_kv_cache: bool = False,
+                                      verify: bool = True) -> dict:
         """Core hindsight lookahead pipeline (shared between policy training and diagnostics/theater):
-        1. Baseline rollout of base_action -> (c_pi, eos_pi, steps_pi)
+        1. Baseline rollout of base_action -> (eos_pi, steps_pi)
         2. Additive EOS forcing (neutrality floor, then fixed eps) -> eos_forced
         3. Hindsight action generation under forced EOS -> (gen_toks, gen_action)
-        4. Causal verification rollout -> (c_gen, eos_gen, steps_gen)
+        4. Causal verification rollout -> (eos_gen, steps_gen), display only —
+           skipped entirely when ``verify=False`` (eos_gen/steps_gen are None).
         """
         B = ctx.shape[0]
         device = ctx.device
 
-        # 1. baseline rollout -> accumulated cost C_pi + imagined terminal EOS
-        c_pi, eos_pi, steps_pi = self._rollout_candidate(
+        # 1. baseline rollout -> imagined terminal EOS
+        eos_pi, steps_pi = self._rollout_candidate(
             ctx, base_cache, base_action, s_dec_toks, n_imagine,
             ctx_len, ctx_mask, use_kv_cache)
 
@@ -2028,20 +2157,22 @@ class Brain:
         # 3b. amplify hindsight action toward extremes (bold recovery bias)
         gen_action = self._amplify_extremes(gen_action)
 
-        # 4. causal verification rollout (causality, reachability and graceful
-        #    overshoot discovery in one test)
-        c_gen, eos_gen, steps_gen = self._rollout_candidate(
-            ctx, base_cache, gen_action, s_dec_toks, n_imagine,
-            ctx_len, ctx_mask, use_kv_cache)
+        # 4. causal verification rollout — display only (Dream Theater);
+        #    skipped when the caller needs neither the completion nor its
+        #    imagined denouement
+        eos_gen = None
+        steps_gen = None
+        if verify:
+            eos_gen, steps_gen = self._rollout_candidate(
+                ctx, base_cache, gen_action, s_dec_toks, n_imagine,
+                ctx_len, ctx_mask, use_kv_cache)
 
         return {
-            "c_pi": c_pi,
             "eos_pi": eos_pi,
             "steps_pi": steps_pi,
             "eos_forced": eos_forced,
             "gen_toks": gen_toks,
             "gen_action": gen_action,
-            "c_gen": c_gen,
             "eos_gen": eos_gen,
             "steps_gen": steps_gen,
         }
@@ -2255,9 +2386,10 @@ class Brain:
           2. Prune ~33% of Coreset into Addendum as candidates for active forgetting.
           3. Phase 1: Train World Model on the pruned Coreset (yielding 'wm_coreset')
              until quota is validated AND loss <= wm_target_loss. Causal passes
-             alternate with EOS-lookahead passes (1 in _WM_LOOKAHEAD_PERIOD):
-             the decision position also attends the realized terminal EOS, so
-             the WM learns the hindsight action.
+             alternate with lookahead passes (1 in _WM_LOOKAHEAD_PERIOD): the
+             lookahead pass trains the inversion only — the gap between the
+             estimated a_{n_ctx} and the observed one, the decision position
+             attending the realized terminal EOS.
           4. Filter Addendum: evaluate surprise under updated WM (dynamics + cost divergence).
              Discard familiar sequences; retain surprising sequences.
           5. Phase 2: Train World Model on the surviving Addendum (yielding 'wm_addendum')

@@ -149,3 +149,15 @@ Normalisation et constantes de temps des six signaux de coût biologique :
 ### Note d'implémentation
 
 Les constantes de `brain.py` suivent le pattern `Brain.__init__` → `config.toml`. Celles de `proprio.py` / `intero.py` / `smoother.py` sont des constantes de module consommées à la construction des capteurs : les externaliser demandera de passer les valeurs aux constructeurs (ou un chargement config dans ces modules) — à prévoir dans des sections `[costs]` / `[interoception]` / `[smoother]` de `config.toml`.
+
+---
+
+## 5. Métrique de santé : distance au geste démontré
+
+> **Statut : acté, non planifié** (déplacé depuis `PROPAL.md`, 2026-11-02).
+
+**Problème.** Aucune mesure ne dit si le WM a intériorisé les démonstrations de relevage : l'inversion P(a4 | contexte, EOS favorable) est-elle apprise ?
+
+**Spécification.** À chaque sommeil, sur les fenêtres du Coreset à relief > 0,05 : générer l'action hindsight sur le contexte s0..s4 avec l'EOS réalisé favorable, et logguer ‖a4_généré − a4_démo‖ moyen — dans les stats de cycle (`sleep_cycle_stats` + résumé console), éventuellement HUD. Cible ~0,05 (mesuré à ~0,20 sur les checkpoints de novembre 2026).
+
+**Usage.** C'est l'indicateur qui pilote les autres leviers du forçage (ε, fréquence lookahead) : si la distance descend, le WM sait refaire le geste ; si elle stagne malgré les leviers, le problème est en amont (couverture des données, pas de conditionnement).

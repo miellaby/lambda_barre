@@ -273,20 +273,21 @@ _ACTION_FLAT_LEN = sum(_N_SIGNALS[STATE_TOKENS:])   # 5
 N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 45
 
 # Per-token action-key → (skeleton attribute, field) lookup.
-# Action tokens record the CONSIGNE (theta_star / d_star) — the decision made
-# in response to the measured state — not the smoothed effective value
-# (theta_eff / d_eff) the actuator converged to (body.py). The salve's
-# (state, action) pair is causally aligned with the decision: a_i answers
-# S_i and drives the transition toward S_{i+1}. The motor smoothing becomes
-# part of the dynamics the world model infers from the history of past
-# consignes; recording theta_eff instead would shift every decision one step
-# into the past (the salve would hold the action that produced its own state).
+# Action tokens record the EFFECTIVE actuator values (theta_eff / d_eff) —
+# the input the physics actually followed — not the consigne (theta_star /
+# d_star), which is only the convergence target of the motor smoothing
+# (body.py). This keeps the recorded (state, action) pairs causally exact:
+# the world model learns the dynamics of what was really applied. The motor
+# smoothing (consigne → effective) is a separate physical layer; recording
+# theta_star instead would force the WM to infer the hidden actuator state
+# from the consigne history, breaking the causal link between action and
+# state transition (the effective value lags the consigne by ~0.5 s).
 _ACTION_LOOKUP = {
-    "membre_avant_theta":   ("limb_front", "theta_star"),
-    "membre_avant_d":       ("limb_front", "d_star"),
-    "membre_arriere_theta": ("limb_back", "theta_star"),
-    "membre_arriere_d":     ("limb_back", "d_star"),
-    "queue_theta":   ("tail_act", "theta_star"),
+    "membre_avant_theta":   ("limb_front", "theta_eff"),
+    "membre_avant_d":       ("limb_front", "d_eff"),
+    "membre_arriere_theta": ("limb_back", "theta_eff"),
+    "membre_arriere_d":     ("limb_back", "d_eff"),
+    "queue_theta":   ("tail_act", "theta_eff"),
 }
 
 # Weights for each innate cost signal in salve_cost.

@@ -50,10 +50,10 @@ Une **salve** regroupe l'ensemble des 16 tokens ($S_i + A_i$) produits à chaque
 | **7** | Visuel / Audio `(0,0,1,0)` | Son `(0,1,0,0)` | `son_0` à `son_4` (5 canaux fréquentiels) | 5 |
 | **8** | Somatosensoriel `(0,1,0,0)` | Contact sol `(0,0,0,1)` | `contact_sol_avant`, `contact_sol_arriere` | 2 |
 | **9** | Somatosensoriel `(0,1,0,0)` | Collision tronc `(0,0,1,0)` | `collision_tronc_x`, `collision_tronc_y`, `collision_tronc_cx`, `collision_tronc_cy` | 4 |
-| **10** | Motivationnel `(1,0,0,1)` | Coûts innés `(0,0,0,0)` | `effort`, `douleur`, `courbature`, `instabilite`, `vertige` | 5 |
+| **10** | Motivationnel `(1,0,0,1)` | Pénalités `(0,0,0,0)` | `effort`, `douleur`, `courbature`, `instabilite`, `vertige` | 5 |
 | **11** | Motivationnel `(1,0,0,1)` | Récompense `(1,0,0,0)` | `confort` | 1 |
 | **12** | Intéroception `(1,0,0,0)` | Bilan métabolique `(0,0,0,1)` | `fatigue`, `souffrance` (niveaux absolus) | 2 |
-
+| **12-EOS** | Intéroception `(1,0,0,0)` | dénouement `(0,0,1,0)` | ??? | ? |
 ### Tokens moteurs et d'action (Tokens 13 à 15)
 
 | Indice | Modalité | Canal | Consignes motrices | Nb signaux |
@@ -70,10 +70,12 @@ Une **salve** regroupe l'ensemble des 16 tokens ($S_i + A_i$) produits à chaque
 Sur les 16 dimensions de signaux d'un token, seules les $N$ premières contiennent des valeurs physiques. Les slots $N \dots 15$ sont maintenus à $0.0$ et sont exclus du calcul de perte MSE via le masque binaire `target_valid`.
 
 ### Token 12 (Bilan métabolique) et token EOS (agrégat de coûts)
-* **Dans l'`ExperienceBuffer`** : le token 12 conserve les niveaux absolus réels enregistrés à chaque pas ($\text{fatigue}, \text{souffrance} \in [0.0, 1.0]$). Ces niveaux sont des intégrateurs lents (demi-vie 100 s / 240 s) : la **porteuse** (*onde porteuse*) d'un dénouement — quasi-statique à l'échelle d'une fenêtre de décision, ils ne peuvent pas la porter.
-* **Dans les tenseurs d'entraînement du World Model (`_batch_tensors`)** :
-  * Les salves intermédiaires ($s_0 \dots s_9$) voient leur token 12 forcé à zéro : la porteuse ne doit pas fuiter en entrée du modèle.
-  * La position terminale porte le **token EOS** — type de token dédié (type état, modalité intéroception, canal $(0,0,1,0)$, orthogonal au canal du bilan métabolique $(0,0,0,1)$) — construit en batch, jamais enregistré dans les salves. Il porte le **delta de dénouement** des canaux de coût innés : la fenêtre de conséquence $s_5 \dots s_{10}$ (pondérée dans le temps, à l'inverse du temps restant) moins la fenêtre de décision $s_0 \dots s_4$ (moyenne plate) :
+* **Dans le journal** : le token 12 contient les niveaux `fatigue` et `souffrance` ($\text{fatigue}, \text{souffrance} \in [0.0, 1.0]$). Des intégrateurs lents (demi-vie 100 s / 240 s).
+* **A l'entraînement du World Model (`_batch_tensors`)** :
+  * Le token 12 des salves est forcé à zéro.
+  * Le dernier token de la séquence (token 12) est reconstruit à la volée pour l'entraînement en **token EOS**
+  * Token EOS: token de type état, de modalité intéroception, de canal $(0,0,1,0)$, distinct du bilan métabolique
+  * Le token EOS porte le **dénouement**, la différence entre la moyenne des pénalités de la conséquence ($s_5 \dots s_{10}$) pondérée à l'inverse du temps, et la moyenne des pénalités du contexte ($s_0 \dots s_4$):
     $$\text{slot}_c = \frac{(\text{late}_c - \text{early}_c)/0.15 + 1}{2}$$
     soit $0.5$ = neutre (aucun changement), $< 0.5$ = rétablissement, $> 0.5$ = aggravation — échelle $\pm 0.15$ calibrée sur la dynamique mesurée (deltas typiques $\pm 0.05$, les pointes de crise saturent).
     Les slots restent des **deltas bruts par canal** (le WM conditionne sur le dénouement de chaque canal, et le forcing est multiplicatif par canal). Partout où l'EOS est lu comme un **scalaire** (relief score, ancre de saliency, affichage Dream Theater), la hiérarchie innée usuelle s'applique : $[\text{effort}, \text{douleur}, \text{courbature}, \text{instabilité}, \text{vertige}, \text{confort}]$ pondérés $[1, 4, 2, 2, 3, 1]$.

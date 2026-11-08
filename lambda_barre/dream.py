@@ -61,7 +61,7 @@ class DreamTrajectory:
     regime_idx: int                   # 0..1 (Kalman, Policy)
     regime_name: str                  # "Kalman", "Policy"
     steps: list[DreamStep] = field(default_factory=list)
-    total_cost: float = 0.0
+    total_cost: float | None = None  # accumulated trajectory cost (legacy candidate machinery only)
     is_best_future: bool = False
     is_winner: bool = False
     eos_pred: list[float] | None = None  # imagined denouement delta (6 slots, 0.5 = neutre)
@@ -720,18 +720,16 @@ class DreamTheater:
             s_reg = font_small.render(r_name, FONT_AA, TEXT_WHITE)
             screen.blit(s_reg, (20, content_y + 12))
 
-            cost_str = f"Cost: {traj.total_cost:.2f}"
+            if traj.total_cost is not None:
+                cost_str = f"Cost: {traj.total_cost:.2f}"
+            else:
+                cost_str = f"Outcome: {_eos_scalar(traj.eos_pred):+.2f}" if traj.eos_pred is not None else "—"
             s_cost = font_small.render(cost_str, FONT_AA, WINNER_BORDER if is_win else (BEST_BORDER if is_best else TEXT_MUTED))
             screen.blit(s_cost, (20, content_y + 30))
 
             if is_win:
                 s_win = font_small.render("🏆 WINNER", FONT_AA, WINNER_BORDER)
                 screen.blit(s_win, (20, content_y + 48))
-            elif traj.eos_pred is not None:
-                # Imagined terminal outcome of this rollout (mean cost)
-                s_eos = font_small.render(f"EOS delta {_eos_scalar(traj.eos_pred):+.2f}",
-                                          FONT_AA, TEXT_MUTED)
-                screen.blit(s_eos, (20, content_y + 48))
             elif is_best:
                 s_best = font_small.render("★ Best Regime", FONT_AA, BEST_BORDER)
                 screen.blit(s_best, (20, content_y + 48))
@@ -859,9 +857,11 @@ class DreamTheater:
             draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
                            cand_color=CAND_COLORS[c_idx], is_winner=traj.is_winner)
             ax = x + self.thumb_w + 10
-            lines = [names[c_idx], f"Cost {traj.total_cost:.2f}"]
+            lines = [names[c_idx]]
+            if traj.total_cost is not None:
+                lines.append(f"Cost {traj.total_cost:.2f}")
             if traj.eos_pred is not None:
-                lines.append(f"EOS delta {_eos_scalar(traj.eos_pred):+.2f}")
+                lines.append(f"Outcome {_eos_scalar(traj.eos_pred):+.2f}")
             if c_idx == 1:
                 lines.append("ACCEPTED" if traj.is_winner else "REJECTED")
             col = WINNER_BORDER if traj.is_winner else CAND_COLORS[c_idx]

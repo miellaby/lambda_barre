@@ -118,86 +118,6 @@ def _apply_consignes(skel, theta_front, d_front, theta_back, d_back, tail_t):
     skel.tail_act.theta_star = tail_t_phys
 
 
-def _synthesize_consigne(samples: list[float], threshold: float = 0.0) -> float:
-    """Synthesize one representative consigne from the series of samples
-    captured between two WM ticks.
-
-    Returns the raw sample with the maximum absolute value (the extreme
-    excursion). Ties prefer the last occurrence.
-
-    - Monotonic progression → the extreme endpoint
-    - Peak / trough (any position) → the peak / trough sample
-    - Noise around a mean → the mean (if |extremum − mean| < threshold)
-
-    The returned value is always a raw sample — never an extrapolated
-    curve value. The recorded value is the *intent* (extreme), not the
-    *effect* (smoothed) — the motor smoothing (theta_eff) is a separate
-    physical layer that the WM must learn to bridge.
-    """
-    if not samples:
-        return 0.0
-    if len(samples) == 1:
-        return samples[0]
-
-    extremum = max(enumerate(samples),
-                   key=lambda iv: (abs(iv[1]), iv[0]))[1]
-
-    if threshold > 0.0:
-        mean = sum(samples) / len(samples)
-        if abs(extremum - mean) < threshold:
-            return mean
-
-    return extremum
-
-
-def _sample_raw_consignes(skel) -> tuple:
-    """Extract raw consigne values from the skeleton (facing-independent).
-    Returns (theta_l, d_l, theta_r, d_r, tail_theta)."""
-    return (
-        skel.limb_l.theta_star, skel.limb_l.d_star,
-        skel.limb_r.theta_star, skel.limb_r.d_star,
-        skel.tail_act.theta_star,
-    )
-
-
-def _override_consignes(skel, record: tuple) -> tuple:
-    """Override the skeleton's consignes with synthesized record values.
-    Returns the original values for restoration."""
-    orig = _sample_raw_consignes(skel)
-    skel.limb_l.theta_star, skel.limb_l.d_star = record[0], record[1]
-    skel.limb_r.theta_star, skel.limb_r.d_star = record[2], record[3]
-    skel.tail_act.theta_star = record[4]
-    return orig
-
-
-def _restore_consignes(skel, orig: tuple) -> None:
-    """Restore the skeleton's consignes after an override."""
-    skel.limb_l.theta_star, skel.limb_l.d_star = orig[0], orig[1]
-    skel.limb_r.theta_star, skel.limb_r.d_star = orig[2], orig[3]
-    skel.tail_act.theta_star = orig[4]
-
-
-def _synthesize_record(buffer: list) -> tuple | None:
-    """Synthesize a single representative consigne tuple from the buffer of
-    raw samples captured between two WM ticks. Returns None if the buffer
-    is empty (no override needed).
-
-    Thresholds (10% of actuator range) distinguish noise (→ mean) from
-    real excursions (→ extremum)."""
-    if not buffer:
-        return None
-
-    theta_thresh = 0.1 * THETA_RANGE
-    d_thresh = 0.1 * (B.LIMB_MAX - B.LIMB_MIN)
-    thresholds = (theta_thresh, d_thresh, theta_thresh, d_thresh, theta_thresh)
-
-    n = len(buffer[0])
-    return tuple(
-        _synthesize_consigne([sample[i] for sample in buffer], thresholds[i])
-        for i in range(n)
-    )
-
-
 def _platform_hit(space, world_pos):
     """Return the (body, shape) of the platform under world_pos, or None."""
     for plat, seg, w, h in space._platforms:
@@ -220,7 +140,13 @@ def run(headless: bool = False, steps: int = 0,
         pol_steps: int = 64, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
         eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
         eos_force_amplify: float = 1.0,
+        eos_force_amplify_threshold: float = 0.95,
         wm_impact_floor: float = 0.25,
+        lookahead_relief_mult: float = 1.0,
+        wm_w_state_post: float = 1.0,
+        wm_w_act_post: float = 1.0,
+        wm_w_eos: float = 16.0,
+        wm_w_a4_lookahead: float = 1.0,
         freeze_physics: bool = False, no_smooth: bool = False,
         wm_target_loss: float = 0.01,
         use_kv_cache: bool = True,
@@ -291,7 +217,13 @@ def run(headless: bool = False, steps: int = 0,
                   eos_force_eps_lo=eos_force_eps_lo,
                   eos_force_eps_hi=eos_force_eps_hi,
                   eos_force_amplify=eos_force_amplify,
-                  wm_impact_floor=wm_impact_floor)
+                  eos_force_amplify_threshold=eos_force_amplify_threshold,
+                  wm_impact_floor=wm_impact_floor,
+                  lookahead_relief_mult=lookahead_relief_mult,
+                  wm_w_state_post=wm_w_state_post,
+                  wm_w_act_post=wm_w_act_post,
+                  wm_w_eos=wm_w_eos,
+                  wm_w_a4_lookahead=wm_w_a4_lookahead)
     auto = False                 # brain drives the consignes when True
     try:
         brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
@@ -307,14 +239,14 @@ def run(headless: bool = False, steps: int = 0,
                                                seq_steps=seq_steps, n_ctx=n_ctx)
         brain.buffer.save(_BUF_CKPT)
         status = f"dataset bootstrapped ({len(brain.buffer)} seqs)"
-    smoother = Smoother()
-    salves: list = []       # buffer of last 10 salves (for display, disabled)
-    wm_view: DreamStep | None = None  # egocentric thumbnail of the last WM tick (wake)
     WM_DT = 1.0 / wm_hz       # world model cadence
     POL_DT = 1.0 / pol_hz     # policy cadence
+    # IIR time constant calibrated so t_90% = one WM tick, whatever wm_hz is
+    smoother = Smoother(tau=WM_DT / math.log(10.0))
+    salves: list = []       # buffer of last 10 salves (for display, disabled)
+    wm_view: DreamStep | None = None  # egocentric thumbnail of the last WM tick (wake)
     wm_accum = 0.0            # WM record accumulator (fires at wm_hz, every other brain tick)
     pol_accum = 0.0           # brain tick accumulator (fires at pol_hz)
-    consigne_buffer: list = []  # raw consigne samples between WM ticks (for synthesis)
     show_overlays = True   # G: toggle targets, egocentric view, and token panel
     drag_plat = None       # (body, shape) of platform being right-dragged
     drag_offset = (0, 0)  # world-space offset from platform centre to mouse
@@ -404,7 +336,6 @@ def run(headless: bool = False, steps: int = 0,
                     smoother.reinit(sig_r, ts_r, cs_r, vs_r, isg_r, rs_r)
                     brain.clear_history()
                     salves.clear()
-                    consigne_buffer.clear()
                     wm_view = None
                     wm_accum = 0.0
                     pol_accum = 0.0
@@ -595,7 +526,6 @@ def run(headless: bool = False, steps: int = 0,
                 smoother.reinit(sig, ts, cs, vs, isg, rs)
                 if sleep_gen is None:
                     brain.clear_history()
-                    consigne_buffer.clear()
                     wm_accum = 0.0
                     pol_accum = 0.0
             else:
@@ -604,9 +534,6 @@ def run(headless: bool = False, steps: int = 0,
             # 5. Brain — offline during sleep
             if sleep_gen is not None:
                 return sig, ts, rs, isg, cs, vs
-
-            # Sample raw consignes for synthesis (before brain tick may change them)
-            consigne_buffer.append(_sample_raw_consignes(skel))
 
             if auto:
                 # Brain tick at policy cadence (6 Hz): WM forward + policy action.
@@ -624,29 +551,21 @@ def run(headless: bool = False, steps: int = 0,
                     wm_accum += POL_DT
                     if wm_accum >= WM_DT:
                         wm_accum -= WM_DT
-                        consigne_buffer.clear()
                         brain.record_tick(salve)
                         salves.append(salve)
                         if len(salves) > 3:
                             salves.pop(0)
                         wm_view = _wm_view_step(brain, salve)
             else:
-                # Manual mode: record tick at WM cadence — synthesize the
-                # consigne from the buffer (the user may have changed it many
-                # times between two records; the snapshot alone is not
-                # representative). No WM inference here: the latent is only
+                # Manual mode: record tick at WM cadence. Action tokens carry
+                # the effective actuator values (theta_eff / d_eff) — what the
+                # physics actually followed — so no consigne synthesis or
+                # override is needed. No WM inference here: the latent is only
                 # consumed in auto mode, where brain_tick refreshes it.
                 wm_accum += 1.0 / 60.0
                 if wm_accum >= WM_DT:
                     wm_accum -= WM_DT
-                    record = _synthesize_record(consigne_buffer)
-                    if record is not None:
-                        orig = _override_consignes(skel, record)
-                        salve = encode_salve()
-                        _restore_consignes(skel, orig)
-                    else:
-                        salve = encode_salve()
-                    consigne_buffer.clear()
+                    salve = encode_salve()
                     brain.record_tick(salve)
                     salves.append(salve)
                     if len(salves) > 3:
@@ -724,7 +643,13 @@ def main() -> None:
         "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_batch": 64,
         "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
         "eos_force_amplify": 1.0,
+        "eos_force_amplify_threshold": 0.95,
         "wm_impact_floor": 0.25,
+        "lookahead_relief_mult": 1.0,
+        "wm_w_state_post": 1.0,
+        "wm_w_act_post": 1.0,
+        "wm_w_eos": 16.0,
+        "wm_w_a4_lookahead": 1.0,
         "freeze_physics": False, "no_smooth": False,
         "wm_target_loss": 0.01,
         "use_kv_cache": True, "pol_eos_lookahead": True,

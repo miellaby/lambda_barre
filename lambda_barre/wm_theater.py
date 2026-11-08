@@ -227,14 +227,15 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         gen_toks = res["gen_toks"]
         gen_action = res["gen_action"]
 
-        # Comparison info: baseline vs hindsight (forced-EOS)
-        c_pi_val = float(res["c_pi"][0].item())
-        c_gen_val = float(res["c_gen"][0].item())
+        # Comparison info: baseline vs hindsight (forced-EOS) — denouement
+        # favorability under the EOS channel hierarchy
+        fav_pi = float(brain._eos_favorability(res["eos_pi"])[0].item())
+        fav_gen = float(brain._eos_favorability(res["eos_gen"])[0].item())
         hindsight_info = {
-            "c_pi": c_pi_val,
-            "c_gen": c_gen_val,
-            "delta_cost": c_gen_val - c_pi_val,
-            "accepted": bool(c_gen_val < c_pi_val),
+            "fav_pi": fav_pi,
+            "fav_gen": fav_gen,
+            "delta_fav": fav_gen - fav_pi,
+            "accepted": bool(fav_gen > fav_pi),
             "eos_pi": res["eos_pi"][0].tolist(),
             "eos_forced": res["eos_forced"][0].tolist(),
             "eos_gen": res["eos_gen"][0].tolist(),
@@ -785,18 +786,18 @@ class WMTheater:
 
         y += 6
 
-        # Cost comparison
-        c_pi = info["c_pi"]
-        c_gen = info["c_gen"]
-        delta_c = info["delta_cost"]
-        s = font_tiny.render("Rollout cost:", FONT_AA, TEXT_MUTED)
+        # Denouement favorability comparison
+        fav_pi = info["fav_pi"]
+        fav_gen = info["fav_gen"]
+        delta_fav = info["delta_fav"]
+        s = font_tiny.render("Outcome favorability (+ = recovery):", FONT_AA, TEXT_MUTED)
         screen.blit(s, (px + 12, y))
         y += 16
-        s = font_tiny.render(f"  Baseline (a4)  : {c_pi:.3f}", FONT_AA, TEXT_WHITE)
+        s = font_tiny.render(f"  Baseline (a4)  : {fav_pi:+.3f}", FONT_AA, TEXT_WHITE)
         screen.blit(s, (px + 12, y))
         y += 15
-        s = font_tiny.render(f"  Hindsight (a4*) : {c_gen:.3f}   ({delta_c:+.3f})",
-                             FONT_AA, (100, 245, 160) if delta_c < 0 else (240, 110, 120))
+        s = font_tiny.render(f"  Hindsight (a4*) : {fav_gen:+.3f}   ({delta_fav:+.3f})",
+                             FONT_AA, (100, 245, 160) if delta_fav > 0 else (240, 110, 120))
         screen.blit(s, (px + 12, y))
         y += 20
 

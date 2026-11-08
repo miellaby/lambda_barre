@@ -59,7 +59,13 @@ TOML_TO_PARAM: dict[str, str] = {
     "training_eos_force_eps_lo": "eos_force_eps_lo",
     "training_eos_force_eps_hi": "eos_force_eps_hi",
     "training_eos_force_amplify": "eos_force_amplify",
+    "training_eos_force_amplify_threshold": "eos_force_amplify_threshold",
     "training_wm_impact_floor":  "wm_impact_floor",
+    "training_lookahead_relief_mult": "lookahead_relief_mult",
+    "training_wm_w_state_post":  "wm_w_state_post",
+    "training_wm_w_act_post":    "wm_w_act_post",
+    "training_wm_w_eos":         "wm_w_eos",
+    "training_wm_w_a4_lookahead": "wm_w_a4_lookahead",
     # buffer section
     "buffer_capacity":         "buffer_capacity",
     "buffer_pool_capacity":    "buffer_pool_capacity",

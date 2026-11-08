@@ -1,9 +1,10 @@
 """IIR exponential smoother for sensor signals.
 
 Each smoothed sensor signal is low-passed with a first-order IIR (exponential
-moving average) with a time constant of ~1/3 s. The smoother is updated every
-frame (60 Hz) and read once per world-model tick (3 Hz), producing a salve that
-synthesizes the last second of sensory experience into a single token set.
+moving average). The smoother is updated every frame (60 Hz) and read once per
+world-model tick (wm_hz), producing a salve that synthesizes the recent sensory
+experience into a single token set. The caller calibrates tau so that t_90%
+equals one WM tick (tau = WM_DT / ln 10, ~1/3 s at 3 Hz) — see main.py.
 
 Smoothing is a per-scalar decision: only noisy *derived* quantities (finite
 differences, impulse-based forces, thresholded cost spikes) are smoothed.
@@ -23,8 +24,10 @@ import math
 
 from .tokenize import _BY_KEY, DenseEncoder
 
-# Time constant of the IIR filter (seconds). At 60 Hz, alpha = dt / (tau + dt).
-# Calibrated for t_90% = 0.33s (1/3 s) -> tau = 0.33 / ln(10) ≈ 0.1433s, half-life ≈ 100 ms (~6 frames).
+# Default IIR time constant (seconds), calibrated for a 3 Hz WM tick:
+# t_90% = 0.33 s -> tau = 0.33 / ln(10) ≈ 0.1433 s, half-life ≈ 100 ms (~6 frames).
+# main.py passes tau = WM_DT / ln(10) so t_90% always equals one WM tick.
+# At 60 Hz, alpha = dt / (tau + dt).
 TAU = 0.33 / math.log(10.0)
 
 # Keys of all sensor signals the smoother tracks (everything except actions,
@@ -60,7 +63,7 @@ _SMOOTHED_KEYS = {
 
 
 class Smoother:
-    """One IIR filter per sensor signal. Update at 60 Hz, read at 1 Hz."""
+    """One IIR filter per sensor signal. Update at 60 Hz, read once per WM tick."""
 
     def __init__(self, tau: float = TAU):
         self._tau = tau

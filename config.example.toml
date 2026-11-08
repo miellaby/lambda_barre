@@ -35,11 +35,19 @@ wm_coreset_epoch   = 512    # World Model training epochs per sleep cycle (Cores
 wm_addendum_epoch  = 128    # World Model training epochs per sleep cycle (Addendum phase)
 wm_batch        = 64     # World Model training batch size
 wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
-pol_steps       = 32     # Policy training steps per sleep cycle
-eos_force_eps_lo = 0.15  # hindsight forcing: lower bound of eps ~ U(lo, hi)
-eos_force_eps_hi = 0.40  # hindsight forcing: upper bound of eps ~ U(lo, hi)
+pol_steps       = 256    # Policy training steps per sleep cycle
+eos_force_eps_lo = 0.10  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
+eos_force_eps_hi = 0.25  # hindsight forcing: upper bound of eps ~ U(lo, hi)
 eos_force_amplify = 1.0  # hindsight action amplification toward extremes (1.0 = off)
-wm_impact_floor  = 0.25   # additive floor on the per-sequence impact weight (impact/neutral contrast ~3x at relief 0.5)
+eos_force_amplify_threshold = 0.95  # only amplify actions already near extremes (|v| >= threshold)
+wm_impact_floor  = 0.10  # additive floor on the per-sequence impact weight (neutral windows learn at a trickle)
+lookahead_relief_mult = 4.0  # relief contrast multiplier on the lookahead (hindsight) loss passes — outcome-carrying sequences weigh more in the inversion
+# Causal-pass loss row weights, relative to the context baseline 1.0 (defaults = "full" mode,
+# i.e. every row trained as before):
+wm_w_state_post  = 1.0   # rows predicting a STATE token of a post-decision salve (k > n_ctx) — keep at 1.0 to preserve the dynamics used by imagined rollouts
+wm_w_act_post    = 1.0   # rows predicting an ACTION token of a post-decision salve — no consumer reads them (0.0 is safe)
+wm_w_eos         = 16.0  # terminal denouement rows (last salve cost/reward slots + EOS token)
+wm_w_a4_lookahead = 1.0  # multiplier on the whole hindsight (EOS-lookahead) loss pass
 
 # ---------------------------------------------------------------------------
 # Experience buffer capacities (in number of sequences)

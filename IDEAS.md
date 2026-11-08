@@ -5,31 +5,34 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 ## Architecture
 
 - Créature 2D dans environnement simulé
-- AI dual-network : un World Model prédit le futur et une Policy décide, reliés par le latent intermédiaire.
-- Apprentissage en ligne continu obtenu par alternance entre éveil (collecte) et sommeil (consolidation).
-- Mode supervisé : policy désactivée et pilotage manuel des consignes enregistrées comme données d'entraînement.
+- IA à 2 modèles : Un Transformer "Word Model" et un MLP "Politique".
+- Le World Model prédit soit le futur, soit la conséquence d'une action, soit une action par anticipation du dénouement.
+- La Politique décide la prochaine action
+- La politique est reliée au latent intermédiaire du WM.
+- Apprentissage continu obtenu par alternance entre éveil (inférence et enrichissement du dataset) et sommeil (apprentissage).
+- Mode auto : inférence des consignes par l'IA.
+- Mode manuel : pilotage manuel des consignes enregistrées comme données d'entraînement.
 - Boucle principale linéaire : physics step → smoother → facing-flip → sleep check → brain_tick → record_tick.
 
 ## Corps & simulation physique
 
-- Créature 2D biomécanique actionnée (pattes avant, pattes arrière, queue) simulée dans Pymunk avec ressorts, friction au sol et gravité.
-- Membres à extension actionnée (`LimbActuator`) et queue à couple (`TailActuator`), chacun avec consigne d'angle et de longueur.
-- Référentiel égocentré des angles de membres : positif vers l'extérieur, aligné sur le sens de marche (`facing`).
-- Lissage moteur : la physique suit des valeurs effectives qui convergent vers la consigne (50 % de l'écart résiduel par période policy), jamais la consigne brute.
-- Gestion propre du retournement (`facing` flip) avec réinitialisation du lisseur, purge de l'historique WM et salve immédiate dans le nouveau référentiel.
-- Balle (rebondissante et soumise à la gravité) perceptible
-- pas de simulation 1/60 s indépendant de l'inférence.
+- Animat 2D. Vue de coté orientée vers le sens de la marche et du regard, à droite ou à gauche (`facing`).
+- Simulation Pymunk avec ressorts, friction au sol et gravité. Des plateformes statiques et une balle rebondissante. Tick de simulation physique stable: 60 Hz.
+- Un Actuateur pour les jambes (consignes d'angle et de longueur) et un pour la queue (angle).
+- Lissage des consignes : la physique suit des valeurs effectives de consignes après lissage (50 % de l'écart résiduel par période policy).
+- Référentiel égocentré des angles de membres : positif vers l'extérieur, orienté vers la marche.
+- Retournement (`facing` **flip**) : Nouvelle orientation du référentiel. Réinitialisation du lisseur. Purge de l'historique WM. Reconstruction immédiate de la salve courante.
 - Accélération du temps réel de 0,25x à 8x.
 
 ## Capteurs & signaux
 
 - Proprioception : angles, extensions, vitesses, forces d'actuateurs et contacts au sol.
 - Extéroception : vision en cône rétinien, flux optique sur les solides mobiles, toucher, audition et suivi de la balle.
-- Intéroception : la fatigue intègre l'effort et la souffrance la douleur. Intégrateurs lents avec dynamique propre (montée par les punitions, décroissance par le confort et évaporation passive).
+- Intéroception : la fatigue accumule l'effort. La souffrance accumule la douleur. Intégrateurs lents avec Récupération encore plus lente.
 - Circuit de récompense inné pondéré : effort ×1, douleur ×4, courbature ×2, instabilité ×2, vertige ×3, confort ×1.
 - Douleur lissée à la source par une enveloppe asymétrique (attaque instantanée, décroissance exponentielle).
 - Filtrage IIR sélectif : seuls les signaux dérivés bruités (accélérations, forces, flux optique) sont lissés, les signaux physiques directs passent sans retard.
-- Capteur balle avec vitesses radiale et angulaire (`ball_dir`, `ball_prox`, `ball_vr`, `ball_va`) remplacant le curseur souris.
+- Capteur balle avec vitesses radiale et angulaire.
 - Enroulement continu de l'angle du tronc sur [-15°, 345°].
 - Actions encodées sans échelle physique, toujours dans l'intervalle [0,1] ; sigmoid en sortie de policy.
 - Capteur d'instabilité. L'instabilité brute est la distance du centre de masse hors du polygone de sustentation (entre les deux pieds) : Plus le centre de masse sort du support, plus raw grandit.
@@ -40,16 +43,16 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 
 - Salve dense de 16 tokens (13 états + 3 actions) produite à chaque tick du World Model. L'action répond à l'état.
 - Tokens d'action = consigne pour les actuateurs.
-- NON: Quantification des valeurs sur 9 niveaux (0–8), le niveau 4 étant le zéro exact des signaux signés.
 - Agencement causal de la salve : physique → coûts → confort → intéroception, coupant tout raccourci intra-salve.
 - Séquence = fenêtre glissante de salves consécutives
 - 10 transitions par défaut, paramétrable. Les n_ctx = 4 premières slaves de la séquence forment le contexte de décision. Les suivantes forment la fenêtre de conséquence.
-- Le token EOS de la dernière salve d'une séquence porte le scalaire `sequence_relief`. C'est la différence des six coûts innés, entre la fenêtre de conséquence et celle du contexte de décision.
-- Fenêtre de décision pondérée par décroissance vers le passé (S4 ~52 %).
-- Fenêtre de conséquence pondérée par moyenne plate sur 2 s.
-- Zero-padding de l'intéroception (fatigue/souffrance) sur les salves intermédiaires, révélée uniquement sur la salve finale.
-- Causalité stricte : masque par groupe empêchant les tokens d'une même salve de se voir entre eux.
-- Journal linéaire segmenté sur les discontinuités physiques (retournement, reset).
+- Le token EOS est le dernier token de la dernière salve d'une séquence. Il porte le dénouement = le delta des coûts innés, entre la conséquence et le contexte de décision. On en déduit le taux de soulagement `sequence_relief`. 
+- Coûts du contexte pondérés en décroissant vers le passé.
+- Coûts de conséquence moyennés.
+- En passe causale: 
+  * Zero-padding de l'intéroception (fatigue/souffrance) sauf EOS.
+  * Causalité stricte : masque par groupe empêchant les tokens d'une même salve de se voir entre eux.
+- Journalisation linéaire des salves. Journal segmenté sur les discontinuités physiques (retournement, reset).
 
 ## World Model
 
@@ -59,7 +62,7 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Dans la phase d'éveil. Inférence WM basé sur un historique des 4 dernières salves vécues (taille du contexte pour l'apprentissage de la policy). L'historique est purgé quand nécessaire (`clear_history`).
 - KV-cache incrémental pour l'inférence, invalidé à chaque mise à jour des poids.
 - Compilation optionnelle `torch.compile` du pas d'entraînement WM (graphe fusionné, passe arrière incluse).
-- Pondération de l'entraînement WM par l'impact de la séquence, c'est à dire abs(sequence_relief), l'amplitude du changement de coût biologique, avec un plancher additif de 0,25 : les séquences neutres apprennent au goutte-à-goutte, contraste impact/neutre d'environ x3.
+- Pondération de l'entraînement WM par l'impact de la séquence, c'est à dire abs(sequence_relief) + plancher: contraste recherché impact/neutre x3.
 - Boost ×16 du gradient sur les canaux de récompense et les slots EOS terminaux.
 - Passes d'entraînement alternées en mode EOS-lookahead : le World Model apprend à prédire l'action conditionnée par le dénouement.
 - Masque d'attention lookahead : la position de décision voit le token EOS terminal, et la ligne EOS ne voit que le contexte de décision.
@@ -73,15 +76,9 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Espace de sortie normalisé (angles dans [-1, 1], extensions dans [0, 1]) séparé de la conversion physique.
 - MLP "moderne" : 256 neurones internes, activations ReLU, sortie tanh/sigmoid.
 - Entraînement par imitation : la policy apprend à reproduire une action obtenue par inférence du World Model
-- Supervision hindsight EOS-lookahead : le WM génère l'action associée à un dénouement (token EOS) forcé meilleur, la policy l'imite si le rollout causal le confirme.
-- Entraînement alternatif de la policy sur option `--no-eos-lookahead`: entraînement basé sur l'imagination.
-   * Apprentissage supervisé basé sur la meilleure action (d'après le futur prédit par le WM) entre 3 candidats: [action historique telle qu'enregistrée dans la séquence] [action générée par la politique courante] [exploration gaussienne σ = 0,30 autour de la politique courante].
-   * Pour chaque action candidate: Imagination WM multi-futurs. On évalue l'action par son meilleur futur ("optimisme de Bellman").
-   * 2 futurs: [prolongation Kalman amortie de l'action candidate] et [application de la policy sur les ticks suivants].
-   * Prolongation Kalman avec clamping de vitesse physique (±0,20 rad/pas, ±0,15 extensions).
-- NON: entraînement REINFORCE de l'action inférée à partir du gain prédit par le WM
+- Supervision hindsight EOS-lookahead : Le WM prédit le futur de l'action politique, puis génère une nouvelle action qui donne un meilleur dénouement. 
 - Forçage additif de l'EOS vers un dénouement plus favorable : plancher à la neutralité (0,5) puis décalage d'amplitude ε ~ U(0,15 ; 0,40) par slot.
-- Amplification optionnelle des actions hindsight vers les extrêmes.
+- Amplification des actions hindsight vers les extrêmes.
 - Échantillonnage de la policy priorisé par soulagement (relief score basé sur le delta de souffrance et de fatigue).
 - Bruit `act_std` sur la sortie policy
 - Synthèse des consignes par extremum entre deux ticks WM pour capturer l'intention réelle.
@@ -129,8 +126,18 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Configuration TOML centralisée (`config.toml`) pour toutes les options structurelles (architecture, séquence, buffer, cadences).
 - Paramétrage de la longueur de séquence (`seq_steps`, `n_ctx`) et des cadences (`wm_hz`, `pol_hz`) via `compute_seq_layout` et fonctions dédiées.
 - Architecture du Brain entièrement paramétrable (d_model, nhead, layers, dim_ff, dropout, pol_hidden, capacités mémoire).
-- NON: Générateur de dataset d'amorçage headless (`--bootstrap-dataset`) avec auto-reset sur chute. Câblé dans le code (`main.py`, `dataset.py`) mais jamais testé et non voulu.
 - Suite de tests pytest end-to-end couvrant le pipeline complet.
 - Dossier `.tmp/` gitignoré pour les scripts temporaires.
 - README en anglais, original français conservé dans `LISEZMOI.md`.
 - DESIGN.md avec les détails d'implémentation
+
+## Idées abandonnées / en cours d'abandon
+
+- Entraînement alternatif de la policy sur option `--no-eos-lookahead`: entraînement basé sur l'imagination.
+   * Apprentissage supervisé basé sur la meilleure action (d'après le futur prédit par le WM) entre 3 candidats: [action historique telle qu'enregistrée dans la séquence] [action générée par la politique courante] [exploration gaussienne σ = 0,30 autour de la politique courante].
+   * Pour chaque action candidate: Imagination WM multi-futurs. On évalue l'action par son meilleur futur ("optimisme de Bellman").
+   * 2 futurs: [prolongation Kalman amortie de l'action candidate] et [application de la policy sur les ticks suivants].
+   * Prolongation Kalman avec clamping de vitesse physique (±0,20 rad/pas, ±0,15 extensions).
+- NON: quantification des signaux de token.
+- NON: entraînement REINFORCE de l'action inférée à partir du gain prédit par le WM
+- NON: Générateur de dataset d'amorçage headless (`--bootstrap-dataset`) avec auto-reset sur chute. Câblé dans le code (`main.py`, `dataset.py`) mais jamais testé et non voulu.

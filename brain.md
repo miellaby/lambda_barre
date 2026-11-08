@@ -42,8 +42,9 @@ bootstrap de données d'équilibre). Le pipeline complet est documenté dans
 
 Pendant l'**éveil**, la physique tourne à 60 Hz. À la cadence world model
 (5 Hz), chaque tick produit une **salve** : 16 tokens denses (13 d'état +
-3 d'action) qui résume la dernière seconde d'expérience sensorielle (lissée
-par IIR). La salve est journalisée dans la mémoire (`Brain.record_tick`, avec
+3 d'action) qui résument l'expérience sensorielle récente — lissage IIR
+calibré sur le tick WM (réponse à 90 % en exactement un tick, ~0.2 s à 5 Hz,
+~0.33 s à 3 Hz), pas une fenêtre fixe d'une seconde. La salve est journalisée dans la mémoire (`Brain.record_tick`, avec
 pause d'enregistrement quand plus rien ne bouge) et alimente l'historique de
 contexte. À la cadence policy (10 Hz, brain on), un forward pass du world
 model produit un **latent** frais à chaque tick — l'observation de la

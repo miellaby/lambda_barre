@@ -56,6 +56,11 @@ def run(device: str | None = None,
         eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
         eos_force_amplify: float = 1.0,
         wm_impact_floor: float = 0.25,
+        lookahead_relief_mult: float = 1.0,
+        wm_w_state_post: float = 1.0,
+        wm_w_act_post: float = 1.0,
+        wm_w_eos: float = 16.0,
+        wm_w_a4_lookahead: float = 1.0,
         wm_hz: float = 3.0, pol_hz: float = 6.0,
         **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
@@ -84,7 +89,12 @@ def run(device: str | None = None,
                   eos_force_eps_lo=eos_force_eps_lo,
                   eos_force_eps_hi=eos_force_eps_hi,
                   eos_force_amplify=eos_force_amplify,
-                  wm_impact_floor=wm_impact_floor)
+                  wm_impact_floor=wm_impact_floor,
+                  lookahead_relief_mult=lookahead_relief_mult,
+                  wm_w_state_post=wm_w_state_post,
+                  wm_w_act_post=wm_w_act_post,
+                  wm_w_eos=wm_w_eos,
+                  wm_w_a4_lookahead=wm_w_a4_lookahead)
     try:
         brain.load_checkpoint(wm_path, pol_path, buf_path)
         status = f"brain restored (coreset {brain.buffer.coreset_size})"
@@ -211,6 +221,7 @@ def main() -> None:
         "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
         "eos_force_amplify": 1.0,
         "wm_impact_floor": 0.25,
+        "lookahead_relief_mult": 1.0,
         # CLI-only
         "save": True,
         "wm_path": _WM_CKPT, "pol_path": _POL_CKPT, "buf_path": _BUF_CKPT,

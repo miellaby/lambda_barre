@@ -31,13 +31,17 @@ follow the cycle live:
    decision state S4 and the terminal state S10 — so the WM focuses on
    sequences with real biological consequences; a small floor weight keeps
    neutral sequences learning at a trickle. The gradient is strongly
-   boosted on the terminal salve's reward slots and on the EOS token.
    Causal passes alternate with EOS-lookahead passes (one lookahead in
-   four): under the lookahead attention mask, the decision position (token
-   76, whose head predicts a4) additionally attends the realized terminal
-   EOS token (position 172), and the EOS token attends only the decision
-   context and itself — so the WM learns the hindsight action (a4 given the
-   context and the EOS) on the same trunk, without letting the recorded a4
+   two). The causal pass trains the full dynamics (its gradient is
+   boosted on the terminal salve's reward slots and on the EOS token).
+   The lookahead pass trains the inversion only — the gap between the
+   estimated a4 and the observed one: under the lookahead attention mask
+   the decision position additionally attends the realized terminal EOS
+   token (position 172), and the loss covers only the rows predicting
+   a4's consigne tokens. Nothing else is asked of the lookahead pass —
+   state predictions and the terminal reward slots are the causal pass's
+   job, and the other actions are not asked for. The EOS token attends
+   only the decision context and itself, so the recorded actions cannot
    leak through the EOS key.
 5. **Surprise Filtering** — inference only, no gradient: the WM predicts
    each surviving Addendum sequence. Error below threshold = familiar =
@@ -109,10 +113,9 @@ survives as an explicit fallback.
   rollout-equivalents per batch instead of the legacy 6):
   - **Baseline rollout**: the policy's action acts on s4, then the policy
     reacts in closed loop to each imagined state for 6 steps (sliding
-    77-token window). The accumulated cost is discounted (gamma > 1
-    amplifies long-horizon consequences) and the imagined salves yield the
-    predicted denouement delta (time-weighted consequence window minus the
-    decision-window baseline read from the real context).
+    77-token window). The imagined salves yield the predicted denouement
+    delta (time-weighted consequence window minus the decision-window
+    baseline read from the real context).
   - **Multiplicative forcing**: the predicted deviation from neutral is
     forced a few percent (random, per slot) further toward the favorable
     side — worsening shrinks toward neutral, recovery deepens — an automatic
@@ -123,10 +126,14 @@ survives as an explicit fallback.
     lookahead mask defines (mathematically identical conditioning).
   - **Verification forward**: causal rollout of the generated a4. One test,
     three roles: causality, reachability, graceful overshoot discovery.
-  - **Comparative acceptance**: the generated a4 becomes the supervised
-    target only if its verified cost beats the baseline cost by the
-    exploration margin; otherwise no optimizer step. MSE toward accepted
-    samples only, gradient norm clipped, Adam step.
+  - **Unconditional hindsight target (short-term)**: the generated a4 is
+    always the supervised target for the policy. A causal verification
+    cannot confirm or refute the suggestion while its completion is the
+    policy's own current behavior (mean, neutral actions) — the outcome
+    gate was a coin flip and is dropped. The verification rollout remains
+    as Dream Theater display. MSE toward every generated sample, gradient
+    norm clipped, Adam step. When the WM's outcome-conditioned completion
+    becomes reliable, it can serve as a true reachability verification.
   - **Fallbacks**: `--no-eos-lookahead` CLI flag; automatic fallback to the
     stochastic candidates when the horizon cannot reach the terminal salve
     or after consecutive fully-rejected batches.
