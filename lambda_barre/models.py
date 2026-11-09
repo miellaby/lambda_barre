@@ -20,8 +20,9 @@ order), and regresses the 16 signal slots of the next token (MSE). The token
 id/structure is fixed by the layout, so only the 16 signal values are free
 predictions.
 
-The policy reads the 47 non-reward sensory scalars of the state (normalized
-to [0, 1]) plus the world model's intermediate latent (d_model) and outputs a
+The policy reads the 51 sensory + cost scalars of the state (tokens 0..11,
+normalized to [0, 1], hors bilan métabolique) plus the world model's
+intermediate latent (d_model) and outputs a
 Gaussian over the 5 actuator consignes in their physical ranges, so sampled
 actions are always valid consignes.
 """
@@ -460,7 +461,7 @@ class WorldModel(nn.Module):
 class Policy(nn.Module):
     """π(a|s): a Gaussian over the 5 actuator consignes, conditioned on the
     intermediate latent of the world model (d_model dimensions) concatenated
-    with the 47 non-reward sensory scalars (normalized to [0,1]).
+    with the 51 sensory + cost scalars (tokens 0..11, normalized to [0,1]).
 
     Output means are squashed into valid consigne ranges:
       limb theta / tail theta -> tanh * THETA_RANGE  in [-pi, pi]

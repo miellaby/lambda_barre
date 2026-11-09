@@ -70,22 +70,25 @@ def compute_seq_layout(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_
 
 
 def compute_eos_time_weights(n_imagine: int) -> list[float]:
-    """Compute uniform (flat) normalized time weights over n_imagine consequence steps."""
+    """Poids de la fenêtre de conséquence dans l'EOS : progression linéaire du
+    premier état (qui suit immédiatement l'action) au dernier état, le dernier
+    pesant exactement 2x le premier. Normalisés."""
     if n_imagine <= 0:
         return []
-    return [1.0 / n_imagine] * n_imagine
-
-
-def compute_context_time_weights(n_early: int, decay: float = 0.5) -> list[float]:
-    """Compute normalized time weights over the pre-decision context window (s0..s_{n_ctx}),
-    decaying backwards in time away from the decision state s_{n_ctx}.
-    The decision state reflects the immediate crisis driving the action, so it carries
-    the majority of the baseline weight (~52% for n=5 with decay=0.5)."""
-    if n_early <= 0:
-        return []
-    w = [decay ** (n_early - 1 - i) for i in range(n_early)]
+    if n_imagine == 1:
+        return [1.0]
+    w = [1.0 + i / (n_imagine - 1) for i in range(n_imagine)]
     total = sum(w)
     return [x / total for x in w]
+
+
+def compute_context_time_weights(n_early: int) -> list[float]:
+    """Poids du contexte de décision dans l'EOS : uniquement la salve de la
+    prise de décision s4 (dernière du contexte s0..s4) — one-hot sur le
+    dernier état."""
+    if n_early <= 0:
+        return []
+    return [0.0] * (n_early - 1) + [1.0]
 
 
 def build_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX,
@@ -193,23 +196,15 @@ _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss bel
 _WM_IMPACT_FLOOR = 0.25                     # additive floor on every sequence's cost impact (~3x impact/neutral contrast at relief 0.5)
 _WM_REWARD_BOOST = 16.0                                      # gradient boost on S10 reward slots and terminal EOS delta
 _WM_LOOKAHEAD_PERIOD = 2                                     # WM mask alternation: 1 lookahead pass every 2 (1:1 causal:lookahead)
-_EOS_FORCE_EPS = (0.15, 0.40)                                # default hindsight forcing range (overridable via config.toml)
+_EOS_FORCE_EPS = (0.015, 0.0375)                            # default hindsight forcing range, en unites de slot EOS (1 slot = 0.5 de delta de cout)
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
-_EOS_DELTA_SCALE = 0.15
 _EOS_TIME_W = compute_eos_time_weights(_EOS_IMAGINE)
 _EOS_TIME_W_T = torch.tensor(_EOS_TIME_W, dtype=torch.float32)
 _CONTEXT_TIME_W = compute_context_time_weights(DEFAULT_N_CTX + 1)
 _CONTEXT_TIME_W_T = torch.tensor(_CONTEXT_TIME_W, dtype=torch.float32)
 _EOS_CHANNEL_W_T = (torch.tensor(_EOS_CHANNEL_W, dtype=torch.float32)
                     / sum(_EOS_CHANNEL_W))                   # sums to 1
-
-
-def _eos_delta_slot(d: float) -> float:
-    """Raw cost-slot delta -> EOS slot: 0.5 = no change, below = recovery,
-    above = worsening; full scale = +/- _EOS_DELTA_SCALE."""
-    t = max(-1.0, min(1.0, d / _EOS_DELTA_SCALE))
-    return (t + 1.0) / 2.0
 
 
 # Precomputed cost metadata (from the dense layout) for the vectorized
@@ -228,10 +223,10 @@ _CONFORT_W = _COST_WEIGHTS["confort"]
 # _N_SIGNALS[i] slots each. Used to gather them in one op from a [B, 13, 16]
 # signal grid.
 _POL_SCALAR_IDX = []
-for _i in range(_COST_IDX):               # tokens 0..9
+for _i in range(_INTERO_IDX):             # tokens 0..11 (hors bilan métabolique 12)
     for _k in range(_N_SIGNALS[_i]):
         _POL_SCALAR_IDX.append(_i * N_SIGNAL + _k)
-assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 45
+assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 51
 # print(f"policy scalars: {_POL_SCALAR_IDX} (len={len(_POL_SCALAR_IDX)})")
 
 # Action encoding metadata: 5 consignes → (token-within-action-block, slot,
@@ -291,17 +286,14 @@ def _salve_moved(s1: list[list[float]], s2: list[list[float]],
     return False
 
 
-def sequence_relief(seq: list, n_ctx: int = DEFAULT_N_CTX,
-                    eos_time_w: list[float] | None = None,
-                    context_time_w: list[float] | None = None) -> float:
-    """Signed biological cost relief of one sequence: pre-decision window (s0..s_{n_ctx})
-    minus time-weighted consequence window (s_{n_ctx+1}..s_end).
-    The pre-decision window is weighted towards s_{n_ctx} (the decision state).
-    Positive = long-term denouement is cheaper (recovery).
-    Negative = long-term denouement is worse (aggravation / fall).
-    """
+def _eos_slots_of_seq(seq: list, n_ctx: int = DEFAULT_N_CTX,
+                      eos_time_w: list[float] | None = None,
+                      context_time_w: list[float] | None = None) -> list[float]:
+    """Les 6 slots du token EOS d'une séquence : delta brut de chaque signal
+    de coût entre contexte de décision (s0..s_{n_ctx}) et fenêtre de
+    conséquence, normalisé (d + 1) / 2. 0.5 = neutre."""
     if len(seq) <= n_ctx + 1:
-        return 0.0
+        return [0.5] * _EOS_NSLOTS
     n_early = n_ctx + 1
     if eos_time_w is None:
         eos_time_w = compute_eos_time_weights(len(seq) - 1 - n_ctx)
@@ -320,23 +312,35 @@ def sequence_relief(seq: list, n_ctx: int = DEFAULT_N_CTX,
             for j in range(5):
                 late[j] += w * salve[_COST_IDX][SIG_OFFSET + j]
             late[5] += w * salve[_REWARD_IDX][SIG_OFFSET]
-        return sum(w * (e - l) for w, e, l in zip(_EOS_CHANNEL_W, early, late)) / sum(_EOS_CHANNEL_W)
+        return [((l - e) + 1.0) / 2.0 for e, l in zip(early, late)]
     except (IndexError, TypeError):
-        return 0.0
+        return [0.5] * _EOS_NSLOTS
 
 
-def sequence_impact(sequences: list[list[list[float]]], n_ctx: int = DEFAULT_N_CTX,
-                    eos_time_w: list[float] | None = None,
-                    context_time_w: list[float] | None = None) -> torch.Tensor:
-    """Per-sequence biological cost impact [B] for World Model training weighting:
-    |relief| = absolute magnitude of the consequence vs decision difference.
-    Symmetric: a sequence where the creature falls or recovers has high impact;
-    a steady-state sequence has near-zero impact.
-    """
+def relief_score(x, n_ctx: int = DEFAULT_N_CTX,
+                 eos_time_w: list[float] | None = None,
+                 context_time_w: list[float] | None = None):
+    """Score de soulagement : somme pondérée des deltas de coût du token EOS
+    (hiérarchie des poids de canaux). Plus haut = meilleur dénouement,
+    négatif = aggravation. Accepte un token EOS (tenseur [..., 6]) ou une
+    séquence (liste de salves dont on construit le token EOS) :
+    relief_score(sequence) = relief_score(eos(sequence))."""
+    if isinstance(x, torch.Tensor):
+        return 2.0 * (_EOS_CHANNEL_W_T.to(x.device) * (0.5 - x)).sum(dim=-1)
+    slots = _eos_slots_of_seq(x, n_ctx=n_ctx, eos_time_w=eos_time_w,
+                              context_time_w=context_time_w)
+    return 2.0 * float((_EOS_CHANNEL_W_T * (0.5 - torch.tensor(slots))).sum())
+
+
+def impact(sequences: list[list[list[float]]], n_ctx: int = DEFAULT_N_CTX,
+           eos_time_w: list[float] | None = None,
+           context_time_w: list[float] | None = None) -> torch.Tensor:
+    """Impact d'entraînement WM [B] = abs(relief_score) par séquence."""
     if not sequences:
         return torch.empty(0)
-    impacts = [abs(sequence_relief(seq, n_ctx=n_ctx, eos_time_w=eos_time_w, context_time_w=context_time_w)) for seq in sequences]
-    return torch.tensor(impacts, dtype=torch.float32)
+    return torch.tensor([abs(relief_score(s, n_ctx=n_ctx, eos_time_w=eos_time_w,
+                                           context_time_w=context_time_w))
+                         for s in sequences], dtype=torch.float32)
 
 
 # --- naive sequence distance & clustering across all channels -----------------
@@ -865,13 +869,6 @@ class ExperienceBuffer:
             samples.append(seq)
         return samples
 
-    def _sequence_relief(self, seq: list) -> float:
-        """Relief score of one stored sequence under this buffer's geometry."""
-        if len(seq) < self.seq_len:
-            return 0.0
-        return sequence_relief(seq, n_ctx=self.n_ctx, eos_time_w=self._eos_time_w,
-                               context_time_w=self._context_time_w)
-
     def sample_for_policy(self, batch: int, beta: float = 2.0) -> list[list[list[float]]]:
         """Sample ``batch`` sequences prioritized by long-term cost relief.
 
@@ -890,7 +887,12 @@ class ExperienceBuffer:
         k = min(batch, len(pool))
         weights = []
         for seq in pool:
-            relief = self._sequence_relief(seq)
+            if len(seq) < self.seq_len:
+                relief = 0.0
+            else:
+                relief = relief_score(seq, n_ctx=self.n_ctx,
+                                      eos_time_w=self._eos_time_w,
+                                      context_time_w=self._context_time_w)
             relief_clamped = max(-1.0, min(1.0, relief))
             weights.append(math.exp(beta * relief_clamped))
 
@@ -1261,11 +1263,11 @@ class Brain:
                        * self._context_w[:, None]).sum(dim=0)
             late_c = (vals[b, late_cost, SIG_OFFSET:SIG_OFFSET + 5]
                       * self._eos_w[:, None]).sum(dim=0)
-            d_c = ((late_c - early_c) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
+            d_c = late_c - early_c    # delta brut in [-1, 1] : ni amplifie ni seuille
             vals[b, p_final, SIG_OFFSET:SIG_OFFSET + 5] = (d_c + 1.0) / 2.0
             early_k = (vals[b, early_rew, SIG_OFFSET] * self._context_w).sum()
             late_k = (vals[b, late_rew, SIG_OFFSET] * self._eos_w).sum()
-            d_k = ((late_k - early_k) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
+            d_k = late_k - early_k
             vals[b, p_final, SIG_OFFSET + 5] = (d_k + 1.0) / 2.0
             vals[b, p_final, SIG_OFFSET + _EOS_NSLOTS:] = 0.0
         return vals
@@ -1328,7 +1330,7 @@ class Brain:
         causal pass), so the outcome-carrying sequences weigh more in the
         inversion's descent."""
         vals = self._batch_tensors(sequences)             # [B, L, 25]
-        impacts = sequence_impact(
+        impacts = impact(
             sequences, n_ctx=self.n_ctx,
             eos_time_w=self.buffer._eos_time_w
         ).to(self.device)
@@ -1510,9 +1512,10 @@ class Brain:
         return (denorm * self._cost_w).sum(1) + _CONFORT_W * confort_phys
 
     def _policy_scalars_batch(self, state_tokens: torch.Tensor) -> torch.Tensor:
-        """Vectorized ``policy_scalars``: extract the 47 non-reward sensory
-        scalars from a batch of state tokens. state_tokens: [B, 13, 25] →
-        [B, 47], one gather op, no per-element loop or ``.tolist()``."""
+        """Vectorized ``policy_scalars``: extract the 51 sensory + cost
+        scalars (tokens 0..11) from a batch of state tokens. state_tokens:
+        [B, 13, 25] → [B, 51], one gather op, no per-element loop or
+        ``.tolist()``."""
         B = state_tokens.shape[0]
         sigs = state_tokens[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]   # [B,13,16]
         flat = sigs.reshape(B, STATE_TOKENS * N_SIGNAL)                # [B,208]
@@ -1871,8 +1874,8 @@ class Brain:
         eos_wsum = w0
 
         def _eos_finalize():
-            d = ((eos_acc / eos_wsum - eos_early) / _EOS_DELTA_SCALE).clamp(-1.0, 1.0)
-            return ((d + 1.0) / 2.0).clamp(0.0, 1.0)
+            d = eos_acc / eos_wsum - eos_early    # delta brut in [-1, 1]
+            return (d + 1.0) / 2.0
 
         s_zeroed = s.clone()
         s_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
@@ -1962,13 +1965,10 @@ class Brain:
                     curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
         return torch.stack(toks, dim=1)                              # [B, 3, 25]
 
-    def _eos_favorability(self, eos: torch.Tensor) -> torch.Tensor:
-        """Scalar denouement favorability of EOS delta slots [B, 6]: the usual
-        innate cost hierarchy applied to the deviation from neutral — higher
-        = better outcome. The same scalarization ``sequence_relief`` applies
-        to realized salves, expressed in EOS slot units."""
-        return ((self._eos_cw[:5] * (0.5 - eos[:, :5])).sum(dim=1)
-                + self._eos_cw[5] * (eos[:, 5] - 0.5))
+    def relief_score(self, eos: torch.Tensor) -> torch.Tensor:
+        """Score de soulagement d'un token EOS [B, 6] — délègue à la fonction
+        module-level relief_score."""
+        return relief_score(eos)
 
     def _policy_step_lookahead(self, batch, n_imagine, use_kv_cache,
                                 step_idx, total_steps):
@@ -2717,8 +2717,14 @@ class Brain:
                 if "net.0.weight" in p_sd:
                     cur_in = self.policy.net[0].in_features
                     ckpt_in = p_sd["net.0.weight"].shape[1]
-                    if ckpt_in == cur_in + 2:
-                        # Adapt from 111 (45 phys + 2 intero + 64 latent) to 109 (45 phys + 64 latent)
+                    if ckpt_in == cur_in - 6:
+                        # Adapt 45 phys + latent to 51 (45 phys + 6 cost/reward) + latent :
+                        # insert neutral (0.5) columns for the cost/reward slots
+                        w = p_sd["net.0.weight"]
+                        pad = torch.full((w.shape[0], 6), 0.5, dtype=w.dtype, device=w.device)
+                        p_sd["net.0.weight"] = torch.cat([w[:, :45], pad, w[:, 45:]], dim=1)
+                    elif ckpt_in == cur_in + 2:
+                        # legacy: drop the 2 intero columns
                         w = p_sd["net.0.weight"]
                         p_sd["net.0.weight"] = torch.cat([w[:, :45], w[:, 47:]], dim=1)
                 try:

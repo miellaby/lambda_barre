@@ -1366,7 +1366,7 @@ def test_ball_physics_gravity_and_sensors():
 
 
 def test_sample_for_policy_prioritizes_relief():
-    from .brain import ExperienceBuffer, SEQ_STEPS, sequence_relief, sequence_impact
+    from .brain import ExperienceBuffer, SEQ_STEPS, relief_score, impact
     from .tokenize import _COST_IDX, _REWARD_IDX, SIG_OFFSET
     buf = ExperienceBuffer(seq_len=11, seed=42)
 
@@ -1389,17 +1389,13 @@ def test_sample_for_policy_prioritizes_relief():
     seq_neutral = make_seq(0.5, 0.5)
     seq_pain = make_seq(0.2, 0.8)       # costs rise after the decision
 
-    # relief score sanity: long-term cheaper than pre-decision = positive
-    assert buf._sequence_relief(seq_relief) > 0.4
-    assert abs(buf._sequence_relief(seq_neutral)) < 1e-6
-    assert buf._sequence_relief(seq_pain) < -0.4
+    # relief_score sanity: long-term cheaper than pre-decision = positive
+    assert relief_score(seq_relief) > 0.4
+    assert abs(relief_score(seq_neutral)) < 1e-6
+    assert relief_score(seq_pain) < -0.4
 
-    # standalone sequence_relief matches buffer method
-    assert abs(sequence_relief(seq_relief) - buf._sequence_relief(seq_relief)) < 1e-6
-    assert abs(sequence_relief(seq_pain) - buf._sequence_relief(seq_pain)) < 1e-6
-
-    # sequence_impact is symmetric |relief|: relief and pain carry identical high impact
-    impacts = sequence_impact([seq_relief, seq_neutral, seq_pain])
+    # impact is symmetric |relief_score|: relief and pain carry identical high impact
+    impacts = impact([seq_relief, seq_neutral, seq_pain])
     assert impacts[0] > 0.4
     assert impacts[1] < 1e-6
     assert impacts[2] > 0.4

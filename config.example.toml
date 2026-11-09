@@ -36,8 +36,8 @@ wm_addendum_epoch  = 128    # World Model training epochs per sleep cycle (Adden
 wm_batch        = 64     # World Model training batch size
 wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
 pol_steps       = 256    # Policy training steps per sleep cycle
-eos_force_eps_lo = 0.10  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
-eos_force_eps_hi = 0.25  # hindsight forcing: upper bound of eps ~ U(lo, hi)
+eos_force_eps_lo = 0.015  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
+eos_force_eps_hi = 0.0375  # hindsight forcing: upper bound of eps ~ U(lo, hi)
 eos_force_amplify = 1.0  # hindsight action amplification toward extremes (1.0 = off)
 eos_force_amplify_threshold = 0.95  # only amplify actions already near extremes (|v| >= threshold)
 wm_impact_floor  = 0.10  # additive floor on the per-sequence impact weight (neutral windows learn at a trickle)
@@ -60,7 +60,7 @@ pool_capacity   = 1000   # coreset: max long-term consolidated sequences
 # Sequence geometry
 # ---------------------------------------------------------------------------
 [sequence]
-seq_steps = 10   # number of transitions (salves) per training sequence
+seq_steps = 16   # number of transitions (salves) per training sequence (fenêtre de conséquence doublée : 12 salves)
 n_ctx     = 4    # decision context length — must be strictly less than seq_steps
                  # The policy decides at step n_ctx; consequences are evaluated
                  # from n_ctx+1 to seq_steps.

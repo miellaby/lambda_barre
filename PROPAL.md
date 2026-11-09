@@ -71,15 +71,16 @@ Note: une vérification d'atteignabilité, consiste à inférer *sous condition 
 
 **Simplifications retenues.**
 - Un seul nouveau scalaire de reward (`délectation`) : le « confort au max » pendant la bouchée passe par lui ; le canal `confort` existant n'est pas modifié.
-- Capteur croquette = 2 scalaires (`croq_dir`, `croq_prox` vers la croquette la plus proche) placés dans les slots libres du token 5 (env/ball, pattern `Ball`) — pas de nouveau token, pas de vr/va (cibles lentes).
+- **Perception unifiée** : il n'y a qu'un seul appât (bait) à la fois dans l'environnement (balle ou croquette) ; le token 5 (BALL, pattern `Ball`) sert indifféremment pour les deux — pas de nouveau token.
+- **Nouveau scalaire odorat** `odorat` dans un slot libre du token 5 : croquette → 1/(1+distance), ballon → 0.
 - Consommation = test de distance tête→croquette la plus proche, pas de collision pymunk tête-croquette.
 - « Pousser mais pas l'inverse » = masse 0,05, purement physique.
 - `faim` uniquement dans le token 10 (coût) + HUD — pas dans le token 12 intero, pour ne pas toucher au zero-padding intero ni à l'adaptation « 45 phys + 2 intero » de la policy.
 - Une seule croquette consommable à la fois (la plus proche).
 
-**Fichiers.** `tokenize.py` (4 nouvelles specs ; token 5 → 6 signaux, token 10 → 6 (`faim`), token 11 → 2 (`délectation`) ; `salve_cost` généralisée à tous les signaux du canal 11), `proprio.py` (`Reward.update` reçoit `faim` et `mange_en_cours` en paramètres optionnels ; `reward_neg = (… + 4·faim)/16`, `reward_pos = confort + délectation`), `intero.py` (intégrateur `faim`), `world.py` (`CROQUETTE_TYPE = 5`, spawn/respawn de N croquettes, `update_croquettes(space, skel, dt)` : conso + sortie de limites), `main.py` + `dataset.py` (câblage ; paramètres optionnels pour ne rien casser), `render.py` (carrés vert→gris, HUD faim/délectation), `brain.py` (remplacer les `SIG_OFFSET + 5` hardcodés par `n_cost`, lignes ~1260–1269 et ~1854), `config.toml` (`[croquettes]`), `test_brain.py`.
+**Fichiers.** `tokenize.py` (3 nouvelles specs : `odorat`, `faim`, `délectation` ; token 5 → 5 signaux avec `odorat`, token 10 → 6 (`faim`), token 11 → 2 (`délectation`) ; `salve_cost` généralisée à tous les signaux du canal 11), `proprio.py` (`Reward.update` reçoit `faim` et `mange_en_cours` en paramètres optionnels ; `reward_neg = (… + 4·faim)/16`, `reward_pos = confort + délectation`), `intero.py` (intégrateur `faim`), `world.py` (`CROQUETTE_TYPE = 5`, un seul mobile actif à la fois, `update_croquettes(space, skel, dt)` : conso + sortie de limites), `extero.py` (`odorat` calculé depuis le mobile courant), `main.py` + `dataset.py` (câblage), `render.py` (carré vert→gris, HUD faim/délectation), `brain.py` (remplacer les `SIG_OFFSET + 5` hardcodés par `n_cost`), `config.toml` (`[croquettes]`), `test_brain.py`.
 
-**Mesures de validation.** Les séquences « manger » ont un relief fortement positif ; la faim HUD monte entre deux repas et chute de moitié à chaque croquette ; après sommeil, la policy initie des déplacements vers la croquette (croq_prox qui augmente en egocentré).
+**Mesures de validation.** Les séquences « manger » ont un relief_score fortement positif ; la faim HUD monte entre deux repas et chute de moitié à chaque croquette ; après sommeil, la policy initie des déplacements vers l'appât odorant (odorat qui monte, ball_prox qui augmente en egocentré).
 
 **Humain :** OK
 

@@ -1,100 +1,63 @@
-# Spécification et structure des tokens de $\bar{\lambda}$
+# Tokens de λ̄
 
-Les échanges entre le corps simulé de l'animat, le World Model et la Politique reposent sur un flux de **tokens denses** de dimension fixe, générés par `DenseEncoder` dans `tokenize.py`.
+Tokens denses produits par DenseEncoder (tokenize.py). Lissage amont : encodeur.md.
 
----
+## Token dense
 
-## Structure d'un token dense
+25 flottants, sans embedding apprise :
 
-Chaque token est un vecteur de **25 flottants**, produit directement par l'encodeur sans couche d'embedding apprise :
+- type (1) : 0 = état, 1 = action
+- modalité (4) : action `_M_ACTION` (0,0,0,0), intéroception `_M_INTERO` (1,0,0,0), proprioception `_M_PROPRIO` (0,1,0,0), extéroception `_M_EXTERO` (0,0,1,0), renforcement `_M_RENF` (1,0,0,1)
+- canal (4) : sous-système dans la modalité
+- signaux (16) : scalaires normalisés [0,1], zero-padding au-delà, exclus du masque de loss
 
-| Section | Dimensions | Rôle et contenu |
-| :--- | :--- | :--- |
-| **Type** | 1 | `0.0` = État / Sensoriel, `1.0` = Action / Moteur |
-| **Modalité** | 4 | Vecteur d'activation de la modalité sensorielle ou motrice |
-| **Canal** | 4 | Vecteur orthogonal identifiant le sous-système au sein de la modalité |
-| **Signaux** | 16 | Scalaires normalisés dans $[0.0, 1.0]$. Remplissage par zéros (*zero-padding*) si $< 16$ |
+## Salve
 
-### Codes de modalité (4D)
+16 tokens par tick WM (wm_hz = 5 Hz) : 13 tokens d'état + 3 tokens d'action (5 valeurs effectives). Préfixe = type+modalité+canal en binaire (9 bits), puis label du canal :
 
-* **Action** (`_M_ACTION`) : `(0.0, 0.0, 0.0, 0.0)`
-* **Intéroception** (`_M_INTERO`) : `(1.0, 0.0, 0.0, 0.0)`
-* **Somatosensoriel** (`_M_SOMATO`) : `(0.0, 1.0, 0.0, 0.0)`
-* **Visuel & Extéroception** (`_M_VISUAL`) : `(0.0, 0.0, 1.0, 0.0)`
-* **Motivationnel & Récompense** (`_M_MOTIV`) : `(1.0, 0.0, 0.0, 1.0)`
+```text
+== proprioception ==
+  tok  0  [001000001]  FORCE        3 sig  force_actuateur_avant/arriere, couple_queue
+  tok  1  [001000010]  POSTURE      4 sig  tronc_angle, queue_angle, accel_tete_avant/haut
+  tok  2  [001000100]  LIMB_F       2 sig  membre_angle_avant, membre_distance_avant
+  tok  3  [001001000]  LIMB_B       2 sig  membre_angle_arriere, membre_distance_arriere
+== extéroception ==
+  tok  4  [000101111]  VISION      16 sig  vis_c1..16
+  tok  5  [000100001]  BALL         4 sig  ball_dir, ball_prox, ball_vr, ball_va
+  tok  6  [000100010]  FLOW         3 sig  flux_surface, flux_x, flux_y
+  tok  7  [000100100]  SOUND        5 sig  son_0..4
+  tok  8  [000101000]  TOUCH_FOOT   2 sig  contact_sol_avant/arrière
+  tok  9  [000101010]  TOUCH_TRUNK  4 sig  collision_tronc_x/y/cx/cy
+== renforcement ==
+  tok 10  [010010000]  COSTS        5 sig  effort, douleur, courbature, instabilite, vertige
+  tok 11  [010011000]  REWARD       1 sig  confort
+== intéroception ==
+  tok 12  [010000001]  METAB        2 sig  fatigue, souffrance
+  tok 12b [010000010]  EOS          6 sig  dernier token, delta renforcement normalisé (tok 10 et 11)
+== action ==
+  tok 13  [100000001]  ACT_F        2 sig  membre_avant_theta/d
+  tok 14  [100000010]  ACT_B        2 sig  membre_arrière_theta/d
+  tok 15  [100000100]  ACT_TAIL     1 sig  queue_theta
+```
 
----
+## Séquence
 
-## Salve temporelle (3 Hz)
+Fenêtre glissante de seq_steps + 1 = 27 salves (seq_steps = 26). n_ctx = 4 : contexte de décision s0..s4 (s4 = état de la prise de décision, qui conditionne a4), fenêtre de conséquence s5..s26 (22 salves). À l'entraînement, le token 12 de la dernière salve est reconstruit en token EOS.
 
-Une **salve** regroupe l'ensemble des 16 tokens ($S_i + A_i$) produits à chaque tick du World Model (fréquence 3 Hz, soit $\Delta t = 0.33\text{ s}$) :
+## Token EOS
 
-* **13 tokens d'état** ($S_0 \dots S_{12}$) : 53 signaux scalaires actifs.
-* **3 tokens d'action** ($A_{13} \dots A_{15}$) : 5 valeurs effectives des actuateurs (l'entrée réelle de la physique après lissage moteur, voir `body.py`).
+Token d'état, modalité intéroception, canal (0,0,1,0), 6 slots : delta brut de chaque signal de coût (5 pénalités + récompense) entre fenêtre de conséquence et contexte de décision, normalisé (d+1)/2. 0.5 = neutre. Ni amplifié, ni seuillé.
 
----
+- contexte de décision : s4 seul (one-hot)
+- fenêtre de conséquence : poids linéaires de 1 à 2, le dernier état pèse 2× le premier
 
-## Répertoire des 16 tokens
+relief_score(séquence) = relief_score(eos(séquence)) = somme pondérée des 6 slots, poids [1,4,2,2,3,1]. impact = abs(relief_score).
 
-### Tokens sensoriels et d'état (Tokens 0 à 12)
+## Forçage hindsight
 
-| Indice | Modalité | Canal | Signaux contenus | Nb signaux |
-| :--- | :--- | :--- | :--- | :--- |
-| **0** | Somatosensoriel `(0,1,0,0)` | Feedback `(0,0,0,1)` | `force_actuateur_avant`, `force_actuateur_arriere`, `couple_queue` | 3 |
-| **1** | Somatosensoriel `(0,1,0,0)` | Posture `(0,0,1,0)` | `tronc_angle`, `queue_angle`, `accel_tete_avant`, `accel_tete_haut` | 4 |
-| **2** | Somatosensoriel `(0,1,0,0)` | Membre avant `(0,1,0,0)` | `membre_angle_avant`, `membre_distance_avant` | 2 |
-| **3** | Somatosensoriel `(0,1,0,0)` | Membre arrière `(1,0,0,0)` | `membre_angle_arriere`, `membre_distance_arriere` | 2 |
-| **4** | Visuel `(0,0,1,0)` | Cône rétinien `(1,1,1,1)` | `vis_c1` à `vis_c16` (16 cellules du champ de vision) | 16 |
-| **5** | Visuel / Extéro `(0,0,1,0)` | Mobile physique `(0,0,0,1)` | `ball_dir`, `ball_prox`, `ball_vr`, `ball_va` | 4 |
-| **6** | Visuel `(0,0,1,0)` | Flux optique `(0,0,1,0)` | `flux_surface`, `flux_x`, `flux_y` | 3 |
-| **7** | Visuel / Audio `(0,0,1,0)` | Son `(0,1,0,0)` | `son_0` à `son_4` (5 canaux fréquentiels) | 5 |
-| **8** | Somatosensoriel `(0,1,0,0)` | Contact sol `(0,0,0,1)` | `contact_sol_avant`, `contact_sol_arriere` | 2 |
-| **9** | Somatosensoriel `(0,1,0,0)` | Collision tronc `(0,0,1,0)` | `collision_tronc_x`, `collision_tronc_y`, `collision_tronc_cx`, `collision_tronc_cy` | 4 |
-| **10** | Motivationnel `(1,0,0,1)` | Pénalités `(0,0,0,0)` | `effort`, `douleur`, `courbature`, `instabilite`, `vertige` | 5 |
-| **11** | Motivationnel `(1,0,0,1)` | Récompense `(1,0,0,0)` | `confort` | 1 |
-| **12** | Intéroception `(1,0,0,0)` | Bilan métabolique `(0,0,0,1)` | `fatigue`, `souffrance` (niveaux absolus) | 2 |
-| **12-EOS** | Intéroception `(1,0,0,0)` | dénouement `(0,0,1,0)` | ??? | ? |
-### Tokens moteurs et d'action (Tokens 13 à 15)
+Additif par slot, eps ~ U(0.015, 0.0375) (eos_force_eps_lo/hi), plancher de neutralité à 0.5.
 
-| Indice | Modalité | Canal | Consignes motrices | Nb signaux |
-| :--- | :--- | :--- | :--- | :--- |
-| **13** | Action `(0,0,0,0)` | Patte avant `(0,0,0,1)` | `membre_avant_theta`, `membre_avant_d` | 2 |
-| **14** | Action `(0,0,0,0)` | Patte arrière `(0,0,1,0)` | `membre_arriere_theta`, `membre_arriere_d` | 2 |
-| **15** | Action `(0,0,0,0)` | Queue `(0,1,0,0)` | `queue_theta` | 1 |
+## Modèles
 
----
-
-## Règles d'encodage et cas particuliers
-
-### Masquage et zéros de remplissage (*Padding slots*)
-Sur les 16 dimensions de signaux d'un token, seules les $N$ premières contiennent des valeurs physiques. Les slots $N \dots 15$ sont maintenus à $0.0$ et sont exclus du calcul de perte MSE via le masque binaire `target_valid`.
-
-### Token 12 (Bilan métabolique) et token EOS (agrégat de coûts)
-* **Dans le journal** : le token 12 contient les niveaux `fatigue` et `souffrance` ($\text{fatigue}, \text{souffrance} \in [0.0, 1.0]$). Des intégrateurs lents (demi-vie 100 s / 240 s).
-* **A l'entraînement du World Model (`_batch_tensors`)** :
-  * Le token 12 des salves est forcé à zéro.
-  * Le dernier token de la séquence (token 12) est reconstruit à la volée pour l'entraînement en **token EOS**
-  * Token EOS: token de type état, de modalité intéroception, de canal $(0,0,1,0)$, distinct du bilan métabolique
-  * Le token EOS porte le **dénouement**, la différence entre la moyenne des pénalités de la conséquence ($s_5 \dots s_{10}$) pondérée à l'inverse du temps, et la moyenne des pénalités du contexte ($s_0 \dots s_4$):
-    $$\text{slot}_c = \frac{(\text{late}_c - \text{early}_c)/0.15 + 1}{2}$$
-    soit $0.5$ = neutre (aucun changement), $< 0.5$ = rétablissement, $> 0.5$ = aggravation — échelle $\pm 0.15$ calibrée sur la dynamique mesurée (deltas typiques $\pm 0.05$, les pointes de crise saturent).
-    Les slots restent des **deltas bruts par canal** (le WM conditionne sur le dénouement de chaque canal, et le forcing est multiplicatif par canal). Partout où l'EOS est lu comme un **scalaire** (relief score, ancre de saliency, affichage Dream Theater), la hiérarchie innée usuelle s'applique : $[\text{effort}, \text{douleur}, \text{courbature}, \text{instabilité}, \text{vertige}, \text{confort}]$ pondérés $[1, 4, 2, 2, 3, 1]$.
-* **Forcing hindsight** : multiplicatif sur l'écart au neutre — $\text{EOS}_{\text{forcé}} = \widehat{\text{EOS}}_\pi - \varepsilon \cdot |\widehat{\text{EOS}}_\pi - 0.5|$, $\varepsilon \sim U(0.02, 0.10)$ par slot : l'aggravation prédite rétrécit vers le neutre, le rétablissement prédit s'approfondit, proportionnellement à ce que la politique elle-même imagine.
-* **Pour la Politique (`sample_for_policy`)** : le *relief score* est la moyenne plate des mêmes canaux sur la fenêtre de décision ($s_0 \dots s_4$) moins l'agrégat pondéré de la fenêtre de conséquence ($s_5 \dots s_{10}$) — priorise l'échantillonnage sur les trajectoires de rétablissement (le dénouement long terme meilleur que l'avant-décision).
-
----
-
-## Intégration dans les modèles
-
-### World Model (`WorldModel`)
-* **Entrée** : projection linéaire $25 \to d_{\text{model}}$ ($d_{\text{model}} = 64$).
-* **Encodage positionnel** : sinusoïdal non-appris indexé par salve (tous les 16 tokens d'une salve partagent le même encodage temporel).
-* **Séquence** : 10 transitions, soit 11 salves consécutives ($10 \times 16 + 13 = 173$ tokens, les actions terminales après $s_{10}$ n'étant pas prédites).
-* **Sortie** : tête de régression linéaire `nn.Linear(64, 16)` prédisant les 16 slots de signaux du token suivant sous masque d'attention causale par salve dans le type.
-
-### Politique (`Policy`)
-* **Cadence** : intervient à **6 Hz** (`POL_DT = 1/6 s`, toutes les 10 frames de physique) pour un contrôle moteur réactif, plus rapide que le World Model (3 Hz).
-* **Entrée** : 45 scalaires sensoriels (tokens d'état non-récompense 0 à 9) concaténés au vecteur latent intermédiaire de 64 dimensions du World Model, soit **109 dimensions**.
-* **Architecture** : MLP ($109 \to 256 \to 256 \to 256 \to 5$ avec activations internes `ReLU`).
-* **Sortie** : 5 consignes motrices squashées par `tanh` (angles) et `sigmoid` (extensions).
-
+- world model : entrée 25→d_model 128, séquence de 429 tokens (27 salves), masque causal par salve, tête 128→16.
+- policy : tick 10 Hz (pol_hz), entrée 51 scalaires (tokens 0..11, hors bilan métabolique) + latent 128 = 179, MLP 179→512→512→512→5 (hidden = 512).

@@ -1,36 +1,21 @@
 # Intéroception de λ̄
 
 L'intéroception est la perception de l'état interne : « dans quel état interne
-suis-je ? » (faim, fatigue, douleur, excitation, etc.).
-
-Contrairement à la proprioception (état du corps) et à l'extéroception (monde
-extérieur), l'intéroception agrège des signaux de
-renforcement: la fatigue est un cumul d'effort, la souffrance un
-cumul de douleurs, etc.
-
-Note: L'intéroception n'est **pas égocentrée**.
+suis-je ? » (faim, fatigue, souffrance, excitation, etc.).
 
 ## Etats cumulés des coûts physiques
 
-* `fatigue`: L'effort est un coût instantané des actuateurs.
-  L'effort s'accumule dans un état de fatigue qui décroît lentement.
-* `souffrance`: La douleur est un coût instantané associé à la proprioception
-  (collisions et accélération excessives, voir proprioception.md).
-  La douleur s'accumule dans un état de souffrance qui décroit lentement.
+Les signaux de renforcement (coûts innés) comme la douleur ou le confort,
+font partie de la proprioception, voir proprioception.md.
 
-## Etats motivationnels
+L'intéroception est une perception de la synthèse de ces signaux:
 
-* `ennui`: 1ère implémentation : Coût pénalisant l'absence de reward
-  significatif (`cumul(|reward|) < seuil`) sur une période récente.
-  Seconde implémentation: prédictibilité du flux sensoriel basé sur
-  l'erreur de prédiction du world model.
-* `eveil`: Cycle métabolique de type cicardien. Sans renforcement.
-  Ce cycle est perturbé par la fatigue et la souffrance.
-* `faim`: non implémenté
-* `playfulness`/excitation: L'esprit joueur est à son max
-  quand la souffrance et la fatigue sont minimales
-  et l'éveil maximal. L'esprit joueur conditionne le renforcement
-  d'un comportement joueur de l'animat (non implémenté).
+* `fatigue`: L'effort est un coût instantané des actuateurs physiques.
+  L'effort s'accumule en **fatigue**.
+* `souffrance`: La douleur est un autre coût instantané (chocs, accélération
+  excessives, ...).  La douleur s'accumule en **souffrance**.
+
+La **récupération** consiste à faire décroite lentement ces accumulateurs.
 
 ## Formules
 
@@ -53,12 +38,24 @@ souffrance += k_douleur * douleur
 souffrance *= decay_souffrance   # demi-vie ~1000 s, plus lente que la fatigue
 ```
 
-### Ennui (deux implémentations)
+===
 
-**1ère version — absence de reward.** On suit le temps écoulé depuis le dernier
-renforcement significatif (`|reward| > seuil`). Si rien n'arrive, l'ennui
-croît ; dès qu'un reward arrive (positif ou négatif), il décroît. Calculable
-sans world model.
+## Renforcements motivationnels (TODO)
+
+### Ennui
+
+L'ennui est un coût pénalisant une trop grande prédictibilité du flux sensoriel.
+
+Il s'appuie sur l'erreur de prédiction du world model :
+
+```python
+imprevision = L_t = -log P(o_{t+1}, r_t | o_t, a_t)
+ennui = k1 * temps_sans_reward + k2 * (1 - imprevision)
+```
+
+L'ennui pourrait être amplifié par un renforcement trop neutre,
+par exemple, d'après le temps écoulé depuis le dernier
+renforcement significatif (`|reward| > seuil`).
 
 ```python
 if |reward| > seuil_reward:
@@ -67,52 +64,40 @@ else:
     ennui += k_ennui * dt       # croît lentement en l'absence de reward
 ```
 
-**2ème version — prédictibilité du reward.** Généralisation: même un
-flux riche de récompenses devient ennuyeux s'il est prévisible. Nécessite
-l'erreur de prédiction du world model :
+### Eveil (TODO)
 
-```python
-imprevision = L_t = -log P(o_{t+1}, r_t | o_t, a_t)
-ennui = k1 * temps_sans_reward + k2 * (1 - imprevision)
-```
-
-### Eveil
-
-Cycle métabolique. Pas de renforcement. Juste un état. Quand le cycle arrive
-à 0 l'animal s'endort (à préciser).
+Cycle métabolique influencé par la fatigue et la souffrance.
+Quand le cycle arrive à 0 l'animal s'endort (phase de veille).
 
 ```python
 base = 0.5 + 0.5 * sin(2*pi*t / periode_circadienne)
 eveil = max(0, base - k_fat * fatigue - k_souff * souffrance)
 ```
 
-### Faim
+### Faim (TODO)
 
-*Non implémenté pour l'instant.*
+TODO
 
-## Playfulness / excitation et instincts du jeu
+## Playfulness / esprit joueur (TODO)
 
-*Non implémenté pour l'instant*
-
-Un état de **playfulness** module l'intensité des instincts de jeu,
-qui renforcent des comportements joueur: poursuite, contact, etc.
-
-```python
-play_rewards = playfulness * (reward_poursuite + reward_contact + ...)
-```
-
-`playfulness` ∈ [0, 1] est un seuillage haut de l'éveil, neutralisé
-par la fatigue et la souffrance. C'est un signal dérivé sans
-renforcement associé.
+`playfulness`/`esprit joueur` est un seuillage haut de l'éveil, neutralisé
+par la fatigue et la souffrance. 
 
 ```python
 playfulness = max(0, eveil - seuil_eveil) * (1 - fatigue) * (1 - souffrance)
 ```
 
-## Format de sortie
+`playfulness` ∈ [0, 1]
 
-Comme les autres modalités : `dict` plat nommé, lisible, non ordonné.
+L'esprit joueur conditionne le renforcement
+de "comportements de jeu": comme
 
-## Cadencement
+* la poursuite d'un mobile attrayant (balle),
+* le contact,
+* etc.
 
-Cadencé avec le world model.
+```python
+play_rewards = playfulness * (reward_poursuite + reward_contact + ...)
+```
+
+`playfulness` pourrait être influencé par l'ennui.

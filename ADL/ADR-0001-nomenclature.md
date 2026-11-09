@@ -46,6 +46,7 @@ On fixe une liste de termes canoniques.
 - **relèvement** : passé de la position couchée à debout
 - **balle / ball** : mobile bondissant et attrayant
 - **croquette / kibble** : objet simulé qui réduit la faim
+- **appât / bait** : l'unique objet présent dans l'environnement à un instant donné (balle ou croquette)
 - **audition** : balle, touches du clavier
 - **bilan métabolique** : fatigue et souffrance.Intégrateurs lents internes des coûts
 - **faim / hunger** : coût qui progresse lentement et diminue par la consommation de croquette

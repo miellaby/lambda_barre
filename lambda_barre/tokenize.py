@@ -193,58 +193,65 @@ class ChannelSpec:
     signals: list[str] = field(default_factory=list)  # signal keys, in order
     source: str = ""                # sensor dict: proprio/touch/ball/vision/
                                     # intero/reward/action
+    label: str = ""                # short id of the channel (FORCE, VISION, ...)
 
 
 # Modality codes (4d, hand-picked orthogonal-ish)
 _M_INTERO = (1.0, 0.0, 0.0, 0.0)
-_M_SOMATO = (0.0, 1.0, 0.0, 0.0)
-_M_VISUAL = (0.0, 0.0, 1.0, 0.0)
-_M_MOTIV  = (1.0, 0.0, 0.0, 1.0)
+_M_PROPRIO = (0.0, 1.0, 0.0, 0.0)
+_M_EXTERO = (0.0, 0.0, 1.0, 0.0)
+_M_RENF  = (1.0, 0.0, 0.0, 1.0)
 _M_ACTION = (0.0, 0.0, 0.0, 0.0)
 
 
 def _build_layout() -> list[ChannelSpec]:
     return [
         # --- sensory (0..12) ---
-        ChannelSpec(0, False, _M_SOMATO, (0.0, 0.0, 0.0, 1.0),
+        ChannelSpec(0, False, _M_PROPRIO, (0.0, 0.0, 0.0, 1.0),
                     ["force_actuateur_avant", "force_actuateur_arriere",
-                     "couple_queue"], "proprio"),
-        ChannelSpec(1, False, _M_SOMATO, (0.0, 0.0, 1.0, 0.0),
+                     "couple_queue"], "proprio", label="FORCE"),
+        ChannelSpec(1, False, _M_PROPRIO, (0.0, 0.0, 1.0, 0.0),
                     ["tronc_angle", "queue_angle", "accel_tete_avant",
-                     "accel_tete_haut"], "proprio"),
-        ChannelSpec(2, False, _M_SOMATO, (0.0, 1.0, 0.0, 0.0),
-                    ["membre_angle_avant", "membre_distance_avant"], "proprio"),
-        ChannelSpec(3, False, _M_SOMATO, (1.0, 0.0, 0.0, 0.0),
+                     "accel_tete_haut"], "proprio", label="POSTURE"),
+        ChannelSpec(2, False, _M_PROPRIO, (0.0, 1.0, 0.0, 0.0),
+                    ["membre_angle_avant", "membre_distance_avant"], "proprio",
+                    label="LIMB_F"),
+        ChannelSpec(3, False, _M_PROPRIO, (1.0, 0.0, 0.0, 0.0),
                     ["membre_angle_arriere", "membre_distance_arriere"],
-                    "proprio"),
-        ChannelSpec(4, False, _M_VISUAL, (1.0, 1.0, 1.0, 1.0),
-                    [f"vis_c{i}" for i in range(1, 17)], "vision"),
-        ChannelSpec(5, False, _M_VISUAL, (0.0, 0.0, 0.0, 1.0),
+                    "proprio", label="LIMB_B"),
+        ChannelSpec(4, False, _M_EXTERO, (1.0, 1.0, 1.0, 1.0),
+                    [f"vis_c{i}" for i in range(1, 17)], "vision", label="VISION"),
+        ChannelSpec(5, False, _M_EXTERO, (0.0, 0.0, 0.0, 1.0),
                     ["ball_dir", "ball_prox", "ball_vr",
-                     "ball_va"], "ball"),
-        ChannelSpec(6, False, _M_VISUAL, (0.0, 0.0, 1.0, 0.0),
-                    ["flux_surface", "flux_x", "flux_y"], "vision"),
-        ChannelSpec(7, False, _M_VISUAL, (0.0, 1.0, 0.0, 0.0),
-                    ["son_0", "son_1", "son_2", "son_3", "son_4"], "ball"),
-        ChannelSpec(8, False, _M_SOMATO, (0.0, 0.0, 0.0, 1.0),
-                    ["contact_sol_avant", "contact_sol_arriere"], "touch"),
-        ChannelSpec(9, False, _M_SOMATO, (0.0, 0.0, 1.0, 0.0),
+                     "ball_va"], "ball", label="BALL"),
+        ChannelSpec(6, False, _M_EXTERO, (0.0, 0.0, 1.0, 0.0),
+                    ["flux_surface", "flux_x", "flux_y"], "vision", label="FLOW"),
+        ChannelSpec(7, False, _M_EXTERO, (0.0, 1.0, 0.0, 0.0),
+                    ["son_0", "son_1", "son_2", "son_3", "son_4"], "ball",
+                    label="SOUND"),
+        ChannelSpec(8, False, _M_EXTERO, (1.0, 0.0, 0.0, 0.0),
+                    ["contact_sol_avant", "contact_sol_arriere"], "touch",
+                    label="TOUCH_FOOT"),
+        ChannelSpec(9, False, _M_EXTERO, (1.0, 0.0, 1.0, 0.0),
                     ["collision_tronc_x", "collision_tronc_y",
-                     "collision_tronc_cx", "collision_tronc_cy"], "touch"),
-        ChannelSpec(10, False, _M_MOTIV, (0.0, 0.0, 0.0, 0.0),
+                     "collision_tronc_cx", "collision_tronc_cy"], "touch",
+                    label="TOUCH_TRUNK"),
+        ChannelSpec(10, False, _M_RENF, (0.0, 0.0, 0.0, 0.0),
                     ["effort", "douleur", "courbature", "instabilite",
-                     "vertige"], "reward"),
-        ChannelSpec(11, False, _M_MOTIV, (1.0, 0.0, 0.0, 0.0),
-                    ["confort"], "reward"),
+                     "vertige"], "reward", label="COSTS"),
+        ChannelSpec(11, False, _M_RENF, (1.0, 0.0, 0.0, 0.0),
+                    ["confort"], "reward", label="REWARD"),
         ChannelSpec(12, False, _M_INTERO, (0.0, 0.0, 0.0, 1.0),
-                    ["fatigue", "souffrance"], "intero"),
+                    ["fatigue", "souffrance"], "intero", label="METAB"),
         # --- motor (13..15) ---
         ChannelSpec(13, True, _M_ACTION, (0.0, 0.0, 0.0, 1.0),
-                    ["membre_avant_theta", "membre_avant_d"], "action"),
+                    ["membre_avant_theta", "membre_avant_d"], "action",
+                    label="ACT_F"),
         ChannelSpec(14, True, _M_ACTION, (0.0, 0.0, 1.0, 0.0),
-                    ["membre_arriere_theta", "membre_arriere_d"], "action"),
+                    ["membre_arriere_theta", "membre_arriere_d"], "action",
+                    label="ACT_B"),
         ChannelSpec(15, True, _M_ACTION, (0.0, 1.0, 0.0, 0.0),
-                    ["queue_theta"], "action"),
+                    ["queue_theta"], "action", label="ACT_TAIL"),
     ]
 
 
@@ -269,8 +276,9 @@ _COST_KEYS = ("effort", "douleur", "courbature", "instabilite", "vertige")
 _STATE_FLAT_LEN = sum(_N_SIGNALS[:STATE_TOKENS])    # 53
 _ACTION_FLAT_LEN = sum(_N_SIGNALS[STATE_TOKENS:])   # 5
 
-# Number of non-reward sensory scalar slots fed to the policy (tokens 0..9).
-N_POLICY_STATE = sum(_N_SIGNALS[:_COST_IDX])         # 45
+# Number of scalar slots fed to the policy (tokens 0..11 : capteurs + coûts +
+# récompense ; hors bilan métabolique, token 12).
+N_POLICY_STATE = sum(_N_SIGNALS[:_INTERO_IDX])       # 51
 
 # Per-token action-key → (skeleton attribute, field) lookup.
 # Action tokens record the EFFECTIVE actuator values (theta_eff / d_eff) —
@@ -330,12 +338,13 @@ def action_tokens(salve: list[list[float]]) -> list[list[float]]:
 
 
 def policy_scalars(salve: list[list[float]]) -> list[float]:
-    """The 45 non-reward sensory signal values (tokens 0..9), in order.
+    """The 51 sensory + cost signal values (tokens 0..11, hors bilan
+    métabolique), in order.
 
     These are the normalized [0,1] floats the policy consumes alongside the
     world-model latent."""
     out: list[float] = []
-    for i in range(_COST_IDX):           # tokens 0..9 (exclude reward 10,11 and intero 12)
+    for i in range(_INTERO_IDX):         # tokens 0..11 (exclude intero 12)
         ch = _LAYOUT[i]
         token = salve[i]
         for k in range(len(ch.signals)):

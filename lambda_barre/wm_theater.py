@@ -24,7 +24,7 @@ import torch
 
 from . import body as B
 from . import config as CFG
-from .brain import Brain, ExperienceBuffer, sequence_relief, compute_context_time_weights
+from .brain import Brain, ExperienceBuffer, relief_score, compute_context_time_weights
 from .dream import (
     CARD_BG,
     CARD_BORDER,
@@ -207,9 +207,9 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
 
         # Denouement / Relief metrics
         n_ctx_cutoff = n_ctx - 1
-        real_relief = sequence_relief(seq, n_ctx=n_ctx_cutoff)
+        real_relief = relief_score(seq, n_ctx=n_ctx_cutoff)
         pred_seq = [s.real_salve for s in steps[:n_ctx]] + [s.pred_salve for s in steps[n_ctx:]]
-        pred_relief = sequence_relief(pred_seq, n_ctx=n_ctx_cutoff)
+        pred_relief = relief_score(pred_seq, n_ctx=n_ctx_cutoff)
 
         early_weights = compute_context_time_weights(n_ctx)
         early_cost = sum(w * sum(s.real_costs) for w, s in zip(early_weights, steps[:n_ctx]))
@@ -227,15 +227,14 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         gen_toks = res["gen_toks"]
         gen_action = res["gen_action"]
 
-        # Comparison info: baseline vs hindsight (forced-EOS) — denouement
-        # favorability under the EOS channel hierarchy
-        fav_pi = float(brain._eos_favorability(res["eos_pi"])[0].item())
-        fav_gen = float(brain._eos_favorability(res["eos_gen"])[0].item())
+        # Comparison info: baseline vs hindsight (forced-EOS) — score de
+        # soulagement (relief_score) lu sur le token EOS
+        relief_pi = float(relief_score(res["eos_pi"])[0].item())
+        relief_gen = float(relief_score(res["eos_gen"])[0].item())
         hindsight_info = {
-            "fav_pi": fav_pi,
-            "fav_gen": fav_gen,
-            "delta_fav": fav_gen - fav_pi,
-            "accepted": bool(fav_gen > fav_pi),
+            "relief_pi": relief_pi,
+            "relief_gen": relief_gen,
+            "delta_relief": relief_gen - relief_pi,
             "eos_pi": res["eos_pi"][0].tolist(),
             "eos_forced": res["eos_forced"][0].tolist(),
             "eos_gen": res["eos_gen"][0].tolist(),
@@ -314,9 +313,9 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         avg_c_rmse = sum(pred_cost_errors) / max(1, len(pred_cost_errors))
 
         n_ctx_cutoff = 4
-        real_relief = sequence_relief(seq, n_ctx=n_ctx_cutoff)
+        real_relief = relief_score(seq, n_ctx=n_ctx_cutoff)
         pred_seq = [s.real_salve for s in steps[:4]] + [steps[4].pred_salve] + [s.pred_salve for s in steps[5:]]
-        pred_relief = sequence_relief(pred_seq, n_ctx=n_ctx_cutoff)
+        pred_relief = relief_score(pred_seq, n_ctx=n_ctx_cutoff)
 
         early_weights = compute_context_time_weights(5)
         early_cost = sum(w * sum(s.real_costs) for w, s in zip(early_weights, steps[:5]))
@@ -490,7 +489,7 @@ class WMTheater:
         # Compute reliefs across all coreset sequences for instant sorting
         n_ctx_cutoff = getattr(brain, "n_ctx", 4)
         self.all_reliefs: list[float] = [
-            sequence_relief(seq, n_ctx=n_ctx_cutoff)
+            relief_score(seq, n_ctx=n_ctx_cutoff)
             for seq in self.buffer._coreset
         ]
 
@@ -749,10 +748,10 @@ class WMTheater:
         screen.blit(s, (px + 12, y))
         y += 24
 
-        # Verdict badge
-        accepted = info["accepted"]
-        badge_color = (80, 220, 130) if accepted else (240, 110, 120)
-        badge_txt = "ACCEPTED — hindsight beats baseline" if accepted else "REJECTED — baseline is better"
+        # Verdict badge (affichage seul, aucune decision)
+        better = info["delta_relief"] > 0
+        badge_color = (80, 220, 130) if better else (240, 110, 120)
+        badge_txt = "hindsight meilleur que baseline" if better else "baseline meilleur que hindsight"
         s = font_small.render(badge_txt, FONT_AA, badge_color)
         screen.blit(s, (px + 12, y))
         y += 26
@@ -786,18 +785,18 @@ class WMTheater:
 
         y += 6
 
-        # Denouement favorability comparison
-        fav_pi = info["fav_pi"]
-        fav_gen = info["fav_gen"]
-        delta_fav = info["delta_fav"]
-        s = font_tiny.render("Outcome favorability (+ = recovery):", FONT_AA, TEXT_MUTED)
+        # Score de soulagement (relief_score du token EOS)
+        relief_pi = info["relief_pi"]
+        relief_gen = info["relief_gen"]
+        delta_relief = info["delta_relief"]
+        s = font_tiny.render("Score de soulagement (+ = recuperation):", FONT_AA, TEXT_MUTED)
         screen.blit(s, (px + 12, y))
         y += 16
-        s = font_tiny.render(f"  Baseline (a4)  : {fav_pi:+.3f}", FONT_AA, TEXT_WHITE)
+        s = font_tiny.render(f"  Baseline (a4)  : {relief_pi:+.3f}", FONT_AA, TEXT_WHITE)
         screen.blit(s, (px + 12, y))
         y += 15
-        s = font_tiny.render(f"  Hindsight (a4*) : {fav_gen:+.3f}   ({delta_fav:+.3f})",
-                             FONT_AA, (100, 245, 160) if delta_fav > 0 else (240, 110, 120))
+        s = font_tiny.render(f"  Hindsight (a4*) : {relief_gen:+.3f}   ({delta_relief:+.3f})",
+                             FONT_AA, (100, 245, 160) if delta_relief > 0 else (240, 110, 120))
         screen.blit(s, (px + 12, y))
         y += 20
 
@@ -1201,7 +1200,7 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 10, n_ctx: int = 4,
                 compile_wm: bool = False,
-                eos_force_eps_lo: float = 0.15, eos_force_eps_hi: float = 0.40,
+                eos_force_eps_lo: float = 0.015, eos_force_eps_hi: float = 0.0375,
                 eos_force_amplify: float = 1.0,
                 wm_hz: float = 3.0, pol_hz: float = 6.0,
                 **_ignored) -> None:
@@ -1301,7 +1300,7 @@ def main() -> None:
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 10, "n_ctx": 4,
         "compile_wm": False,
-        "eos_force_eps_lo": 0.15, "eos_force_eps_hi": 0.40,
+        "eos_force_eps_lo": 0.015, "eos_force_eps_hi": 0.0375,
         "eos_force_amplify": 1.0,
     }
 

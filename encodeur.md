@@ -18,10 +18,10 @@ Pour le détail complet des 16 tokens et de leurs canaux, voir [tokens.md](token
 
 ## Prétraitement et lissage temporel (`Smoother`)
 
-Le `Smoother` opère la **compression temporelle** entre la dynamique physique (60 Hz) et le rythme d'observation du cerveau (3 Hz et 6 Hz) :
+Le `Smoother` opère la **compression temporelle** entre la dynamique physique (60 Hz) et le rythme d'observation du cerveau (5 Hz et 10 Hz) :
 
-* **Filtre IIR / EMA** : filtre passe-bas exponentiel du 1er ordre actualisé à chaque pas physique (60 Hz) avec une constante de temps $\tau = 0.33 / \ln(10) \approx 0.1433\text{ s}$ :
-  * $90\%$ de la valeur cible est atteinte en exactement $0.33\text{ s}$ (1 tick WM à 3 Hz).
+* **Filtre IIR / EMA** : filtre passe-bas exponentiel du 1er ordre actualisé à chaque pas physique (60 Hz) avec une constante de temps $\tau = 0.2 / \ln(10) \approx 0.0869\text{ s}$ :
+  * $90\%$ de la valeur cible est atteinte en exactement $0.2\text{ s}$ (1 tick WM à 5 Hz).
   * Demi-vie d'environ $100\text{ ms}$ (~6 frames physiques), offrant un compromis idéal entre réduction du bruit impulsionnel et réactivité motrice.
 * **Filtrage sélectif par signal (*per-scalar*)** :
   * **Signaux lissés** : grandeurs dérivées bruitées (différences finies, chocs et pics instantanés) :
