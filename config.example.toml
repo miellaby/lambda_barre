@@ -28,7 +28,7 @@ hidden    = 256   # width of each hidden layer (3 hidden layers)
 [training]
 lr_wm         = 3.0e-4   # World Model learning rate (Adam)
 lr_pol        = 2.0e-4   # Policy learning rate (Adam)
-act_std       = 0.05     # action sampling std during wake (exploitation)
+act_std       = 0.0      # action sampling std during wake (0 = pas de bruit)
 
 # Sleep cycle training
 wm_coreset_epoch   = 512    # World Model training epochs per sleep cycle (Coreset phase)
@@ -37,7 +37,10 @@ wm_batch        = 64     # World Model training batch size
 wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
 pol_steps       = 256    # Policy training steps per sleep cycle
 eos_force_eps_lo = 0.015  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
-eos_force_eps_hi = 0.0375  # hindsight forcing: upper bound of eps ~ U(lo, hi)
+eos_force_eps_hi = 0.0375
+eos_decay = 0.9          # décroissance temporelle de l écart au but dans l EOS
+eos_poids_chemin = 0.1  # poids du coût du chemin dans le progrès par canal
+eos_max_p = 8.0         # exposant du max flou agrégeant les canaux (relief_score)
 eos_force_amplify = 1.0  # hindsight action amplification toward extremes (1.0 = off)
 eos_force_amplify_threshold = 0.95  # only amplify actions already near extremes (|v| >= threshold)
 wm_impact_floor  = 0.10  # additive floor on the per-sequence impact weight (neutral windows learn at a trickle)

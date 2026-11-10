@@ -139,6 +139,7 @@ def run(headless: bool = False, steps: int = 0,
         device: str | None = None, bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
         eos_force_eps_lo: float = 0.015, eos_force_eps_hi: float = 0.0375,
+        eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_max_p: float = 8.0,
         eos_force_amplify: float = 1.0,
         eos_force_amplify_threshold: float = 0.95,
         wm_impact_floor: float = 0.25,
@@ -162,7 +163,7 @@ def run(headless: bool = False, steps: int = 0,
         pol_hidden: int = 256,
         # Training hyperparameters
         lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-        act_std: float = 0.05,
+        act_std: float = 0.0,
         wm_batch: int = 64,
         seed: int = 0,
         # Buffer capacities
@@ -216,6 +217,9 @@ def run(headless: bool = False, steps: int = 0,
                   buffer_pool_capacity=buffer_pool_capacity,
                   eos_force_eps_lo=eos_force_eps_lo,
                   eos_force_eps_hi=eos_force_eps_hi,
+                  eos_decay=eos_decay,
+                  eos_poids_chemin=eos_poids_chemin,
+                  eos_max_p=eos_max_p,
                   eos_force_amplify=eos_force_amplify,
                   eos_force_amplify_threshold=eos_force_amplify_threshold,
                   wm_impact_floor=wm_impact_floor,
@@ -523,6 +527,7 @@ def run(headless: bool = False, steps: int = 0,
             # 4. Smoother + facing flip
             if skel.facing != prev_facing:
                 prev_facing = skel.facing
+                B.flip_torso_shape(skel)
                 smoother.reinit(sig, ts, cs, vs, isg, rs)
                 if sleep_gen is None:
                     brain.clear_history()
@@ -642,6 +647,7 @@ def main() -> None:
         "bootstrap_dataset": 0,
         "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_batch": 64,
         "eos_force_eps_lo": 0.015, "eos_force_eps_hi": 0.0375,
+        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
         "eos_force_amplify": 1.0,
         "eos_force_amplify_threshold": 0.95,
         "wm_impact_floor": 0.25,
@@ -660,7 +666,7 @@ def main() -> None:
         "dim_ff": 384, "wm_dropout": 0.0,
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05,
+        "act_std": 0.0,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
     }

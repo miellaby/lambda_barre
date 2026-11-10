@@ -199,6 +199,9 @@ _WM_LOOKAHEAD_PERIOD = 2                                     # WM mask alternati
 _EOS_FORCE_EPS = (0.015, 0.0375)                            # default hindsight forcing range, en unites de slot EOS (1 slot = 0.5 de delta de cout)
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
+_EOS_DECAY = 0.9          # décroissance temporelle de l'écart au but dans l'EOS
+_EOS_POIDS_CHEMIN = 0.1   # poids du coût du chemin dans le progrès par canal
+_EOS_MAX_P = 8.0          # exposant du max flou agrégeant les canaux (relief_score)
 _EOS_TIME_W = compute_eos_time_weights(_EOS_IMAGINE)
 _EOS_TIME_W_T = torch.tensor(_EOS_TIME_W, dtype=torch.float32)
 _CONTEXT_TIME_W = compute_context_time_weights(DEFAULT_N_CTX + 1)
@@ -286,60 +289,63 @@ def _salve_moved(s1: list[list[float]], s2: list[list[float]],
     return False
 
 
+def _eos_progres(c: list[float], n_ctx: int, decay: float, poids_chemin: float) -> float:
+    """Progrès d'un canal sur sa série de niveaux c (une valeur par salve) :
+    f = P - poids_chemin*A, avec P = c[s_{n_ctx}] - c[fin] (progrès final, signe
+    du score) et A = Σ_k decay^k (c[s_{n_ctx+1+k}] - c[fin]) (écart au but sur
+    le chemin, pondéré décroissant). Retourne le slot en [0,1], 0.5 = neutre."""
+    L = len(c)
+    P = c[n_ctx] - c[L - 1]
+    A = sum(decay ** k * (c[n_ctx + 1 + k] - c[L - 1]) for k in range(L - 1 - n_ctx))
+    r = P - poids_chemin * A
+    return 0.5 + 0.5 * r / (1.0 + abs(r))
+
+
 def _eos_slots_of_seq(seq: list, n_ctx: int = DEFAULT_N_CTX,
-                      eos_time_w: list[float] | None = None,
-                      context_time_w: list[float] | None = None) -> list[float]:
-    """Les 6 slots du token EOS d'une séquence : delta brut de chaque signal
-    de coût entre contexte de décision (s0..s_{n_ctx}) et fenêtre de
-    conséquence, normalisé (d + 1) / 2. 0.5 = neutre."""
-    if len(seq) <= n_ctx + 1:
+                      decay: float = _EOS_DECAY,
+                      poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[float]:
+    """Les 6 slots du token EOS d'une séquence : progrès par canal (voir
+    _eos_progres). Slot 5 = inconfort (-confort). 0.5 = neutre."""
+    L = len(seq)
+    if L <= n_ctx + 1:
         return [0.5] * _EOS_NSLOTS
-    n_early = n_ctx + 1
-    if eos_time_w is None:
-        eos_time_w = compute_eos_time_weights(len(seq) - 1 - n_ctx)
-    if context_time_w is None:
-        context_time_w = compute_context_time_weights(n_early)
     try:
-        early = [0.0] * _EOS_NSLOTS
-        for i, salve in enumerate(seq[:n_early]):
-            w = context_time_w[i] if i < len(context_time_w) else (1.0 / n_early)
-            for j in range(5):
-                early[j] += w * salve[_COST_IDX][SIG_OFFSET + j]
-            early[5] += w * salve[_REWARD_IDX][SIG_OFFSET]
-        late = [0.0] * _EOS_NSLOTS
-        for i, salve in enumerate(seq[n_early:]):
-            w = eos_time_w[i] if i < len(eos_time_w) else 0.0
-            for j in range(5):
-                late[j] += w * salve[_COST_IDX][SIG_OFFSET + j]
-            late[5] += w * salve[_REWARD_IDX][SIG_OFFSET]
-        return [((l - e) + 1.0) / 2.0 for e, l in zip(early, late)]
+        c = []
+        for salve in seq:
+            row = [salve[_COST_IDX][SIG_OFFSET + j] for j in range(5)]
+            row.append(-salve[_REWARD_IDX][SIG_OFFSET])    # inconfort = -confort
+            c.append(row)
+        return [_eos_progres([c[k][j] for k in range(L)], n_ctx, decay, poids_chemin)
+                for j in range(_EOS_NSLOTS)]
     except (IndexError, TypeError):
         return [0.5] * _EOS_NSLOTS
 
 
 def relief_score(x, n_ctx: int = DEFAULT_N_CTX,
-                 eos_time_w: list[float] | None = None,
-                 context_time_w: list[float] | None = None):
-    """Score de soulagement : somme pondérée des deltas de coût du token EOS
-    (hiérarchie des poids de canaux). Plus haut = meilleur dénouement,
-    négatif = aggravation. Accepte un token EOS (tenseur [..., 6]) ou une
-    séquence (liste de salves dont on construit le token EOS) :
+                 decay: float = _EOS_DECAY,
+                 poids_chemin: float = _EOS_POIDS_CHEMIN,
+                 p: float = _EOS_MAX_P):
+    """Score de soulagement : max flou pondéré des 6 slots du token EOS
+    (poids de canaux normalisés, exposant p). Positif = gain. Accepte un token
+    EOS (tenseur [..., 6]) ou une séquence (liste de salves) :
     relief_score(sequence) = relief_score(eos(sequence))."""
     if isinstance(x, torch.Tensor):
-        return 2.0 * (_EOS_CHANNEL_W_T.to(x.device) * (0.5 - x)).sum(dim=-1)
-    slots = _eos_slots_of_seq(x, n_ctx=n_ctx, eos_time_w=eos_time_w,
-                              context_time_w=context_time_w)
-    return 2.0 * float((_EOS_CHANNEL_W_T * (0.5 - torch.tensor(slots))).sum())
+        slots = x
+    else:
+        slots = torch.tensor(_eos_slots_of_seq(x, n_ctx=n_ctx, decay=decay,
+                                               poids_chemin=poids_chemin))
+    w = _EOS_CHANNEL_W_T.to(slots.device)
+    mf = ((w * slots ** p).sum(dim=-1)) ** (1.0 / p)
+    return 2.0 * (mf - 0.5)
 
 
 def impact(sequences: list[list[list[float]]], n_ctx: int = DEFAULT_N_CTX,
-           eos_time_w: list[float] | None = None,
-           context_time_w: list[float] | None = None) -> torch.Tensor:
+           decay: float = _EOS_DECAY, poids_chemin: float = _EOS_POIDS_CHEMIN) -> torch.Tensor:
     """Impact d'entraînement WM [B] = abs(relief_score) par séquence."""
     if not sequences:
         return torch.empty(0)
-    return torch.tensor([abs(relief_score(s, n_ctx=n_ctx, eos_time_w=eos_time_w,
-                                           context_time_w=context_time_w))
+    return torch.tensor([abs(relief_score(s, n_ctx=n_ctx, decay=decay,
+                                           poids_chemin=poids_chemin))
                          for s in sequences], dtype=torch.float32)
 
 
@@ -458,7 +464,8 @@ class ExperienceBuffer:
 
     def __init__(self, seq_len: int = DEFAULT_SEQ_STEPS + 1, capacity: int = 1000,
                  pool_capacity: int = 1000, seed: int = 0,
-                 n_ctx: int | None = None):
+                 n_ctx: int | None = None,
+                 eos_decay: float = _EOS_DECAY, eos_poids_chemin: float = _EOS_POIDS_CHEMIN):
         self.seq_len = seq_len
         self.capacity = capacity
         self.pool_capacity = pool_capacity
@@ -468,6 +475,8 @@ class ExperienceBuffer:
         else:
             self.n_ctx = n_ctx
         self.n_imagine = max(1, self.seq_steps - self.n_ctx)
+        self.eos_decay = eos_decay
+        self.eos_poids_chemin = eos_poids_chemin
         self._eos_time_w = compute_eos_time_weights(self.n_imagine)
         self._context_time_w = compute_context_time_weights(self.n_ctx + 1)
         self._segments: deque[list[list[float]]] = deque()
@@ -891,8 +900,8 @@ class ExperienceBuffer:
                 relief = 0.0
             else:
                 relief = relief_score(seq, n_ctx=self.n_ctx,
-                                      eos_time_w=self._eos_time_w,
-                                      context_time_w=self._context_time_w)
+                                      decay=self.eos_decay,
+                                      poids_chemin=self.eos_poids_chemin)  # attrs du buffer
             relief_clamped = max(-1.0, min(1.0, relief))
             weights.append(math.exp(beta * relief_clamped))
 
@@ -935,7 +944,10 @@ class Brain:
                  wm_w_state_post: float = 1.0,
                  wm_w_act_post: float = 1.0,
                  wm_w_eos: float = _WM_REWARD_BOOST,
-                 wm_w_a4_lookahead: float = 1.0):
+                 wm_w_a4_lookahead: float = 1.0,
+                 eos_decay: float = _EOS_DECAY,
+                 eos_poids_chemin: float = _EOS_POIDS_CHEMIN,
+                 eos_max_p: float = _EOS_MAX_P):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
         # Intra-op parallelism cap: 2 threads wins or ties in both regimes on
@@ -963,6 +975,7 @@ class Brain:
             list(self.policy.parameters()) + list(self.latent_norm.parameters()),
             lr=lr_pol)
         self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
+                                       eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
                                        capacity=buffer_capacity,
                                        pool_capacity=buffer_pool_capacity)
         self.wm_w_state_post = wm_w_state_post
@@ -996,6 +1009,12 @@ class Brain:
             self._context_w = torch.tensor(context_w, dtype=torch.float32, device=self.device)
         self._eos_tmpl = _EOS_TEMPLATE.to(self.device)
         self._eos_cw = _EOS_CHANNEL_W_T.to(self.device)  # innate channel weights
+        self.eos_decay = eos_decay
+        self.eos_poids_chemin = eos_poids_chemin
+        self.eos_max_p = eos_max_p
+        n_im = max(1, self.seq_steps - self.n_ctx)
+        self._eos_decay_pow = torch.tensor([eos_decay ** k for k in range(n_im)],
+                                           dtype=torch.float32, device=self.device)
         # WM training step: eager by default, optionally compiled as one
         # fused graph (static shapes [B, 173, 25] — the training loop is the
         # only caller, so no recompilation churn). The module itself stays
@@ -1246,29 +1265,22 @@ class Brain:
                 p_intero = k * SALVE_TOKENS + _INTERO_IDX
                 vals[b, p_intero, SIG_OFFSET:] = 0.0
 
-            # Terminal EOS token (position eos_pos): the DENOUEMENT DELTA the
-            # hindsight mechanism conditions on — per innate cost channel,
-            # the time-weighted consequence window, hyperbolic weights: the long term
-            # dominates, minus the flat decision window. Slots normalized 0.5 = neutre,
-            # < 0.5 = rétablissement, > 0.5 = aggravation.
+            # Terminal EOS token (position eos_pos): progrès par canal,
+            # f(c) = P - poids_chemin*A (voir _eos_progres). Slot 5 = inconfort.
             p_final = self.eos_pos
-            early_cost = [k * SALVE_TOKENS + _COST_IDX for k in range(self.n_ctx + 1)]
-            late_cost = [k * SALVE_TOKENS + _COST_IDX
-                         for k in range(self.n_ctx + 1, self.seq_steps + 1)]
-            early_rew = [k * SALVE_TOKENS + _REWARD_IDX for k in range(self.n_ctx + 1)]
-            late_rew = [k * SALVE_TOKENS + _REWARD_IDX
-                        for k in range(self.n_ctx + 1, self.seq_steps + 1)]
+            ks = range(self.seq_steps + 1)
+            c_cost = torch.stack([vals[b, k * SALVE_TOKENS + _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+                                  for k in ks])                                  # [L, 5]
+            c_rew = torch.stack([vals[b, k * SALVE_TOKENS + _REWARD_IDX, SIG_OFFSET]
+                                 for k in ks])                                       # [L]
+            c = torch.cat([c_cost, -c_rew.unsqueeze(-1)], dim=-1)                    # [L, 6]
+            P = c[self.n_ctx] - c[-1]                                                # [6]
+            diff = c[self.n_ctx + 1:] - c[-1]                                        # [n_imagine, 6]
+            A = (diff * self._eos_decay_pow.unsqueeze(-1)).sum(dim=0)                # [6]
+            r = P - self.eos_poids_chemin * A
+            slots = 0.5 + 0.5 * r / (1.0 + r.abs())
             vals[b, p_final, :SIG_OFFSET] = self._eos_tmpl[:SIG_OFFSET]
-            early_c = (vals[b, early_cost, SIG_OFFSET:SIG_OFFSET + 5]
-                       * self._context_w[:, None]).sum(dim=0)
-            late_c = (vals[b, late_cost, SIG_OFFSET:SIG_OFFSET + 5]
-                      * self._eos_w[:, None]).sum(dim=0)
-            d_c = late_c - early_c    # delta brut in [-1, 1] : ni amplifie ni seuille
-            vals[b, p_final, SIG_OFFSET:SIG_OFFSET + 5] = (d_c + 1.0) / 2.0
-            early_k = (vals[b, early_rew, SIG_OFFSET] * self._context_w).sum()
-            late_k = (vals[b, late_rew, SIG_OFFSET] * self._eos_w).sum()
-            d_k = late_k - early_k
-            vals[b, p_final, SIG_OFFSET + 5] = (d_k + 1.0) / 2.0
+            vals[b, p_final, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS] = slots
             vals[b, p_final, SIG_OFFSET + _EOS_NSLOTS:] = 0.0
         return vals
 
@@ -1332,7 +1344,7 @@ class Brain:
         vals = self._batch_tensors(sequences)             # [B, L, 25]
         impacts = impact(
             sequences, n_ctx=self.n_ctx,
-            eos_time_w=self.buffer._eos_time_w
+            decay=self.eos_decay, poids_chemin=self.eos_poids_chemin
         ).to(self.device)
         mult = self.lookahead_relief_mult if lookahead else 1.0
         weights = mult * impacts + self.wm_impact_floor
@@ -1850,13 +1862,12 @@ class Brain:
         dream_steps = [DreamStep(state_tokens=s_dec_toks, action=action[0].tolist(),
                                  label=f"s{self.n_ctx}+cand")]
         eos_pred = None
-        # decision-window baseline (s0..s_{n_ctx}) from the real context, weighted towards s_{n_ctx}
-        e_cost = [k * SALVE_TOKENS + _COST_IDX for k in range(self.n_ctx + 1)]
-        e_rew = [k * SALVE_TOKENS + _REWARD_IDX for k in range(self.n_ctx + 1)]
-        eos_early = torch.zeros(ctx.shape[0], _EOS_NSLOTS, device=ctx.device)
-        eos_early[:, :5] = (ctx[:, e_cost, SIG_OFFSET:SIG_OFFSET + 5]
-                            * self._context_w[None, :, None]).sum(dim=1)
-        eos_early[:, 5] = (ctx[:, e_rew, SIG_OFFSET] * self._context_w[None, :]).sum(dim=1)
+        # decision state (s_{n_ctx}) cost levels from the real context
+        p_dec = self.n_ctx * SALVE_TOKENS
+        c_dec = torch.zeros(ctx.shape[0], _EOS_NSLOTS, device=ctx.device)
+        c_dec[:, :5] = ctx[:, p_dec + _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+        c_dec[:, 5] = -ctx[:, p_dec + _REWARD_IDX, SIG_OFFSET]   # inconfort = -confort
+        eos_series = [c_dec]
         if use_kv_cache:
             cache = base_cache.clone()
             with torch.inference_mode():
@@ -1867,15 +1878,19 @@ class Brain:
             with torch.inference_mode():
                 s = self.world.predict_next_state(cand_ctx)
         c0 = self._salve_cost_batch(s)
-        w0 = self._eos_w[0] if len(self._eos_w) > 0 else (1.0 / n_imagine)
-        eos_acc = torch.zeros(s.shape[0], _EOS_NSLOTS, device=s.device)
-        eos_acc[:, :5] += w0 * s[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-        eos_acc[:, 5] += w0 * s[:, _REWARD_IDX, SIG_OFFSET]
-        eos_wsum = w0
+        c_gen = torch.zeros(s.shape[0], _EOS_NSLOTS, device=s.device)
+        c_gen[:, :5] = s[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+        c_gen[:, 5] = -s[:, _REWARD_IDX, SIG_OFFSET]            # inconfort = -confort
+        eos_series.append(c_gen)
 
         def _eos_finalize():
-            d = eos_acc / eos_wsum - eos_early    # delta brut in [-1, 1]
-            return (d + 1.0) / 2.0
+            # progrès par canal : f = P - poids_chemin*A (voir _eos_progres)
+            c = torch.stack(eos_series, dim=1)                  # [B, L, 6]
+            P = c[:, 0] - c[:, -1]
+            diff = c[:, 1:] - c[:, -1:]
+            A = (diff * self._eos_decay_pow[None, :, None]).sum(dim=1)
+            r = P - self.eos_poids_chemin * A
+            return 0.5 + 0.5 * r / (1.0 + r.abs())
 
         s_zeroed = s.clone()
         s_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
@@ -1915,9 +1930,10 @@ class Brain:
                 hist = torch.cat([hist, next_a_toks, gen_zeroed], dim=1)
             else:
                 cand_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
-            eos_acc[:, :5] += wk * gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-            eos_acc[:, 5] += wk * gen[:, _REWARD_IDX, SIG_OFFSET]
-            eos_wsum = eos_wsum + wk
+            c_g = torch.zeros(gen.shape[0], _EOS_NSLOTS, device=gen.device)
+            c_g[:, :5] = gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
+            c_g[:, 5] = -gen[:, _REWARD_IDX, SIG_OFFSET]
+            eos_series.append(c_g)
             if k + 1 == self.n_imagine:
                 eos_pred = _eos_finalize()
             cur_state = gen

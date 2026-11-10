@@ -6,6 +6,7 @@ import math
 import pygame
 
 from . import body as B
+from . import world as W
 
 # screen geometry
 WIDTH, HEIGHT = 960, 600
@@ -67,6 +68,13 @@ def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True,
         pygame.draw.circle(screen, (70, 74, 88), (x0, cy), r)
         pygame.draw.circle(screen, (70, 74, 88), (x1, cy), r)
 
+    # Debug equilateral triangle
+    tri = getattr(skel.space, "debug_triangle", None)
+    if tri is not None:
+        verts = [w2s(p.x, p.y) for p in (tri.local_to_world(v) for v in W.debug_tri_verts())]
+        pygame.draw.polygon(screen, (90, 200, 120), verts)
+        pygame.draw.polygon(screen, (50, 130, 75), verts, 2)
+
     # Red ball mobile (simple physical ball)
     ball = getattr(skel.space, "ball", None)
     if ball is not None:
@@ -88,8 +96,7 @@ def draw(screen, skel: "B.Skeleton", font, show_targets: bool = True,
                 pygame.draw.circle(screen, (255, 220, 180), (bx, by), r + 4, 1)
 
     torso = skel.torso
-    # torso triangle — mirror x when facing left so the asymmetric apex
-    # follows the orientation
+    # torso triangle — mirror x on facing flip, like the head (global mirror effect)
     sgn = skel.facing
     verts = [torso.local_to_world((v[0] * sgn, v[1])) for v in B.TORSO_VERTS]
     pts = [w2s(v.x, v.y) for v in verts]

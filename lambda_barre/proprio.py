@@ -22,9 +22,9 @@ from . import body as B
 
 # --- Reward circuit constants ------------------------------------------------
 EFFORT_SCALE = 6000.0             # power at which effort = 0.5
-DOULEUR_SEUIL_COLLISION = 800.0   # impulse/dt threshold for trunk collision
+DOULEUR_SEUIL_COLLISION = 400.0   # impulse/dt threshold for trunk collision
 DOULEUR_SEUIL_ACCEL = 1500.0      # accel threshold for head
-DOULEUR_SCALE = 6000.0            # douleur at which pain = 0.5
+DOULEUR_SCALE = 1500.0            # douleur at which pain = 0.5
 DOULEUR_DECAY_TAU = 0.15          # seconds — nociceptive decay time constant (~150 ms)
 COURBATURE_WINDOW = 1.0           # seconds — proprio variance window
 COURBATURE_SEUIL_VAR = 5.0        # below this variance, courbature accrues
@@ -35,6 +35,7 @@ INSTABILITE_SCALE = 1.0          # raw at which instabilite = 0.5
 VERTIGE_SCALE = 5.0             # omega at which vertige = 0.5
 CONFORT_K = 0.3                   # tronc_angle² → reward scale
 CONFORT_DEG = math.radians(10.0)  # comfort zone around upright
+CONFORT_DOULEUR_MAX = 0.10        # confort nul si douleur >= ce seuil (assis ne suffit pas)
 
 
 def _limb_measure(torso, foot, hip_local):
@@ -260,8 +261,9 @@ class Reward:
         vertige = self._omega_smooth / (self._omega_smooth + VERTIGE_SCALE)
 
         # --- confort ---
+        # conditionné à l'absence de douleur : la posture seule ne suffit pas
         tronc_angle = abs(proprio.get("tronc_angle", 0.0))
-        if tronc_angle < CONFORT_DEG:
+        if douleur < CONFORT_DOULEUR_MAX and tronc_angle < CONFORT_DEG:
             confort = -CONFORT_K * (CONFORT_DEG - tronc_angle) / CONFORT_DEG
         else:
             confort = 0.0

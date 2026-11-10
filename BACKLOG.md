@@ -150,6 +150,16 @@ Normalisation et constantes de temps des six signaux de coût biologique :
 
 Les constantes de `brain.py` suivent le pattern `Brain.__init__` → `config.toml`. Celles de `proprio.py` / `intero.py` / `smoother.py` sont des constantes de module consommées à la construction des capteurs : les externaliser demandera de passer les valeurs aux constructeurs (ou un chargement config dans ces modules) — à prévoir dans des sections `[costs]` / `[interoception]` / `[smoother]` de `config.toml`.
 
+### Passe du 2026-11-09 (inventaire des constantes encore en dur)
+
+- `[costs]` : toutes les constantes de proprio.py (EFFORT_SCALE, DOULEUR_SEUIL_COLLISION, DOULEUR_SEUIL_ACCEL, DOULEUR_SCALE, DOULEUR_DECAY_TAU, COURBATURE_*, INSTABILITE_*, VERTIGE_SCALE, CONFORT_K, CONFORT_DEG, CONFORT_DOULEUR_MAX).
+- `[interoception]` : FATIGUE_RISE/FALL, SOUFFRANCE_RISE/FALL (intero.py).
+- `[contact]` : CONTACT_REF_LEN (extero.py).
+- `[vision]` : VISION_* (extero.py).
+- `[world]` : GRAVITY, BALL_RADIUS/MASS/SPAWN.
+- `[smoother]` : TAU.
+- Hors périmètre : morphologie de body.py (TORSO_VERTS, masses, ressorts) et constantes de rendu.
+
 ---
 
 ## 5. Métrique de santé : distance au geste démontré

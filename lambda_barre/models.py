@@ -505,11 +505,10 @@ class Policy(nn.Module):
         distribution (a standard simplification: we optimize in raw space)."""
         h = self.net(state_vec)
         raw_mean = self.mean_head(h)             # [B, 5]
-        # print("raw[:,1]", raw_mean[:, 1])
-        # print("raw[:,3]", raw_mean[:, 3])
-        # print("sigmoid", torch.sigmoid(raw_mean[:, [1, 3]]))
-        # print("action", self._squash(raw_mean)[:, [1, 3]])
-        dist = torch.distributions.Normal(raw_mean, std)
-        raw = dist.rsample()
+        if std is None or std <= 0.0:
+            raw = raw_mean                       # déterministe, pas de bruit
+        else:
+            dist = torch.distributions.Normal(raw_mean, std)
+            raw = dist.rsample()
         action = self._squash(raw)
         return action, raw, raw_mean

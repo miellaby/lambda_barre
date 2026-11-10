@@ -20,6 +20,32 @@ BALL_RADIUS = 16.0
 BALL_MASS = 0.5
 BALL_SPAWN = (-360.0, 92.0)
 
+DEBUG_TRI_TYPE = 6
+DEBUG_TRI_SIDE = 40.0
+DEBUG_TRI_SPAWN = (-200.0, 250.0)
+
+
+def debug_tri_verts() -> list[tuple[float, float]]:
+    """Sommets du triangle équilatéral de debug, centré sur son centre de masse."""
+    r = DEBUG_TRI_SIDE / math.sqrt(3.0)   # circumradius
+    return [(0.0, r),
+            (r * math.cos(math.radians(210)), r * math.sin(math.radians(210))),
+            (r * math.cos(math.radians(330)), r * math.sin(math.radians(330)))]
+
+
+def create_debug_triangle(space: pymunk.Space) -> tuple[pymunk.Body, pymunk.Poly]:
+    """Equilateral debug triangle that falls and rests on the ground."""
+    verts = debug_tri_verts()
+    body = pymunk.Body(1.0, pymunk.moment_for_poly(1.0, verts))
+    body.position = DEBUG_TRI_SPAWN
+    shape = pymunk.Poly(body, verts)
+    shape.friction = 0.8
+    shape.elasticity = 0.0
+    shape.collision_type = DEBUG_TRI_TYPE
+    space.add(body, shape)
+    space.debug_triangle = body       # type: ignore[attr-defined]
+    return body, shape
+
 
 
 def create_ball(space: pymunk.Space, pos: tuple[float, float] = BALL_SPAWN,
@@ -86,6 +112,8 @@ def make_space() -> pymunk.Space:
 
     # mobile red balloon
     create_ball(space)
+    # debug equilateral triangle
+    create_debug_triangle(space)
     return space
 
 
@@ -105,4 +133,11 @@ def step(space: pymunk.Space, skel: "B.Skeleton", dt: float) -> None:
         bp = ball.position
         if bp.y < -50.0 or abs(bp.x) > 3000.0:
             reset_ball(space)
+    tri = getattr(space, "debug_triangle", None)
+    if tri is not None:
+        tp = tri.position
+        if tp.y < -50.0 or abs(tp.x) > 3000.0:
+            tri.position = DEBUG_TRI_SPAWN
+            tri.velocity = (0.0, 0.0)
+            tri.angular_velocity = 0.0
 

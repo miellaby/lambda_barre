@@ -215,6 +215,7 @@ class Ball:
 # --- Vision: 4×4 retina cone -------------------------------------------------
 
 # Cone geometry
+CONTACT_REF_LEN = 2.0   # px — longueur de référence du segment de contact (coeff de concentration)
 VISION_FOV = math.radians(100)    # total field of view (vertical spread)
 VISION_RANGE = 40.0              # px, max depth — about the head length
 VISION_ROWS = 4
@@ -464,17 +465,24 @@ class Touch:
 
     def _on_trunk_post_solve(self, arb: pymunk.Arbiter, space, data):
         ti = arb.total_impulse
-        self._trunk_impulse_x += ti.x
-        self._trunk_impulse_y += ti.y
-        # contact point barycentre, weighted by impulse magnitude
+        # contact concentration: 1 point = coeff 1 (max pressure), 2 points
+        # spread over a segment of length L = coeff REF/L (force distributed)
+        pts = arb.contact_point_set.points
+        if len(pts) >= 2:
+            L = math.hypot(pts[0].point_a.x - pts[1].point_a.x,
+                           pts[0].point_a.y - pts[1].point_a.y)
+            coeff = min(1.0, CONTACT_REF_LEN / L) if L > 1e-6 else 1.0
+        else:
+            coeff = 1.0
+        self._trunk_impulse_x += ti.x * coeff
+        self._trunk_impulse_y += ti.y * coeff
+        # contact point barycentre over all points, weighted by impulse magnitude
         w = abs(ti.x) + abs(ti.y)
         if w > 0:
-            cps = arb.contact_point_set
-            for cp in cps.points:
+            for cp in pts:
                 # point_a is on the trunk, point_b on the ground; use point_a
                 self._trunk_contact_x += w * cp.point_a.x
                 self._trunk_contact_y += w * cp.point_a.y
-                break  # use first contact point
             self._trunk_weight += w
 
     def reset_contacts(self) -> None:

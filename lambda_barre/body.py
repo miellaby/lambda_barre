@@ -173,6 +173,7 @@ class Skeleton:
     front_r: pymunk.Body = None
     foot_shape_l: pymunk.Shape = None
     foot_shape_r: pymunk.Shape = None
+    torso_shape: pymunk.Poly = None
     limb_l: LimbActuator = field(default_factory=LimbActuator)
     limb_r: LimbActuator = field(default_factory=LimbActuator)
     tail_act: TailActuator = field(default_factory=TailActuator)
@@ -324,7 +325,8 @@ def build_skeleton(space: pymunk.Space) -> Skeleton:
                              FRONT_REST)
 
     skel = Skeleton(
-        space=space, torso=torso, foot_l=foot_l, foot_r=foot_r, tail=tail,
+        space=space, torso=torso, torso_shape=torso_shape,
+        foot_l=foot_l, foot_r=foot_r, tail=tail,
         tail_spring=tail_spring,
         spring_l=spring_l, spring_r=spring_r,
         ear_l=ear_l, ear_r=ear_r,
@@ -470,6 +472,27 @@ def apply_consignes(skel: Skeleton, dt: float = 0.0) -> None:
     # move them smoothly (not instant) — it's cuter that way
     skel.ear_spring_l.rest_angle = -sgn * EAR_REST_L
     skel.ear_spring_r.rest_angle = -sgn * EAR_REST_R
+
+
+def flip_torso_shape(skel: "Skeleton") -> None:
+    """Mirror the torso's physical shape in x on a facing flip, so the
+    asymmetric apex follows the orientation (the render mirrors it too)."""
+    torso = skel.torso
+    space = skel.space
+    old = skel.torso_shape
+    sgn = skel.facing
+    verts = [(v[0] * sgn, v[1]) for v in TORSO_VERTS]   # apex follows facing
+    space.remove(old)
+    new = pymunk.Poly(torso, verts)
+    new.friction = old.friction
+    new.filter = old.filter
+    new.collision_type = old.collision_type
+    space.add(new)
+    space.reindex_shape(new)
+    skel.torso_shape = new
+    cx = sum(v[0] for v in verts) / len(verts)
+    cy = sum(v[1] for v in verts) / len(verts)
+    torso.center_of_gravity = (cx, cy)
 
 
 def reset(skel: Skeleton) -> None:
