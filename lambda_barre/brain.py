@@ -598,8 +598,17 @@ class ExperienceBuffer:
         """
         if len(self._coreset) <= 1 or pct <= 0.0:
             return 0
-        n_prune = max(1, int(len(self._coreset) * pct))
+        return self.prune_coreset_n(max(1, int(len(self._coreset) * pct)), beta=beta)
+
+    def prune_coreset_n(self, n_prune: int, beta: float = 2.0) -> int:
+        """Move exactly ``n_prune`` sequences from Coreset into Addendum, with
+        the same vivacity-biased sampling without replacement as
+        ``prune_coreset``. Returns the number of sequences moved."""
+        if len(self._coreset) <= 1:
+            return 0
         n_prune = min(n_prune, len(self._coreset) - 1)
+        if n_prune <= 0:
+            return 0
         while len(self._coreset_vivacity) < len(self._coreset):
             self._coreset_vivacity.append(1.0)
         # Weighted stochastic keys: key_i = -ln(u_i) / w_i with u_i ~ U(0, 1).
@@ -1382,6 +1391,55 @@ class Brain:
             yield "wm", loss_val
         self.last_wm_loss = sum(losses) / len(losses) if losses else float("nan")
 
+    def train_wm_phase(self, epochs: int, batch: int,
+                       target_loss: float | None = None,
+                       source: str = "coreset",
+                       fixed_seq=None,
+                       buffer: "ExperienceBuffer | None" = None,
+                       label: str = "wm"):
+        """One World Model training phase — the exact loop of the sleep
+        Coreset/Addendum phases — as a generator yielding
+        ``(label, epoch, loss, lookahead)`` after each epoch.
+
+        Batches are sampled from ``buffer`` (default: own buffer), coreset or
+        addendum per ``source``. ``fixed_seq`` (a sequence, or a callable
+        returning the current one) is prepended to every batch — e.g. the
+        sequence currently selected in wm_manager. Stops when the epoch
+        quota is reached AND the loss is under ``target_loss`` (overtime
+        allowed, as in the sleep)."""
+        buf = buffer if buffer is not None else self.buffer
+        if len(buf) < 1 and fixed_seq is None:
+            return
+        self.world.train()
+        self.sleep_wm_epochs = epochs
+        ep = 0
+        while True:
+            ep += 1
+            self.sleep_wm_step = ep
+            if ep > self.sleep_wm_epochs:
+                self.sleep_wm_epochs = ep
+            if source == "addendum":
+                seqs = buf.sample_addendum(batch)
+            else:
+                seqs = buf.sample_coreset(batch)
+            if fixed_seq is not None:
+                fs = fixed_seq() if callable(fixed_seq) else fixed_seq
+                seqs = [fs] + list(seqs)
+            if not seqs:
+                break
+            # Alternated mask: 1 EOS-lookahead pass every _WM_LOOKAHEAD_PERIOD
+            lookahead = (ep % _WM_LOOKAHEAD_PERIOD == 0)
+            loss_val = self._train_wm_batch(seqs, lookahead=lookahead)
+            yield label, ep, loss_val, lookahead
+
+            # Stopping criterion: must have completed the quota AND reached target loss
+            quota_done = (ep >= epochs)
+            target_done = (target_loss is None) or (loss_val <= target_loss)
+            if quota_done and target_done:
+                if ep > epochs:
+                    print(f"[{label}] Target loss {target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
+                break
+
     def evaluate_sequences_surprise(self, sequences: list[list[list[float]]], batch_size: int = 32) -> list[float]:
         """Evaluate surprise scores for a list of sequences under the current World Model.
 
@@ -1944,42 +2002,42 @@ class Brain:
         return eos_pred, dream_steps
 
     def _lookahead_generate(self, ctx, base_cache, eos_forced, use_kv_cache):
-        """Generate the hindsight action conditioned on the forced terminal EOS."""
+        """Generate the hindsight action conditioned on the forced terminal EOS.
+
+        The EOS token stays in the running input (last position) while each
+        of the 3 consigne tokens is generated, and every action row (the
+        intero token of each context salve) attends it — the same mask
+        pattern as the training lookahead mask (build_lookahead_mask), so
+        generation matches what the WM was trained on. The KV-cache path is
+        deliberately not used: a cache built from the bare context cannot
+        give the context rows EOS attention at any layer.
+        """
         B, ctx_len, _ = ctx.shape
         device = ctx.device
         wm = self.world
         assert ctx_len == self.decision_pos + 1, f"hindsight generation expects the {self.decision_pos + 1}-token context"
-        eos_tok = self._build_eos_token(eos_forced).unsqueeze(1)     # [B, 1, 25]
-        x = torch.cat([ctx, eos_tok], dim=1)                          # [B, ctx_len + 1, 25]
-        salve_pos = torch.arange(ctx_len + 1, device=device) // SALVE_TOKENS
-        salve_pos[ctx_len] = self.seq_steps                           # EOS at its terminal salve
-        gen_mask = build_lookahead_gen_mask(ctx_len, device, decision_pos=self.decision_pos)
+        n_dec = self.decision_pos // SALVE_TOKENS
+        eos_tok = self._build_eos_token(eos_forced)                    # [B, 25]
         toks = []
         with torch.inference_mode():
-            out = wm(x, attn_mask=gen_mask, is_causal=False,
-                     salve_positions=salve_pos)
-            sig = out[:, self.decision_pos, :].clamp(0.0, 1.0) * wm.action_valid_mask[0].to(device)
-            tok = wm.action_template[0].to(device).unsqueeze(0).expand(B, -1).clone()
-            tok[:, SIG_OFFSET:] = sig
-            toks.append(tok)
-            if use_kv_cache:
-                cache = base_cache.clone()
-                for i in range(1, ACTION_TOKENS):
-                    wm.cache_forward(toks[-1].unsqueeze(1), cache)
-                    sig = cache.last_pred.clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
-                    tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
-                    tok[:, SIG_OFFSET:] = sig
-                    toks.append(tok)
-            else:
-                curr = torch.cat([ctx, toks[0].unsqueeze(1)], dim=1)
-                for i in range(1, ACTION_TOKENS):
-                    o = wm(curr)
-                    sig = o[:, -1, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
-                    tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
-                    tok[:, SIG_OFFSET:] = sig
-                    toks.append(tok)
-                    curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
-        return torch.stack(toks, dim=1)                              # [B, 3, 25]
+            curr = ctx
+            curr_sp = torch.arange(ctx_len, device=device) // SALVE_TOKENS
+            for i in range(ACTION_TOKENS):
+                x = torch.cat([curr, eos_tok.unsqueeze(1)], dim=1)     # [B, L+1, 25]
+                L1 = x.shape[1]
+                sp = torch.cat([curr_sp, torch.tensor([self.seq_steps], device=device)])
+                mask = build_salve_mask(L1, device).clone()
+                for k in range(n_dec + 1):
+                    mask[k * SALVE_TOKENS + _INTERO_IDX, L1 - 1] = False  # action rows attend EOS
+                mask[L1 - 1, self.decision_pos + 1:L1 - 1] = True         # EOS sees context + itself
+                out = wm(x, attn_mask=mask, is_causal=False, salve_positions=sp)
+                sig = out[:, self.decision_pos + i, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
+                tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
+                tok[:, SIG_OFFSET:] = sig
+                toks.append(tok)
+                curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
+                curr_sp = torch.cat([curr_sp, torch.tensor([n_dec], device=device)])
+        return torch.stack(toks, dim=1)                                # [B, 3, 25]
 
     def relief_score(self, eos: torch.Tensor) -> torch.Tensor:
         """Score de soulagement d'un token EOS [B, 6] — délègue à la fonction
@@ -2094,6 +2152,7 @@ class Brain:
             facing=1,
             context_steps=context_steps,
             candidate_actions=[policy_action[0].tolist(), gen_action[0].tolist()],
+            real_action=lived_actions[self.n_ctx].tolist(),
             trajectories=[
                 DreamTrajectory(candidate_idx=0, regime_idx=0, regime_name="Policy",
                                 steps=steps_pi,
@@ -2390,7 +2449,9 @@ class Brain:
               wm_batch: int = 64,
               pol_steps: int = 64, pol_batch: int = 32,
               pol_n_imagine: int | None = None, clear_buffer: bool = True,
-              prune_pct: float = 0.33, surprise_factor: float = 1.0,
+              prune_pct: float = 0.33, surprise_factor: float = 0.5,
+              prune_min_fill: float = 0.75, prune_beta: float = 2.0,
+              dedup_eps: float = 0.08, surprise_floor: float = 0.001,
               wm_target_loss: float | None = 0.01,
               wm_coreset_target_loss: float | None = None,
               use_kv_cache: bool = True,
@@ -2426,22 +2487,26 @@ class Brain:
         # 1. Extraction des nouvelles expériences de la session de veille
         n_wake = self.buffer.extract_addendum()
 
-        # 2. Souvenirs remis en jeu (oubli actif : 33% du Coreset)
+        # 2. Souvenirs remis en jeu (oubli actif) : aucun pruning tant que le
+        # Coreset n'a pas atteint prune_min_fill de sa capacité ; au-delà, on
+        # repasse exactement à ce seuil (n = taille - 75% capacité).
         n_pruned = 0
-        if self.buffer.coreset_size > 1 and prune_pct > 0.0:
-            n_pruned = self.buffer.prune_coreset(prune_pct)
+        prune_floor = int(prune_min_fill * self.buffer.pool_capacity)
+        if prune_pct > 0.0 and self.buffer.coreset_size > prune_floor:
+            n_pruned = self.buffer.prune_coreset_n(self.buffer.coreset_size - prune_floor,
+                                                  beta=prune_beta)
 
         addendum_initial = self.buffer.addendum_size
 
         # 3. Déduplication géométrique :
         # 3a. Intra-Addendum
         saliency_weights = self.trusted_saliency_weights()
-        n_intra_dropped = self.buffer.deduplicate_addendum(eps=0.04, weights=saliency_weights)
+        n_intra_dropped = self.buffer.deduplicate_addendum(eps=dedup_eps, weights=saliency_weights)
         if n_intra_dropped > 0:
             print(f"[sleep:intra-addendum] {n_intra_dropped} redundant duplicates eliminated from Addendum.")
 
         # 3b. Addendum vs Coreset
-        cross_res = self.buffer.deduplicate_against_coreset(eps=0.04, weights=saliency_weights)
+        cross_res = self.buffer.deduplicate_against_coreset(eps=dedup_eps, weights=saliency_weights)
         n_cross_dropped = cross_res["dropped"]
         n_cross_refreshed = cross_res["refreshed"]
         if n_cross_dropped > 0:
@@ -2488,32 +2553,13 @@ class Brain:
         core_losses = []
         lookahead_losses = []
         if epochs_core > 0 or (has_coreset and wm_target_loss is not None):
-            self.world.train()
-            self.sleep_wm_epochs = epochs_core
-            ep = 0
-            while True:
-                ep += 1
-                self.sleep_wm_step = ep
-                if ep > self.sleep_wm_epochs:
-                    self.sleep_wm_epochs = ep
-                seqs = self.buffer.sample_coreset(wm_batch)
-                if not seqs:
-                    break
-                # Alternated mask: 1 EOS-lookahead pass every _WM_LOOKAHEAD_PERIOD
-                lookahead = (ep % _WM_LOOKAHEAD_PERIOD == 0)
-                loss_val = self._train_wm_batch(seqs, lookahead=lookahead)
+            for _, ep, loss_val, lookahead in self.train_wm_phase(
+                    epochs_core, wm_batch, wm_target_loss,
+                    source="coreset", label="wm_coreset"):
                 core_losses.append(loss_val)
                 if lookahead:
                     lookahead_losses.append(loss_val)
                 yield "wm_coreset", loss_val
-
-                # Stopping criterion: must have completed the quota AND reached target loss
-                quota_done = (ep >= epochs_core)
-                target_done = (wm_target_loss is None) or (loss_val <= wm_target_loss)
-                if quota_done and target_done:
-                    if ep > epochs_core:
-                        print(f"[sleep:wm_coreset] Target loss {wm_target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
-                    break
         recent_losses = core_losses[-min(len(core_losses), 5):]
         self.last_wm_coreset_loss = (sum(recent_losses) / len(recent_losses)) if recent_losses else float("nan")
 
@@ -2532,7 +2578,7 @@ class Brain:
 
         if self.buffer.addendum_size > 0:
             if has_coreset and not math.isnan(self.last_wm_coreset_loss):
-                threshold = max(self.last_wm_coreset_loss * surprise_factor, 1e-4)
+                threshold = max(self.last_wm_coreset_loss * surprise_factor, surprise_floor)
                 surprises = self.evaluate_sequences_surprise(self.buffer._addendum)
                 surviving = []
                 surviving_meta = []
@@ -2603,31 +2649,13 @@ class Brain:
         # 6. Phase 2: Train World Model on surviving Addendum
         add_losses = []
         if self.buffer.addendum_size > 0 and (epochs_add > 0 or wm_target_loss is not None):
-            self.world.train()
-            self.sleep_wm_epochs = epochs_add
-            ep = 0
-            while True:
-                ep += 1
-                self.sleep_wm_step = ep
-                if ep > self.sleep_wm_epochs:
-                    self.sleep_wm_epochs = ep
-                seqs = self.buffer.sample_addendum(wm_batch)
-                if not seqs:
-                    break
-                lookahead = (ep % _WM_LOOKAHEAD_PERIOD == 0)
-                loss_val = self._train_wm_batch(seqs, lookahead=lookahead)
+            for _, ep, loss_val, lookahead in self.train_wm_phase(
+                    epochs_add, wm_batch, wm_target_loss,
+                    source="addendum", label="wm_addendum"):
                 add_losses.append(loss_val)
                 if lookahead:
                     lookahead_losses.append(loss_val)
                 yield "wm_addendum", loss_val
-
-                # Stopping criterion: must have completed the quota AND reached target loss
-                quota_done = (ep >= epochs_add)
-                target_done = (wm_target_loss is None) or (loss_val <= wm_target_loss)
-                if quota_done and target_done:
-                    if ep > epochs_add:
-                        print(f"[sleep:wm_addendum] Target loss {wm_target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
-                    break
         recent_add_losses = add_losses[-min(len(add_losses), 5):]
         self.last_wm_addendum_loss = (sum(recent_add_losses) / len(recent_add_losses)) if recent_add_losses else float("nan")
 
@@ -2646,7 +2674,7 @@ class Brain:
         # 8. Consolidate surviving Addendum into Coreset with memory decay.
         saliency_weights = self.trusted_saliency_weights()
         cons_stats = self.buffer.consolidate_addendum_into_coreset(
-            eps=0.04, decay=0.01, dedup_intra=False, weights=saliency_weights
+            eps=dedup_eps, decay=0.01, dedup_intra=False, weights=saliency_weights
         )
         cons_stats["refreshed"] = n_cross_refreshed + cons_stats.get("refreshed", 0)
         cons_stats["dedup_cross_dropped"] = n_cross_dropped

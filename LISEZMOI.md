@@ -41,7 +41,6 @@ uv pip install -e .
 
 | Option | Description | Valeurs possibles |
 |---|---|---|
-| `--accel` | Active l'accélération matérielle maximale (alias de `--device auto`). | Drapeau booléen |
 | `--device` | Spécifie le matériel de calcul pour les réseaux de neurones. | `cpu` *(défaut)*, `cuda`, `auto`, `cpu-fast` |
 | `--reset` | Supprime les checkpoints existants (`wm_ckpt.pt`, `pol_ckpt.pt`) et démarre avec des poids neufs. | Drapeau booléen |
 | `--headless` | Exécute la simulation sans fenêtre Pygame (nécessite `--steps`). | Drapeau booléen |
@@ -49,7 +48,6 @@ uv pip install -e .
 
 Options passées par l'environnement :
 
-* **`LAMBDA_ACCEL=1`** : `--accel`.
 * **`LAMBDA_DEVICE=cuda`**: `--device cuda`
 * **`LAMBDA_TORCH_MKLDNN=1`** : `--device cpu-fast`
 * **`SDL_VIDEODRIVER=dummy`** : Idéal pour le mode headless.

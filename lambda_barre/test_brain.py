@@ -1141,11 +1141,14 @@ def test_wm_theater_rollout_and_rendering():
     rec = rollout_sequence(brain, mock_seqs[0], 0, 2, 1.0)
     assert rec.seq_idx == 0
     assert len(rec.steps) == 11
-    # First 5 steps (s0..s4) are context only
-    for s_i in range(5):
+    # Steps 0..3 are pure context; step 4 (decision salve) carries the WM-predicted a4^
+    for s_i in range(4):
         assert rec.steps[s_i].pred_step is None
         assert rec.steps[s_i].pred_costs is None
         assert len(rec.steps[s_i].real_costs) == 5
+    dec = rec.steps[4]
+    assert dec.pred_step is not None and dec.pred_step.label == "s4a^"
+    assert dec.pred_salve is not None and dec.cost_rmse is not None
     # Steps 5..10 are predicted
     for s_i in range(5, 11):
         assert rec.steps[s_i].pred_step is not None

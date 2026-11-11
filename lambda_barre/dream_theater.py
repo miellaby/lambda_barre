@@ -35,6 +35,9 @@ def run(device: str | None = None,
         pol_steps: int = 32,
         wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
         wm_target_loss: float = 0.01,
+        prune_pct: float = 0.33, surprise_factor: float = 0.5,
+        prune_min_fill: float = 0.75, prune_beta: float = 2.0,
+        dedup_eps: float = 0.08, surprise_floor: float = 0.001,
         use_kv_cache: bool = True,
         pol_eos_lookahead: bool = True,
         compile_wm: bool = False,
@@ -133,6 +136,12 @@ def run(device: str | None = None,
                                         wm_addendum_epoch=wm_addendum_epoch,
                                         pol_steps=pol_steps,
                                         wm_target_loss=wm_target_loss,
+                                        prune_pct=prune_pct,
+                                        surprise_factor=surprise_factor,
+                                        prune_min_fill=prune_min_fill,
+                                        prune_beta=prune_beta,
+                                        dedup_eps=dedup_eps,
+                                        surprise_floor=surprise_floor,
                                         use_kv_cache=use_kv_cache,
                                         pol_eos_lookahead=pol_eos_lookahead)
                 status = "sleeping..."
@@ -205,8 +214,11 @@ def main() -> None:
     # Built-in defaults (same as run() signature)
     params: dict = {
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "accel": bool(os.environ.get("LAMBDA_ACCEL")),
+        "accel": False,
         "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_target_loss": 0.01,
+        "prune_pct": 0.33, "surprise_factor": 0.5,
+        "prune_min_fill": 0.75, "prune_beta": 2.0,
+        "dedup_eps": 0.08, "surprise_floor": 0.001,
         "use_kv_cache": True, "pol_eos_lookahead": True,
         "compile_wm": False,
         "seq_steps": 10, "n_ctx": 4,
@@ -234,8 +246,6 @@ def main() -> None:
     p.add_argument("--device", type=str, default=argparse.SUPPRESS,
                    choices=["cpu", "cuda", "auto", "cpu-fast"],
                    help="computation device: 'cpu' (default safe), 'cuda', 'auto', or 'cpu-fast'")
-    p.add_argument("--accel", action="store_true", default=argparse.SUPPRESS,
-                   help="enable maximum hardware acceleration (CUDA if available, else CPU)")
     p.add_argument("--pol-steps", type=int, default=argparse.SUPPRESS,
                    help="policy training steps per sleep cycle")
     p.add_argument("--wm-coreset-epoch", type=int, default=argparse.SUPPRESS,
@@ -304,7 +314,7 @@ def main() -> None:
     if "no_save" in params:
         params["save"] = not params.pop("no_save")
 
-    # Resolve device: --accel overrides --device
+    # Resolve device: accel (config.toml) overrides device
     accel = params.pop("accel", False)
     if accel:
         params["device"] = "auto"

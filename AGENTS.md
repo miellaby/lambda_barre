@@ -37,6 +37,7 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 * `main.py`: Pygame interactive loop, keyboard dispatcher, HUD display, live sleep stepper.
 * `dream.py`: Visualizer for sleep policy rollouts (`DreamTheater`) and sleep training dialog.
 * `wm_theater.py`: Standalone visualizer comparing ground-truth Coreset sequences with autoregressive World Model rollouts.
+* `wm_manager.py`: WM Theater + epoch-by-epoch World Model training on the selected coreset sequence (live lr, loss history, save with V).
 * `models.py`: PyTorch architectures for `WorldModel` and `Policy`.
 * `tokenize.py`: 16-token dense salve representation (53 state signals + 5 motor actions).
 * `body.py`, `world.py`, `proprio.py`, `extero.py`, `intero.py`: Physics simulation, joints, sensors, interoception, reward signals.

@@ -27,9 +27,6 @@ uv pip install -e .
 # Launch without any hardware acceleration, works on any CPU
 .venv/bin/python -m lambda_barre.main
 
-# Launch with maximum hardware acceleration (CUDA)
-.venv/bin/python -m lambda_barre.main --accel
-
 # Select the execution backend
 .venv/bin/python -m lambda_barre.main --device cuda
 .venv/bin/python -m lambda_barre.main --device auto
@@ -45,7 +42,7 @@ Runs sleep cycles offline, straight from the checkpoints, without the physics si
 
 ```bash
 .venv/bin/python -m lambda_barre.dream_theater
-dream-theater --accel               # console script equivalent
+dream-theater                       # console script equivalent
 dream-theater --no-save             # view-only: checkpoints are not written back
 ```
 
@@ -67,11 +64,18 @@ wm-theater                          # default checkpoints, relief sort
 wm-theater --sort abs_desc          # extreme sequences first
 ```
 
+### WM Manager
+
+The WM Manager (same view as WM Theater, plus epoch-by-epoch World Model training on the selected sequence) is available as `wm-manager`, equivalent to `.venv/bin/python -m lambda_barre.wm_manager`.
+
+```bash
+wm-manager                          # [T] train on the selected sequence, [W] full WM phase with it pre-selected
+```
+
 ### Options
 
 | Option | Description | Possible values |
 |---|---|---|
-| `--accel` | Enables maximum hardware acceleration (alias for `--device auto`). | Boolean flag |
 | `--device` | Specifies the compute hardware for the neural networks. | `cpu` *(default)*, `cuda`, `auto`, `cpu-fast` |
 | `--reset` | Deletes existing checkpoints (`wm_ckpt.pt`, `pol_ckpt.pt`) and starts with fresh weights. | Boolean flag |
 | `--headless` | Runs the simulation without a Pygame window (requires `--steps`). | Boolean flag |
@@ -79,7 +83,6 @@ wm-theater --sort abs_desc          # extreme sequences first
 
 Options passed through the environment:
 
-* **`LAMBDA_ACCEL=1`**: `--accel`.
 * **`LAMBDA_DEVICE=cuda`**: `--device cuda`
 * **`LAMBDA_TORCH_MKLDNN=1`**: `--device cpu-fast`
 * **`SDL_VIDEODRIVER=dummy`**: Ideal for headless mode.

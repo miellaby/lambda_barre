@@ -13,3 +13,7 @@ dependencies = [
 lambda-barre = "lambda_barre.main:main"
 dream-theater = "lambda_barre.dream_theater:main"
 wm-theater = "lambda_barre.wm_theater:main"
+wm-manager = "lambda_barre.wm_manager:main"
+
+[tool.setuptools]
+packages = ["lambda_barre"]

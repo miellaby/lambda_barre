@@ -72,6 +72,12 @@ TOML_TO_PARAM: dict[str, str] = {
     # buffer section
     "buffer_capacity":         "buffer_capacity",
     "buffer_pool_capacity":    "buffer_pool_capacity",
+    "buffer_prune_pct":        "prune_pct",
+    "buffer_prune_min_fill":   "prune_min_fill",
+    "buffer_prune_beta":       "prune_beta",
+    "buffer_dedup_eps":        "dedup_eps",
+    "buffer_surprise_factor":  "surprise_factor",
+    "buffer_surprise_floor":   "surprise_floor",
     # sequence section
     "sequence_seq_steps": "seq_steps",
     "sequence_n_ctx":     "n_ctx",

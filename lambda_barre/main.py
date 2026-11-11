@@ -150,6 +150,9 @@ def run(headless: bool = False, steps: int = 0,
         wm_w_a4_lookahead: float = 1.0,
         freeze_physics: bool = False, no_smooth: bool = False,
         wm_target_loss: float = 0.01,
+        prune_pct: float = 0.33, surprise_factor: float = 0.5,
+        prune_min_fill: float = 0.75, prune_beta: float = 2.0,
+        dedup_eps: float = 0.08, surprise_floor: float = 0.001,
         use_kv_cache: bool = True,
         pol_eos_lookahead: bool = True,
         compile_wm: bool = False,
@@ -310,6 +313,12 @@ def run(headless: bool = False, steps: int = 0,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
                                                 wm_target_loss=wm_target_loss,
+                                                prune_pct=prune_pct,
+                                                surprise_factor=surprise_factor,
+                                                prune_min_fill=prune_min_fill,
+                                                prune_beta=prune_beta,
+                                                dedup_eps=dedup_eps,
+                                                surprise_floor=surprise_floor,
                                                 use_kv_cache=use_kv_cache,
                                                 pol_eos_lookahead=pol_eos_lookahead)
                         status = "sleeping..."
@@ -372,6 +381,12 @@ def run(headless: bool = False, steps: int = 0,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
                                                 wm_target_loss=wm_target_loss,
+                                                prune_pct=prune_pct,
+                                                surprise_factor=surprise_factor,
+                                                prune_min_fill=prune_min_fill,
+                                                prune_beta=prune_beta,
+                                                dedup_eps=dedup_eps,
+                                                surprise_floor=surprise_floor,
                                                 use_kv_cache=use_kv_cache,
                                                 pol_eos_lookahead=pol_eos_lookahead)
                         status = "sleeping..."
@@ -643,7 +658,7 @@ def main() -> None:
     params: dict = {
         "headless": False, "steps": 0, "reset": False,
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "accel": bool(os.environ.get("LAMBDA_ACCEL")),
+        "accel": False,
         "bootstrap_dataset": 0,
         "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_batch": 64,
         "eos_force_eps_lo": 0.015, "eos_force_eps_hi": 0.0375,
@@ -658,6 +673,9 @@ def main() -> None:
         "wm_w_a4_lookahead": 1.0,
         "freeze_physics": False, "no_smooth": False,
         "wm_target_loss": 0.01,
+        "prune_pct": 0.33, "surprise_factor": 0.5,
+        "prune_min_fill": 0.75, "prune_beta": 2.0,
+        "dedup_eps": 0.08, "surprise_floor": 0.001,
         "use_kv_cache": True, "pol_eos_lookahead": True,
         "compile_wm": False,
         "seq_steps": 10, "n_ctx": 4,
@@ -685,8 +703,6 @@ def main() -> None:
     p.add_argument("--device", type=str, default=argparse.SUPPRESS,
                    choices=["cpu", "cuda", "auto", "cpu-fast"],
                    help="computation device: 'cpu' (default safe), 'cuda', 'auto', or 'cpu-fast'")
-    p.add_argument("--accel", action="store_true", default=argparse.SUPPRESS,
-                   help="enable maximum hardware acceleration (CUDA if available, else CPU)")
     p.add_argument("--bootstrap-dataset", type=int, default=argparse.SUPPRESS,
                    nargs="?", const=3000,
                    help="generate a large physical experience dataset before running")
@@ -735,7 +751,7 @@ def main() -> None:
     # CLI overrides config
     CFG.merge_cli(params, cli)
 
-    # Resolve device: --accel overrides --device
+    # Resolve device: accel (config.toml) overrides device
     accel = params.pop("accel")
     if accel:
         params["device"] = "auto"

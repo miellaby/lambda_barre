@@ -84,6 +84,7 @@ class DreamRecord:
     lived_steps: list[DreamStep] | None = None        # full lived sequence s0..s10 with actions and per-salve costs
     predicted_steps: list[DreamStep] | None = None     # real s0..s3 + hindsight a4 + imagined s5..s10
     eos_realized: list[float] | None = None           # realized denouement delta of the lived sequence
+    real_action: list[float] | None = None            # recorded a4 of the lived sequence (decision row)
 
 
 def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
@@ -302,8 +303,8 @@ class DreamTheater:
 
     Hindsight (EOS-lookahead) policy steps are recorded in a per-cycle history
     and shown one at a time, storyboard style:
-      - LIVED SEQUENCE: the full s0..s10 window as experienced (ground truth),
-      - WM COMPLETION: real s0..s3, the hindsight-generated a4 on s4, and the
+      - SEQ: the full s0..s10 window as experienced (ground truth),
+      - WM: real s0..s3, the hindsight-generated a4 on s4, and the
         imagined s5..s10 it causes (completion toward the forced EOS),
       - DECISION: side by side, what the policy infers on s4 vs what the WM
         recommends (cost, imagined EOS, accepted/rejected).
@@ -675,7 +676,7 @@ class DreamTheater:
         for idx, step in enumerate(rec.context_steps):
             th_rect = pygame.Rect(start_x + idx * (self.thumb_w + self.thumb_gap),
                                   content_y + 4, self.thumb_w, self.thumb_h)
-            lbl = f"s{idx}" if idx < len(rec.context_steps) - 1 else "s4 (decision)"
+            lbl = f"s{idx}"
             cand_c = CAND_COLORS[0] if step.action is not None else None
             draw_thumbnail(screen, th_rect, step, font_small, facing=rec.facing,
                            cand_color=cand_c, highlight_label=lbl)
@@ -762,14 +763,14 @@ class DreamTheater:
         y = self.header_h + 10
 
         # --- LIVED SEQUENCE row: the ground truth s0 -> s10 ---
-        label = "LIVED SEQUENCE (s0-s10)"
+        label = "SEQ"
         if rec.eos_realized is not None:
             label += f"  EOS delta {_eos_scalar(rec.eos_realized):+.2f}"
         y = self._draw_seq_row(screen, rec, rec.lived_steps, label, y, font_small,
                                TEXT_WHITE, (200, 200, 210))
 
         # --- WM COMPLETION row: hindsight-generated a4 + imagined s5 -> s10 ---
-        label = "WM COMPLETION (hindsight EOS)"
+        label = "WM"
         traj_gen = rec.trajectories[1]
         if traj_gen.eos_pred is not None:
             label += f"  EOS delta {_eos_scalar(traj_gen.eos_pred):+.2f}"
@@ -841,15 +842,30 @@ class DreamTheater:
     def _draw_decision_row(self, screen: pygame.Surface, rec: DreamRecord,
                            font: pygame.font.Font, font_small: pygame.font.Font,
                            y: int) -> int:
-        """Side-by-side decision on s4: what the policy infers vs what the WM
-        recommends, with cost, imagined EOS and acceptance."""
-        s_lbl = font_small.render("DECISION (POLICY vs WM HINDSIGHT)", FONT_AA, TEXT_ACCENT)
+        """Side-by-side decision on s4, in order: the recorded action (real),
+        the WM hindsight suggestion, then the policy, with cost, imagined EOS
+        and acceptance."""
+        s_lbl = font_small.render("DECISION (REAL / WM HINDSIGHT / POLICY)", FONT_AA, TEXT_ACCENT)
         screen.blit(s_lbl, (16, y))
         y += 16
         s4 = rec.context_steps[-1]
-        names = ["POLICY", "WM HINDSIGHT"]
         x = 16
-        for c_idx in range(2):
+        # 1. Real recorded a4
+        if rec.real_action is not None:
+            step = DreamStep(state_tokens=s4.state_tokens,
+                             action=rec.real_action, label="s4+a4 reel")
+            rect = pygame.Rect(x, y, self.thumb_w, self.thumb_h)
+            draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
+                           cand_color=(200, 200, 210))
+            ax = x + self.thumb_w + 10
+            screen.blit(font_small.render("REAL a4", FONT_AA, TEXT_WHITE), (ax, y + 4))
+            x = ax + 150
+        # 2. WM hindsight suggestion, then policy (order: real, WM, policy)
+        order = [1, 0] if len(rec.candidate_actions) >= 2 else [0]
+        names = {0: "POLICY", 1: "WM HINDSIGHT"}
+        for c_idx in order:
+            if c_idx >= len(rec.trajectories):
+                break
             traj = rec.trajectories[c_idx]
             step = DreamStep(state_tokens=s4.state_tokens,
                              action=rec.candidate_actions[c_idx])
@@ -858,11 +874,12 @@ class DreamTheater:
                            cand_color=CAND_COLORS[c_idx], is_winner=traj.is_winner)
             ax = x + self.thumb_w + 10
             lines = [names[c_idx]]
+            is_hindsight = (c_idx == 1)
             if traj.total_cost is not None:
                 lines.append(f"Cost {traj.total_cost:.2f}")
             if traj.eos_pred is not None:
                 lines.append(f"Outcome {_eos_scalar(traj.eos_pred):+.2f}")
-            if c_idx == 1:
+            if is_hindsight:
                 lines.append("ACCEPTED" if traj.is_winner else "REJECTED")
             col = WINNER_BORDER if traj.is_winner else CAND_COLORS[c_idx]
             for i, txt in enumerate(lines):

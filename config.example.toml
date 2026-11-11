@@ -58,6 +58,14 @@ wm_w_a4_lookahead = 1.0  # multiplier on the whole hindsight (EOS-lookahead) los
 [buffer]
 capacity        = 1000   # session journal: max extractable sequences during wake
 pool_capacity   = 1000   # coreset: max long-term consolidated sequences
+# Active forgetting (sleep): prune Coreset only past this fill level, then
+# exactly back down to it (n_pruned = coreset_size - prune_min_fill * pool_capacity)
+prune_pct        = 0.33  # master switch for pruning (>0 = enabled)
+prune_min_fill   = 0.75  # no pruning before the coreset reaches 75% of pool_capacity
+prune_beta       = 2.0   # vivacity bias of the stochastic prune sampling
+dedup_eps        = 0.08  # similarity ceiling: sequences closer than eps are duplicates
+surprise_factor  = 0.5   # surprise threshold = last WM coreset loss * this factor (lower = eject less)
+surprise_floor   = 0.001 # floor on the surprise threshold (lower = eject less)
 
 # ---------------------------------------------------------------------------
 # Sequence geometry

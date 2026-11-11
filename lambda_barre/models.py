@@ -42,22 +42,18 @@ def configure_hardware(device_preference: str | None = None) -> tuple[torch.devi
                crashes on VMs or hosts with incomplete cpuinfo flags.
       - 'cpu-fast': Enable MKL-DNN on CPU if the host CPU is known to support it.
 
-    Controlled via argument, or LAMBDA_DEVICE env var ('cuda', 'cpu', 'auto'),
-    or LAMBDA_ACCEL=1 ('auto').
+    Controlled via argument, or LAMBDA_DEVICE env var ('cuda', 'cpu', 'auto').
     """
     import os
     import torch
     torch.set_printoptions(precision=4, sci_mode=False, linewidth=200)
 
     env_dev = os.environ.get("LAMBDA_DEVICE")
-    env_accel = os.environ.get("LAMBDA_ACCEL")
     if isinstance(device_preference, torch.device):
         device_preference = device_preference.type
     elif device_preference is None:
         if env_dev:
             device_preference = env_dev.lower().strip()
-        elif env_accel and env_accel not in ("0", "false", "no"):
-            device_preference = "auto"
         else:
             device_preference = "cpu"
 
