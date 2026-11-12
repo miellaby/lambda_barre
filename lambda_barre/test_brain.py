@@ -21,7 +21,7 @@ from .models import Policy, WorldModel, THETA_RANGE
 
 def _run_sleep(b, **kw):
     """Consume a sleep generator and return the final stats dict."""
-    for label, value in b.sleep(**kw):
+    for label, value in b.sleep_cycle(**kw):
         if label == "done":
             return value
     return None
@@ -1050,9 +1050,9 @@ def test_experience_buffer_intra_addendum_deduplication():
     # 10 identical sequences + 1 unique sequence
     for _ in range(10):
         buf._addendum.append(seq_dup)
-        buf._addendum_meta.append("wake")
+        buf._addendum_meta.append(buf._default_meta("wake"))
     buf._addendum.append(seq_uniq)
-    buf._addendum_meta.append("wake")
+    buf._addendum_meta.append(buf._default_meta("wake"))
 
     assert len(buf._addendum) == 11
     n_dropped = buf.deduplicate_addendum(eps=0.04)
@@ -1275,21 +1275,27 @@ def test_sleep_wm_coreset_stopping_condition():
     b.buffer.consolidate_addendum_into_coreset()
 
     # Case 1: Target loss is already satisfied (10.0) -> completes full quota (4 epochs)
+    # train_wm_phase yield par batch : on compte les epochs distinctes via sleep_wm_step
     steps_core = 0
-    for label, val in b.sleep(wm_coreset_epoch=4, wm_addendum_epoch=4, wm_batch=16, pol_steps=1, pol_batch=8,
+    last_ep = 0
+    for label, val in b.sleep_cycle(wm_coreset_epoch=4, wm_addendum_epoch=4, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_coreset_target_loss=10.0, prune_pct=0.0):
-        if label == "wm_coreset":
+        if label == "wm_coreset" and b.sleep_wm_step != last_ep:
+            last_ep = b.sleep_wm_step
             steps_core += 1
     assert steps_core == 4, f"Expected 4 steps to complete quota, got {steps_core}"
 
     # Case 2: Quota is small (1 epoch), but target loss is ambitious (0.05)
     # The loop MUST continue past epoch 1 in overtime until loss <= 0.05
     steps_overtime = 0
+    last_ep = 0
     final_loss = 1.0
-    for label, val in b.sleep(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
+    for label, val in b.sleep_cycle(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_target_loss=0.05, prune_pct=0.0):
         if label == "wm_coreset":
-            steps_overtime += 1
+            if b.sleep_wm_step != last_ep:
+                last_ep = b.sleep_wm_step
+                steps_overtime += 1
             final_loss = val
     assert steps_overtime > 1, f"Expected overtime steps (>1), got {steps_overtime}"
     assert final_loss <= 0.05, f"Expected final loss <= 0.05, got {final_loss}"
@@ -1301,11 +1307,14 @@ def test_sleep_wm_coreset_stopping_condition():
         salve = _make_salve(ss, [0.5, 0.5, 0.5, 0.5, 0.5])
         b.record(salve)
     steps_add_overtime = 0
+    last_ep = 0
     final_add_loss = 1.0
-    for label, val in b.sleep(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
+    for label, val in b.sleep_cycle(wm_coreset_epoch=1, wm_addendum_epoch=1, wm_batch=16, pol_steps=1, pol_batch=8,
                               wm_target_loss=0.05, prune_pct=0.0, surprise_factor=0.0):
         if label == "wm_addendum":
-            steps_add_overtime += 1
+            if b.sleep_wm_step != last_ep:
+                last_ep = b.sleep_wm_step
+                steps_add_overtime += 1
             final_add_loss = val
     if steps_add_overtime > 0:
         assert final_add_loss <= 0.05, f"Expected final addendum loss <= 0.05, got {final_add_loss}"

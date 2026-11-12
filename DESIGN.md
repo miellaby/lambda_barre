@@ -17,45 +17,47 @@ follow the cycle live:
 2. **Active Forgetting Candidates** — a third of the Coreset is pruned into
    the Addendum (vivacity-biased random, `prune_coreset`): old memories are
    systematically put back in play at every sleep.
-3. **Geometric Deduplication**
+3. **Sequence Metadata** (`Brain._compute_sequence_metadata`) — before any
+   dedup, every Coreset/Addendum sequence gets a metadata dict: causal pass
+   over the full sequence (captures the EOS latent), causal pass over the
+   context alone → policy inference → causal rollout from context + policy
+   action (pol_relief_score), lookahead pass. Stores `relief_score`,
+   `causal_score`, `lookahead_score`, `dissonance`, `surprise` (during
+   training), `latent`, `pol_relief_score`, `learn_count`, `vivacity`.
+4. **Geometric Deduplication**
    - Intra-Addendum: complete-linkage clustering drops redundant duplicates
      (`deduplicate_addendum`).
    - Addendum vs Coreset: near-duplicates refresh the Coreset memory's
      vivacity and are dropped from the Addendum
-     (`deduplicate_against_coreset`). Distances are saliency-weighted only
-     once the coreset WM loss is low enough to trust the sensitivity map.
-4. **World Model Training on Coreset** (`wm_coreset`) — establishes the
-   baseline known dynamics. Runs until the epoch quota is validated AND the
-   loss reaches the target. Each sequence's descent weight is proportional
-   to its realized impact — the absolute change in innate cost between the
-   decision state S4 and the terminal state S10 — so the WM focuses on
-   sequences with real biological consequences; a small floor weight keeps
-   neutral sequences learning at a trickle. The gradient is strongly
-   Causal passes alternate with EOS-lookahead passes (one lookahead in
-   two). The causal pass trains the full dynamics (its gradient is
-   boosted on the terminal salve's reward slots and on the EOS token).
-   The lookahead pass trains the inversion only — the gap between the
-   estimated a4 and the observed one: under the lookahead attention mask
-   the decision position additionally attends the realized terminal EOS
-   token (position 172), and the loss covers only the rows predicting
-   a4's consigne tokens. Nothing else is asked of the lookahead pass —
-   state predictions and the terminal reward slots are the causal pass's
-   job, and the other actions are not asked for. The EOS token attends
-   only the decision context and itself, so the recorded actions cannot
-   leak through the EOS key.
-5. **Surprise Filtering** — inference only, no gradient: the WM predicts
+     (`deduplicate_against_coreset`). Distances combine the saliency-weighted
+     RMSE with the cosine distance between sequence latents
+     (`latent_weight=1.0`); saliency weights are used only once the coreset
+     WM loss is low enough to trust the sensitivity map.
+5. **World Model Training on Coreset** (`wm_coreset`) — real epochs: each
+   epoch sweeps the whole Coreset in batches without replacement, in the
+   sorted order (`sorted_coreset_indices`, natural order off-plateau); every
+   batch gets a causal pass AND a lookahead pass. `learn_count` +1 per epoch
+   per sequence, `surprise` = causal loss of its batch. Runs until the epoch
+   quota (5) is validated AND the loss reaches the target. Impact weighting
+   as before (absolute relief between decision and terminal state, with a
+   floor). After the phase, `wm_loss_ratio = loss / wm_loss_before_sleep`;
+   `wm_plateau = ratio > 0.95`.
+6. **Surprise Filtering** — inference only, no gradient: the WM predicts
    each surviving Addendum sequence. Error below threshold = familiar =
-   dropped; error at or above = surprising = kept. UI stats update
-   immediately, before Addendum training begins.
-6. **World Model Training on Addendum** (`wm_addendum`) — same impact
-   weighting and the same causal/lookahead alternation, on the surprising
-   survivors.
-7. **Policy Training** — supervised improvement by imitation of the WM's
+   dropped; error at or above = surprising = kept. Additionally, during the
+   first Addendum epoch, new sequences (`learn_count == 0`) below the
+   surprise threshold are dropped immediately.
+7. **World Model Training on Addendum** (`wm_addendum`) — same real-epoch
+   scheme, addendum shuffled each epoch, causal + lookahead per batch.
+8. **Policy Training** — supervised improvement by imitation of the WM's
    hindsight action, verified by imagined rollouts (`train_policy`); every
    step is recorded for the Dream Theater.
-8. **Final Consolidation** — surviving Addendum sequences commit into the
-   Coreset (`consolidate_addendum_into_coreset`), vivacity decay is applied,
-   coldest memories are evicted above capacity.
+9. **Final Consolidation** — surviving Addendum sequences commit into the
+   Coreset (`consolidate_addendum_into_coreset`, evict=False), vivacity
+   decay is applied, then excess sequences above capacity are evicted by the
+   sorted order (`Brain._evict_coreset_excess`): the first m of the sorted
+   coreset (min-flou of normalized determinism / consonance / vivacity when
+   plateau, natural order otherwise).
 
 ## The EOS Token (dénouement)
 

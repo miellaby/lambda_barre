@@ -32,31 +32,35 @@ On fixe une liste de termes canoniques.
 - **référentiel égocentré**
 - **intéroception** : états internes lents (coûts intégrés)
 - **consigne** : cible motrice, valeur d'actuateur. Consigne sur la position des membres (θ*, d*) et l'angle de la queue.
-- **coûts / costs** : l'animat associe à son état des coût innés signés (bénéfiques ou pénalisants). Sans précision, il s'agit de coût instantané.
-- **pénalités / penalty** : Coûts positifs: effort, douleur, courbature, instabilité, vertige. 
-- **récompenses / reward** : Coûts négatifs comme "le confort".
+- **coûts / costs** : le circuit de renforcement inné (codé en dur) associe à l'état de l'animat des coût signés. Ce sont des coûts instantanés.
+- **pénalités / penalty** : Coûts positifs: effort, douleur, courbature, instabilité, vertige, ...
+- **récompenses / reward** : Coûts négatifs comme "le confort", la délectation ...
 - **reward_pos / reward_neg** : agrégats signés du renforcement
+- **effort**: force et mouvement. Pas un "vrai" effort car à 0 sans mouvement.
+- **douleur**: quantité de force externe rapportée à la surface de contact
+- **courbature** : absence de mouvement des membres
+- **instabilité** : centre de masse à l'intérieur du polygone de sustentation
+- **vertige** : accélération de la tête élevée
+- **confort**: récompense à avoir une posture confortable
+- **délectation / delight** : récomponsense de consommation d'une croquette par l'animat
 - **dénouement** : vecteur delta des coûts entre le contexte de décision et la conséquence de l'action
 - **EOS token** : token terminal de la séquence. C'est un token d'intéroception qui porte le dénouement.
-- **soulagement / relief** : Relief score ; sequence relief. le soulagement d'une séquence. Delta pondéré des coûts entre le contexte de décision et la fenêtre de conséquence.
-- **score de dénouement / favorability** : favorability ; fav(denouement) ; score du token EOS, pour affichage.
-- **Poids des canaux de coût**
-- **position couchée** : position douloureuse après une chute
-- **debout** : posture neutre
+- **score de soulagement / relief score** : sequence relief. Soulagement d'une séquence. Score de dénouement. Favorability ; Le token EOS ramené à un score.
+- **Poids des canaux de coût**: Ces poids hiérarchisent les coûts. Utile pour réduire le vecteur des coûts en un score unique (affichage), ou pour réduire l'EOS en un unique score de soulagement.
+- **position couchée** : posture douloureuse, généralement après une chute.
+- **position assise** : posture où l'animat est stable, postérieur posé sur le sol. posture douloureuse.
+- **position debout** : posture neutre, indolore.
 - **relèvement** : passé de la position couchée à debout
 - **balle / ball** : mobile bondissant et attrayant
 - **croquette / kibble** : objet simulé qui réduit la faim
 - **appât / bait** : l'unique objet présent dans l'environnement à un instant donné (balle ou croquette)
 - **audition** : balle, touches du clavier
-- **bilan métabolique** : fatigue et souffrance.Intégrateurs lents internes des coûts
-- **faim / hunger** : coût qui progresse lentement et diminue par la consommation de croquette
-- **délectation / delight** : reward de consommation
-- **Fatigue** La fatigue intègre l'effort
-- **Souffrance** La souffrance intègre la douleur
+- **bilan métabolique** : Intégrateurs lents internes des coûts: fatigue, souffrance, faim, ...
+- **Fatigue**: intègre l'effort
+- **Souffrance / Pain**: intègre la douleur
+- **Faim / hunger** : intègre la délectation.
 - **récupération / recovery** :  Facteur de récupération
-- **signaux normalisés de capteur** : stabilité (centre de masse vs polygone de sustentation), collision, choc, contact au sol, cône visuel constituée de cellule rétinienne, confort postural, effort musculaire, flux optique,
-- **curiosité, ennui, playfulness** : circuit de renforcement avancé
-- **vertige** : accélération de la tête
+- **signaux normalisés de capteur** : collision, choc, contact au sol, cône visuel constituée de cellule rétinienne, flux visuel
 - **canal / channel** : emplacement d'un signal normalisé dans un token ; normalized signal slot
 
 ### Termes pour l'IA

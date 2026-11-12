@@ -333,7 +333,7 @@ class DreamTheater:
 
         # Sleep cycle progress tracking (fed by dream_theater.py / main.py)
         self.sleep_active = False
-        self.sleep_phase = ""           # "prune" | "filter" | "wm" | "pol" | "done" | ""
+        self.sleep_phase = ""           # "meta" | "prune" | "filter" | "wm" | "wm_coreset" | "wm_addendum" | "pol" | "done" | ""
         self.sleep_step = 0
         self.sleep_total = 0
         self.coreset_size = 0
@@ -552,9 +552,12 @@ class DreamTheater:
 
         # --- Sleep actif : barre de progression + stats ---
         phase_labels = {
+            "meta":   "Sequence metadata",
             "prune":  "Pruning & deduplication",
             "filter": "Surprise filter",
             "wm":     "World Model training",
+            "wm_coreset":  "WM training — Coreset",
+            "wm_addendum": "WM training — Addendum",
             "pol":    "Policy training (hindsight)",
             "done":   "Sleep cycle complete",
         }

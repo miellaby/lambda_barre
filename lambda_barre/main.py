@@ -65,10 +65,16 @@ def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
     if brain is not None:
         wm = brain.last_wm_loss
         pol = brain.last_pol_loss
+        ratio = getattr(brain, "wm_loss_ratio", float("nan"))
+        if not math.isnan(ratio):
+            pct = (ratio - 1.0) * 100.0
+            wm_str = f"{wm:.3f} ({pct:+.0f}%)"
+        else:
+            wm_str = f"{wm:.2f}"
         dev = getattr(brain, "device_desc", str(brain.device))
         lines.append(f"dev {dev}")
         lines.append(
-            f"core {brain.buffer.coreset_size} · add {brain.buffer.addendum_size} ({brain.buffer.num_segments}s) wm {wm:.2f} pol {pol:.2f}")
+            f"core {brain.buffer.coreset_size} · add {brain.buffer.addendum_size} ({brain.buffer.num_segments}s) wm {wm_str} pol {pol:.2f}")
         lines.append(
             f"inf wm {brain._wm_time:.1f}ms pol {brain._pol_time:.1f}ms")
     if status:
@@ -137,8 +143,8 @@ def _platform_hit(space, world_pos):
 
 def run(headless: bool = False, steps: int = 0,
         device: str | None = None, bootstrap_dataset: int = 0,
-        pol_steps: int = 64, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
-        eos_force_eps_lo: float = 0.015, eos_force_eps_hi: float = 0.0375,
+        pol_steps: int = 64, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
+        eos_force_amp_lo: float = 0.1, eos_force_amp_hi: float = 0.5,
         eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_max_p: float = 8.0,
         eos_force_amplify: float = 1.0,
         eos_force_amplify_threshold: float = 0.95,
@@ -152,7 +158,7 @@ def run(headless: bool = False, steps: int = 0,
         wm_target_loss: float = 0.01,
         prune_pct: float = 0.33, surprise_factor: float = 0.5,
         prune_min_fill: float = 0.75, prune_beta: float = 2.0,
-        dedup_eps: float = 0.08, surprise_floor: float = 0.001,
+        dedup_eps: float = 0.02, surprise_floor: float = 0.001,
         use_kv_cache: bool = True,
         pol_eos_lookahead: bool = True,
         compile_wm: bool = False,
@@ -167,6 +173,9 @@ def run(headless: bool = False, steps: int = 0,
         # Training hyperparameters
         lr_wm: float = 3e-4, lr_pol: float = 2e-4,
         act_std: float = 0.0,
+        act_conseq_shift: int = 2,
+        tri_w_det: float = 1.0, tri_w_cons: float = 1.0,
+        tri_w_viv: float = 1.0, tri_vivacity_pow: float = 1.0,
         wm_batch: int = 64,
         seed: int = 0,
         # Buffer capacities
@@ -218,8 +227,8 @@ def run(headless: bool = False, steps: int = 0,
                   seed=seed,
                   buffer_capacity=buffer_capacity,
                   buffer_pool_capacity=buffer_pool_capacity,
-                  eos_force_eps_lo=eos_force_eps_lo,
-                  eos_force_eps_hi=eos_force_eps_hi,
+                  eos_force_amp_lo=eos_force_amp_lo,
+                  eos_force_amp_hi=eos_force_amp_hi,
                   eos_decay=eos_decay,
                   eos_poids_chemin=eos_poids_chemin,
                   eos_max_p=eos_max_p,
@@ -231,6 +240,11 @@ def run(headless: bool = False, steps: int = 0,
                   wm_w_act_post=wm_w_act_post,
                   wm_w_eos=wm_w_eos,
                   wm_w_a4_lookahead=wm_w_a4_lookahead)
+    brain.act_conseq_shift = act_conseq_shift  # démarre en manual (auto=False) → k appliqué
+    brain.tri_w_det = tri_w_det
+    brain.tri_w_cons = tri_w_cons
+    brain.tri_w_viv = tri_w_viv
+    brain.tri_vivacity_pow = tri_vivacity_pow
     auto = False                 # brain drives the consignes when True
     try:
         brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
@@ -292,7 +306,11 @@ def run(headless: bool = False, steps: int = 0,
                 pygame.display.toggle_fullscreen()
                 status = "fullscreen on" if pygame.display.is_fullscreen() else "fullscreen off"
             elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                if show_dream and sleep_gen is None:
+                if sleep_gen is not None:
+                    # coupe la phase de sommeil en cours, passe à la suivante
+                    brain._skip_phase = True
+                    status = "phase skipped"
+                elif show_dream and sleep_gen is None:
                     show_dream = False
                 else:
                     running = False
@@ -308,7 +326,7 @@ def run(headless: bool = False, steps: int = 0,
                         dream_theater.is_paused = False
                         dream_theater.sleep_active = True
                         dream_theater.set_sleep_progress("prune", 0, 0)
-                        sleep_gen = brain.sleep(wm_coreset_epoch=wm_coreset_epoch,
+                        sleep_gen = brain.sleep_cycle(wm_coreset_epoch=wm_coreset_epoch,
                                                 wm_addendum_epoch=wm_addendum_epoch,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
@@ -359,8 +377,10 @@ def run(headless: bool = False, steps: int = 0,
                     status = "overlays on" if show_overlays else "overlays off"
                 elif ev.key == pygame.K_b:
                     auto = not auto
+                    # brain-on : k forcé à 0 ; brain-off : décalage (a_n ; s_{n-k})
+                    brain.act_conseq_shift = 0 if auto else act_conseq_shift
                     # brain.clear_history() # toggling brain on/off doesn't justify clearing history
-                    status = "BRAIN on" if auto else "BRAIN off (manual)"
+                    status = "BRAIN on" if auto else f"BRAIN off (manual, k={act_conseq_shift})"
                 elif ev.key == pygame.K_d:
                     if brain.last_dream_record is not None:
                         show_dream = True
@@ -376,7 +396,7 @@ def run(headless: bool = False, steps: int = 0,
                         dream_theater.is_paused = False
                         dream_theater.sleep_active = True
                         dream_theater.set_sleep_progress("prune", 0, 0)
-                        sleep_gen = brain.sleep(wm_coreset_epoch=wm_coreset_epoch,
+                        sleep_gen = brain.sleep_cycle(wm_coreset_epoch=wm_coreset_epoch,
                                                 wm_addendum_epoch=wm_addendum_epoch,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
@@ -465,16 +485,32 @@ def run(headless: bool = False, steps: int = 0,
                     d_core = value.get('dedup_coreset', 0)
                     status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
                     dream_theater.set_sleep_progress("prune", 1, 1)
+                elif label == "meta":
+                    status = f"sequence metadata {value['done']}/{value['total']}"
+                    dream_theater.set_sleep_progress("meta", value['done'], value['total'])
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
-                    if label == "wm_addendum":
-                        status = f"learning addendum {wm_step}/{wm_total} (loss {value:.2f})"
-                    elif label == "wm_coreset":
-                        status = f"learning coreset {wm_step}/{wm_total} (loss {value:.2f})"
-                    else:
-                        status = f"learning wm {wm_step}/{wm_total} (loss {value:.2f})"
-                    dream_theater.set_sleep_progress("wm", wm_step, wm_total)
+                    wb = getattr(brain, "sleep_wm_batch", 0)
+                    wB = getattr(brain, "sleep_wm_batches", 0)
+                    wn = getattr(brain, "sleep_wm_n", 0)
+                    # affichage : epoch réelle (overtime visible), batch courant
+                    ep_disp = wm_step
+                    overtime = wm_step - wm_total
+                    ot_str = f" (+{overtime} overtime)" if overtime > 0 else ""
+                    # barre globale epoch × batch, NON cappée : en overtime on
+                    # refait tous les batchs, la progression continue au-delà du quota
+                    g_total = wm_total * wB
+                    g_step = (wm_step - 1) * wB + wb
+                    name = {"wm_addendum": "addendum", "wm_coreset": "coreset"}.get(label, "wm")
+                    status = (f"learning {name} epoch {ep_disp}/{wm_total}{ot_str} "
+                              f"batch {wb}/{wB} ({wn} seq, loss {value:.2f})")
+                    print(f"[modale] phase={label} ep={wm_step} quota={wm_total} batch={wb}/{wB} n={wn} "
+                          f"g_step={g_step} g_total={g_total} loss={value:.5f} "
+                          f"target={wm_target_loss} last_wm_loss={brain.last_wm_loss:.5f} "
+                          f"ratio={getattr(brain, 'wm_loss_ratio', float('nan')):.3f} "
+                          f"plateau={getattr(brain, 'wm_plateau', False)}")
+                    dream_theater.set_sleep_progress(label if label != "wm" else "wm", g_step, g_total)
                 elif label == "filter":
                     status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
                     dream_theater.set_sleep_progress("filter", 1, 1)
@@ -660,8 +696,8 @@ def main() -> None:
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
         "accel": False,
         "bootstrap_dataset": 0,
-        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_batch": 64,
-        "eos_force_eps_lo": 0.015, "eos_force_eps_hi": 0.0375,
+        "pol_steps": 32, "wm_coreset_epoch": 5, "wm_addendum_epoch": 5, "wm_batch": 64,
+        "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
         "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
         "eos_force_amplify": 1.0,
         "eos_force_amplify_threshold": 0.95,
@@ -675,7 +711,7 @@ def main() -> None:
         "wm_target_loss": 0.01,
         "prune_pct": 0.33, "surprise_factor": 0.5,
         "prune_min_fill": 0.75, "prune_beta": 2.0,
-        "dedup_eps": 0.08, "surprise_floor": 0.001,
+        "dedup_eps": 0.02, "surprise_floor": 0.001,
         "use_kv_cache": True, "pol_eos_lookahead": True,
         "compile_wm": False,
         "seq_steps": 10, "n_ctx": 4,
@@ -685,6 +721,8 @@ def main() -> None:
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
         "act_std": 0.0,
+        "act_conseq_shift": 2,
+        "tri_w_det": 1.0, "tri_w_cons": 1.0, "tri_w_viv": 1.0, "tri_vivacity_pow": 1.0,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
     }
@@ -742,6 +780,16 @@ def main() -> None:
                    help="Policy learning rate")
     p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
                    help="action sampling std during wake")
+    p.add_argument("--act-conseq-shift", type=int, default=argparse.SUPPRESS,
+                   help="brain-off action/consequence shift k: recorded pair is (a_n ; s_{n-k}), default 2")
+    p.add_argument("--tri-w-det", type=float, default=argparse.SUPPRESS,
+                   help="poids du déterminisme dans le min-flou de tri du coreset (plateau WM)")
+    p.add_argument("--tri-w-cons", type=float, default=argparse.SUPPRESS,
+                   help="poids de la consonance dans le min-flou de tri du coreset")
+    p.add_argument("--tri-w-viv", type=float, default=argparse.SUPPRESS,
+                   help="poids de la vivacité dans le min-flou de tri du coreset")
+    p.add_argument("--tri-vivacity-pow", type=float, default=argparse.SUPPRESS,
+                   help="exposant appliqué à la vivacité normalisée dans le tri")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS,
                    help="random seed")
 

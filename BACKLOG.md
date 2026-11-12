@@ -4,57 +4,7 @@ Ce document répertorie les chantiers et orientations de conception actés pour 
 
 ---
 
-## 1. Supervision efficiente de la politique : le WM en mode « EOS-lookahead »
-
-> **Statut : implémenté** (2026-10-01, voir `session_2026_10_01.md`). Détail d'implémentation par rapport à la spécification : la ligne du token EOS du masque lookahead est restreinte au contexte de décision (et à elle-même) — sans cette restriction, la clé EOS laissait fuiter l'action enregistrée vers la requête de décision en couche ≥ 2, et la génération compacte n'était pas exactement équivalente à l'entraînement.
-
-### Rationale & Philosophie
-
-La prédiction d'action par le WM sous MSE produit **l'action moyenne** : pour un contexte identique, le MSE mélange toutes les intentions en une action tiède à demi-amplitude que personne n'a jamais prise. Le problème n'est pas la tête mais le **conditionnement** : $P(a \mid \text{contexte})$ est multimodale dès que la politique est stochastique.
-
-La solution est de **conditionner par le dénouement** (*hindsight*) : $P(a_4 \mid \text{contexte}, EOS)$. Forcer un EOS favorable filtre la multimodalité — l'action générée est celle *associée au soulagement* dans des situations semblables, pas la moyenne de tout ce qui a été tenté. Le WM n'invente rien : il réinterroge l'expérience vécue (« dans des situations pareilles, qu'est-ce qui a effectivement soulagé ? »).
-
-Ce chantier remplace la machinerie actuelle de `train_policy` — 4 candidats (baseline, démonstration, bruit faible, bruit fort) × 3 régimes (Kalman, WM autoregressif, Policy closed-loop) = **12 rollouts imaginés par échantillon** — par **3 forwards**. Sur CPU sans accélération, c'est le dividende principal. Le régime 2 (WM autoregressif, action moyenne) devient obsolète d'un coup.
-
-### Spécifications techniques
-
-1. **Masque d'attention « EOS-lookahead » :**
-   - Variante du masque causal où la position qui prédit $a_4$ (dernier token d'état de $S_4$, position 76) peut attendre la position du token EOS terminal (172).
-   - Entraînement **alterné** avec le masque causal classique sur le même tronc (précédent : prefix-LM, UL2, GLM). Ratio à régler (ex. 3:1 causal:lookahead).
-   - **Pré-requis code** : `WorldModel.forward` passe `is_causal=True` en dur — à rendre conditionnel, sinon le chemin rapide causal ignore silencieusement le masque lookahead.
-   - L'encodage positionnel sinusoidal par index de salve existe déjà : le modèle sait où il est indépendamment de la causalité.
-
-2. **Entraînement du mode lookahead :**
-   - Aucun forçage : chaque séquence du Coreset/Addendum porte son EOS **réalisé**. La paire (contexte $S_0 \dots S_4$, EOS réel $\to$ $a_4$ réel) s'apprend sur toutes les données, bonnes et mauvaises issues (les mauvaises enseignent la frontière).
-   - Passes alternées dans `wm_coreset` / `wm_addendum`, loss identique (masquée, boostée EOS/récompense, pondérée par impact).
-
-3. **Génération (supervision de la politique) — pipeline par échantillon :**
-   - Rollout **baseline** avec l'action de la politique $\pi$ depuis le contexte → EOS prédit $\widehat{EOS}_{\pi}$ + coût accumulé $C_{\pi}$ (même $\gamma = 1.1$ que le Bellman actuel).
-   - **Forçage gradué relatif** : $EOS_{\text{forcé}} = \widehat{EOS}_{\pi} - \varepsilon$, avec $\varepsilon$ tiré d'une petite distribution fixe dans le sens favorable. Pas de scan du Coreset (non scalable) : l'ancre contextuelle vient du modèle lui-même. Curriculum automatique — les cibles se resserrent à mesure que la politique s'améliore.
-   - **Génération** de $a_4$ par le mode lookahead sous $EOS_{\text{forcé}}$.
-   - **Vérification forward** : rollout causal de 6 pas avec $a_4$ → $C_{\text{gen}}$.
-   - **Acceptation purement comparative** (le critère décisif, pas « proche de l'EOS forcé ») : si $C_{\text{gen}} < (1 - 0.001) \cdot C_{\pi}$ (marge de stabilité existante `_EXPLORE_MARGIN_PCT`) → $a_4$ devient **LA sortie supervisée** de la politique ($\mathcal{L} = \text{MSE}(\pi, a_4)$) ; sinon → pas de mise à jour (ou cible = baseline).
-   - La vérification forward cumule trois rôles : test de **causalité** (l'action générée cause-t-elle le soulagement ?), test d'**atteignabilité** (subsume tout test de support), et **découverte gracieuse du dépassement** (mieux que demandé = gardé).
-
-4. **Ce qui ne change pas :**
-   - Réveil, latent, KV-cache, imagination : **mode causal uniquement**. Le masque est un argument d'appel, le wiring du réveil est intact.
-   - Évaluation de surprise, filtrage, consolidation : inchangés.
-
-### Scalabilité
-
-- **O(1)** en taille de dataset et en longueur de séquence : aucun scan de voisins, aucune lecture des séquences à la génération.
-- Complément optionnel : quantiles globaux d'EOS maintenus en streaming (mise à jour O(1) à la consolidation) pour calibrer l'échelle de $\varepsilon$.
-
-### Risques & monitorage
-
-- **Capacité** : d_model 64, 3 couches — les deux objectifs se disputent le tronc. Si `last_wm_coreset_loss` stagne ou remonte, baisser le ratio lookahead.
-- **Interférence sur le latent** : le latent du réveil est produit causalement mais façonné aussi par les gradients lookahead — surveiller le comportement de la politique après sommeil.
-- **Perte lookahead stratifiée par quantile d'EOS** : si les requêtes favorables échouent nettement plus que les médianes, on interroge hors distribution.
-- **Fallback** : si la génération échoue (rejet systématique), retomber sur les candidats stochastiques actuels — garder le code en survivance derrière un drapeau.
-
----
-
-## 2. Mode « Exploratoire » dans l'IHM (Remplacement du dataset généré offline)
+## 1. Mode « Exploratoire » dans l'IHM (Remplacement du dataset généré offline)
 
 ### Rationale & Philosophie
 Le dataset synthétique généré hors-ligne (`dataset.py` / `--bootstrap-dataset`) est **retiré**. Cette auto-génération déconnectait l'apprentissage de la boucle vivante, du rendu visuel et de l'incarnation physique réelle de la créature.
@@ -92,7 +42,7 @@ Ce mode exploratoire interactif est une **solution transitoire** avant la mise e
 
 ---
 
-## 3. Comportement Instinctif / Curiosité (« Mode Jeu »)
+## 2. Comportement Instinctif / Curiosité (« Mode Jeu »)
 
 À terme, le mode exploratoire procédural cédera la place à une pulsion d'exploration intrinsèque :
 - Récompense interne basée sur l'erreur de prédiction ou la nouveauté du World Model (type *Curiosity-driven exploration / Random Network Distillation*).
@@ -100,7 +50,7 @@ Ce mode exploratoire interactif est une **solution transitoire** avant la mise e
 
 ---
 
-## 4. Externaliser les nombres magiques vers `config.toml`
+## 3. Externaliser les nombres magiques vers `config.toml`
 
 > **Statut : ouvert** — `wm_impact_floor` externalisé (plancher additif de la pondération d'impact, contraste ~3x). Le reste de la liste est à implémenter au fil de l'eau.
 
@@ -162,7 +112,7 @@ Les constantes de `brain.py` suivent le pattern `Brain.__init__` → `config.tom
 
 ---
 
-## 5. Métrique de santé : distance au geste démontré
+## 4. Métrique de santé : distance au geste démontré
 
 > **Statut : acté, non planifié** (déplacé depuis `PROPAL.md`, 2026-11-02).
 
@@ -171,3 +121,45 @@ Les constantes de `brain.py` suivent le pattern `Brain.__init__` → `config.tom
 **Spécification.** À chaque sommeil, sur les fenêtres du Coreset à relief > 0,05 : générer l'action hindsight sur le contexte s0..s4 avec l'EOS réalisé favorable, et logguer ‖a4_généré − a4_démo‖ moyen — dans les stats de cycle (`sleep_cycle_stats` + résumé console), éventuellement HUD. Cible ~0,05 (mesuré à ~0,20 sur les checkpoints de novembre 2026).
 
 **Usage.** C'est l'indicateur qui pilote les autres leviers du forçage (ε, fréquence lookahead) : si la distance descend, le WM sait refaire le geste ; si elle stagne malgré les leviers, le problème est en amont (couverture des données, pas de conditionnement).
+
+---
+
+## 5. Classification des séquences et déterminisme action→dénouement
+
+> **Statut : acté, non implémenté** (2026-11-10). Table exhaustive des cas : `classification_sequences.csv` (96 combinaisons, critères décrits en tête du fichier).
+
+**Classification.** Six axes indépendants par séquence ; les ensembles se définissent par croisement (ex. « améliorable ET déterministe ») :
+
+- `determinisme` — somme de deux scores (formule ci-dessous), « oui » si la somme dépasse un seuil à régler expérimentalement.
+- `signe_denouement` — `+` / `0` / `−` (relief_score signé).
+- `surprenant` — loss > seuil de surprise (`evaluate_sequences_surprise`).
+- `nouveau` — dans l'addendum ou dans le coreset depuis peu (compteur individuel d'apprentissage proche de 0).
+- `vicace` — vécue récemment ou remémorée et conservée.
+- `impact_fort` — |relief| au-dessus du plancher.
+- `ameliorable` — dénouement de la séquence sous le seuil moyen du corpus (indépendant du déterminisme).
+
+**Formule du déterminisme** (WM supposé bien entraîné, test par contre-factuel — pas de fouille du corpus) :
+
+- det(action→conséquence) = similarité(dénouement WM sur [contexte + action enregistrée], dénouement enregistré) / dispersion des dénouements prédits par le WM pour les actions déductibles du contexte (action enregistrée, action WM causale, action WM conditionnée EOS, action policy courante).
+- det(conséquence→action) = similarité(action WM conditionnée par l'EOS enregistré, action enregistrée) / dispersion des actions générées pour d'autres EOS (ex. EOS neutre 0,5).
+- Interprétation : conséquences similaires pour des actions différentes = causalité exogène ; dénouement bien prédit pour l'action enregistrée = déterminisme par l'action.
+- **Quand calculer le déterminisme** : une seule fois par cycle de sommeil (pas de recalcul entre deux epochs), et seulement une fois le WM bien entraîné — ex. quand la loss WM atteint un plateau. Avant ce plateau, pas de calcul de déterminisme.
+
+**Rejeté** : définir « même contexte » par clustering/saliency pondérée pour chercher des séquences voisines dans le corpus — la distance pondérée linéaire est un piège sur un problème non-linéaire (une variable peut compter selon la valeur des autres).
+
+**Conclusions par axe** (à traduire en pondérations d'apprentissage et critères d'éviction) :
+
+- non-déterministe → séquence proposée à l'éviction, d'autant plus qu'elle a déjà été souvent entraînée (compteur « nb de batchs WM » par séquence : **n'existe pas, à ajouter**, +1 à chaque batch coreset/addendum où la séquence est présente).
+- signe du dénouement : pas un critère — une séquence déterministe s'apprend quel que soit son dénouement.
+- surprenant : pour une séquence **ancienne** (compteur de batchs WM >= 1) la surprise basse (loss < surprise_floor) est un signe de déterminisme. Ce n'est pas un critère d'oubli sinon il ne restera que des séquences non-déterministes et donc non apprennable. Pour une séquence **neuve** (compteur de batchs WM = 0), une surprise basse (loss  < `surprise_floor`) signifie qu'on peut oublier la séquence.
+- vivacité : à combiner avec le déterminisme pour l'éviction.
+- impact : peut moduler le gain d'apprentissage, mais le dénouement neutre s'apprend aussi.
+- améliorable : ne pas apprendre de nouvelle action si l'action politique courante est suffisamment bonne — dénouement politique prédit ≥ dénouement enregistré de la séquence, ou ≥ quantile élevé du dénouement moyen du corpus — sinon on désapprend.
+
+---
+
+## 6. Proprioception de l'angle du tronc → exteroception (oreille interne)
+
+> **Statut : acté, non implémenté** (2026-11-12).
+
+L'angle du tronc (équilibre/verticalité) est actuellement classé en proprioception, mais sémantiquement c'est de l'**exteroception** : c'est l'oreille interne (vestibulaire), un capteur de position dans le monde, pas un retour moteur. À reclasser dans le layout des tokens (`tokenize.py`) lors d'un prochain changement de nomenclature.

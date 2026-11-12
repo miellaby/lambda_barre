@@ -48,6 +48,7 @@ class WMManager(WMTheater):
         self.phase_target = phase_target
         self.epoch = 0
         self.losses: list[tuple[int, float, bool]] = []  # (epoch, loss, lookahead)
+        self.force_amp = 0.5              # amplitude du forçage EOS (touches - / =)
         self.epf = 1                    # epochs per frame while training
         self.saved_flash: float | None = None
         self.footer_hints = ("Nav: [← / →]  |  [S] Sort  |  [L] Lookahead  |  [T] Train seq  |  "
@@ -152,6 +153,14 @@ class WMManager(WMTheater):
             elif ev.key == pygame.K_v:
                 self.save_wm()
                 return True
+            elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_COMMA):
+                self.force_amp = max(0.05, round(self.force_amp - 0.05, 2))
+                self.cache.clear()
+                return True
+            elif ev.key in (pygame.K_EQUALS, pygame.K_KP_PLUS, pygame.K_PERIOD):
+                self.force_amp = min(1.0, round(self.force_amp + 0.05, 2))
+                self.cache.clear()
+                return True
         return super().handle_event(ev)
 
     # --- drawing ------------------------------------------------------------
@@ -175,7 +184,7 @@ class WMManager(WMTheater):
         screen.blit(font_small.render(badge, FONT_AA, badge_c), (x, y0 + 6))
         lr = self.brain.opt_wm.param_groups[0]["lr"]
         screen.blit(font_tiny.render(
-            f"Epoch {self.epoch}   epf {self.epf}   lr {lr:.2e}", FONT_AA, TEXT_WHITE),
+            f"Epoch {self.epoch}   epf {self.epf}   lr {lr:.2e}   force_amp {self.force_amp:.2f} (-/=)", FONT_AA, TEXT_WHITE),
             (x, y0 + 24))
         if self.losses:
             _, loss, la = self.losses[-1]
@@ -230,7 +239,7 @@ def run_manager(buffer_path: str = "buf_ckpt.pt",
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 26, n_ctx: int = 4,
                 compile_wm: bool = False,
-                eos_force_eps_lo: float = 0.015, eos_force_eps_hi: float = 0.0375,
+                eos_force_amp_lo: float = 0.1, eos_force_amp_hi: float = 0.5,
                 eos_force_amplify: float = 1.0,
                 wm_impact_floor: float = 0.25,
                 lookahead_relief_mult: float = 1.0,
@@ -264,8 +273,8 @@ def run_manager(buffer_path: str = "buf_ckpt.pt",
                   seed=seed,
                   buffer_capacity=buffer_capacity,
                   buffer_pool_capacity=buffer_pool_capacity,
-                  eos_force_eps_lo=eos_force_eps_lo,
-                  eos_force_eps_hi=eos_force_eps_hi,
+                  eos_force_amp_lo=eos_force_amp_lo,
+                  eos_force_amp_hi=eos_force_amp_hi,
                   eos_force_amplify=eos_force_amplify,
                   wm_impact_floor=wm_impact_floor,
                   lookahead_relief_mult=lookahead_relief_mult,
@@ -341,7 +350,7 @@ def main() -> None:
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 26, "n_ctx": 4,
         "compile_wm": False,
-        "eos_force_eps_lo": 0.015, "eos_force_eps_hi": 0.0375,
+        "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
         "eos_force_amplify": 1.0,
         "wm_impact_floor": 0.25,
         "lookahead_relief_mult": 1.0,

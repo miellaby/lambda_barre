@@ -119,7 +119,7 @@ def build_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_
         elif k > n_ctx:
             w = w_act_post if tidx >= STATE_TOKENS else w_state_post
         else:
-            w = 1.0
+            w = 0.0                       # contexte : pas de loss (prédiction triviale)
         target_weight[p, :n] = w
 
     return target_valid, target_weight
@@ -167,6 +167,11 @@ def build_lookahead_mask(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAUL
     for k in range(seq_steps):
         mask[k * SALVE_TOKENS + _INTERO_IDX, ep] = False
     mask[ep, dp + 1: ep] = True
+    # Hypothèse anti-surapprentissage : la requête de décision n'ignore pas
+    # les actions du contexte — elle ne voit que les tokens états (sinon le
+    # WM recopie l'action enregistrée au lieu de conditionner sur l'EOS).
+    for k in range(n_ctx):
+        mask[dp, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
     return mask
 
 
@@ -183,6 +188,9 @@ def build_lookahead_gen_mask(ctx_len: int, device, decision_pos: int | None = No
     n_ctx = decision_pos // SALVE_TOKENS
     for k in range(n_ctx + 1):
         m[k * SALVE_TOKENS + _INTERO_IDX, ctx_len] = False
+    # même hypothèse qu'en training : la décision ne voit pas les actions du contexte
+    for k in range(n_ctx):
+        m[decision_pos, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
     return m
 
 
@@ -194,9 +202,9 @@ _EOS_IMAGINE = _LAYOUT_DEFAULT["n_imagine"]
 _EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
 _WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
 _WM_IMPACT_FLOOR = 0.25                     # additive floor on every sequence's cost impact (~3x impact/neutral contrast at relief 0.5)
-_WM_REWARD_BOOST = 16.0                                      # gradient boost on S10 reward slots and terminal EOS delta
+_WM_REWARD_BOOST = 2.0                                       # gradient boost on S10 reward slots and terminal EOS delta
 _WM_LOOKAHEAD_PERIOD = 2                                     # WM mask alternation: 1 lookahead pass every 2 (1:1 causal:lookahead)
-_EOS_FORCE_EPS = (0.015, 0.0375)                            # default hindsight forcing range, en unites de slot EOS (1 slot = 0.5 de delta de cout)
+_EOS_FORCE_AMP = (0.015, 0.0375)                            # default hindsight forcing range, en unites de slot EOS (1 slot = 0.5 de delta de cout)
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
 _EOS_DECAY = 0.9          # décroissance temporelle de l'écart au but dans l'EOS
@@ -304,8 +312,9 @@ def _eos_progres(c: list[float], n_ctx: int, decay: float, poids_chemin: float) 
 def _eos_slots_of_seq(seq: list, n_ctx: int = DEFAULT_N_CTX,
                       decay: float = _EOS_DECAY,
                       poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[float]:
-    """Les 6 slots du token EOS d'une séquence : progrès par canal (voir
-    _eos_progres). Slot 5 = inconfort (-confort). 0.5 = neutre."""
+    """Les 6 slots du token EOS d'une séquence, calculés comme au batch time
+    (_batch_tensors) : progrès par canal f = P - poids_chemin*A.
+    Slot 5 = inconfort (-confort). 0.5 = neutre."""
     L = len(seq)
     if L <= n_ctx + 1:
         return [0.5] * _EOS_NSLOTS
@@ -315,8 +324,14 @@ def _eos_slots_of_seq(seq: list, n_ctx: int = DEFAULT_N_CTX,
             row = [salve[_COST_IDX][SIG_OFFSET + j] for j in range(5)]
             row.append(-salve[_REWARD_IDX][SIG_OFFSET])    # inconfort = -confort
             c.append(row)
-        return [_eos_progres([c[k][j] for k in range(L)], n_ctx, decay, poids_chemin)
-                for j in range(_EOS_NSLOTS)]
+        P = [c[n_ctx][j] - c[-1][j] for j in range(_EOS_NSLOTS)]
+        out = []
+        for j in range(_EOS_NSLOTS):
+            diffs = [(c[k][j] - c[-1][j]) * decay ** (k - n_ctx - 1) for k in range(n_ctx + 1, L)]
+            A = sum(diffs)
+            r = P[j] - poids_chemin * A
+            out.append(0.5 + 0.5 * r / (1.0 + abs(r)))
+        return out
     except (IndexError, TypeError):
         return [0.5] * _EOS_NSLOTS
 
@@ -328,7 +343,8 @@ def relief_score(x, n_ctx: int = DEFAULT_N_CTX,
     """Score de soulagement : max flou pondéré des 6 slots du token EOS
     (poids de canaux normalisés, exposant p). Positif = gain. Accepte un token
     EOS (tenseur [..., 6]) ou une séquence (liste de salves) :
-    relief_score(sequence) = relief_score(eos(sequence))."""
+    relief_score(sequence) = relief_score(eos(sequence)), les slots EOS étant
+    calculés comme au batch time (_eos_slots_of_seq)."""
     if isinstance(x, torch.Tensor):
         slots = x
     else:
@@ -339,13 +355,11 @@ def relief_score(x, n_ctx: int = DEFAULT_N_CTX,
     return 2.0 * (mf - 0.5)
 
 
-def impact(sequences: list[list[list[float]]], n_ctx: int = DEFAULT_N_CTX,
-           decay: float = _EOS_DECAY, poids_chemin: float = _EOS_POIDS_CHEMIN) -> torch.Tensor:
+def impact(sequences, n_ctx: int = DEFAULT_N_CTX, decay: float = _EOS_DECAY, poids_chemin: float = _EOS_POIDS_CHEMIN) -> torch.Tensor:
     """Impact d'entraînement WM [B] = abs(relief_score) par séquence."""
     if not sequences:
         return torch.empty(0)
-    return torch.tensor([abs(relief_score(s, n_ctx=n_ctx, decay=decay,
-                                           poids_chemin=poids_chemin))
+    return torch.tensor([abs(relief_score(s))
                          for s in sequences], dtype=torch.float32)
 
 
@@ -367,10 +381,34 @@ def _sequence_signals_tensor(sequences: list[list[list[float]]],
     return torch.tensor(flat_list, dtype=torch.float32, device=device)
 
 
+def _latents_tensor(metas: list[dict], device: torch.device) -> torch.Tensor | None:
+    """Stack per-sequence latent vectors from metadata dicts into [N, d].
+    Returns None when no latent is available."""
+    latents = [m.get("latent") for m in metas]
+    if not latents or latents[0] is None:
+        return None
+    try:
+        return torch.tensor(latents, dtype=torch.float32, device=device)
+    except (TypeError, ValueError):
+        return None
+
+
+def latent_cosine_distances(latents: torch.Tensor) -> torch.Tensor:
+    """[N, d] → [N, N] cosine distance matrix (1 - cos)."""
+    n = latents.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    L = latents / n
+    return 1.0 - L @ L.T
+
+
 def pairwise_sequence_distances(sequences: list[list[list[float]]],
                                 device: torch.device = torch.device("cpu"),
-                                weights: torch.Tensor | None = None) -> torch.Tensor:
-    """Pairwise RMSE distance matrix [N, N] across all channels and tokens, optionally weighted by saliency."""
+                                weights: torch.Tensor | None = None,
+                                latents: torch.Tensor | None = None,
+                                latent_weight: float = 0.0) -> torch.Tensor:
+    """Pairwise RMSE distance matrix [N, N] across all channels and tokens,
+    optionally weighted by saliency. When ``latents`` [N, d] and
+    ``latent_weight`` > 0 are given, adds ``latent_weight`` * cosine distance
+    between sequence latents."""
     X = _sequence_signals_tensor(sequences, device)
     N, D = X.shape
     if N <= 1 or D == 0:
@@ -378,14 +416,22 @@ def pairwise_sequence_distances(sequences: list[list[list[float]]],
     if weights is not None:
         w = weights.to(device=device, dtype=X.dtype).view(1, D)
         X = X * torch.sqrt(w)
-    return torch.cdist(X, X) / (D ** 0.5)
+    Dm = torch.cdist(X, X) / (D ** 0.5)
+    if latents is not None and latent_weight > 0:
+        Dm = Dm + latent_weight * latent_cosine_distances(latents.to(device))
+    return Dm
 
 
 def cross_sequence_distances(seqs_a: list[list[list[float]]],
                              seqs_b: list[list[list[float]]],
                              device: torch.device = torch.device("cpu"),
-                             weights: torch.Tensor | None = None) -> torch.Tensor:
-    """Cross RMSE distance matrix [N_a, N_b] across all channels and tokens, optionally weighted by saliency."""
+                             weights: torch.Tensor | None = None,
+                             latents_a: torch.Tensor | None = None,
+                             latents_b: torch.Tensor | None = None,
+                             latent_weight: float = 0.0) -> torch.Tensor:
+    """Cross RMSE distance matrix [N_a, N_b] across all channels and tokens,
+    optionally weighted by saliency. When latents are given, adds the cosine
+    distance between the two latent sets."""
     Xa = _sequence_signals_tensor(seqs_a, device)
     Xb = _sequence_signals_tensor(seqs_b, device)
     if Xa.shape[0] == 0 or Xb.shape[0] == 0 or Xa.shape[1] == 0:
@@ -396,7 +442,14 @@ def cross_sequence_distances(seqs_a: list[list[list[float]]],
         w_sqrt = torch.sqrt(w)
         Xa = Xa * w_sqrt
         Xb = Xb * w_sqrt
-    return torch.cdist(Xa, Xb) / (D ** 0.5)
+    Dm = torch.cdist(Xa, Xb) / (D ** 0.5)
+    if latents_a is not None and latents_b is not None and latent_weight > 0:
+        na = latents_a.to(device).norm(dim=1, keepdim=True).clamp(min=1e-8)
+        nb = latents_b.to(device).norm(dim=1, keepdim=True).clamp(min=1e-8)
+        La = latents_a.to(device) / na
+        Lb = latents_b.to(device) / nb
+        Dm = Dm + latent_weight * (1.0 - La @ Lb.T)
+    return Dm
 
 
 def complete_linkage_clustering(dist_matrix: torch.Tensor, eps: float) -> list[list[int]]:
@@ -483,8 +536,9 @@ class ExperienceBuffer:
         self._current: list[list[float]] = []
         self._coreset: list[list[list[float]]] = []
         self._coreset_vivacity: list[float] = []
+        self._coreset_meta: list[dict] = []
         self._addendum: list[list[list[float]]] = []
-        self._addendum_meta: list[str] = []
+        self._addendum_meta: list[dict] = []
         self._rng = random.Random(seed)
 
     @property
@@ -496,6 +550,26 @@ class ExperienceBuffer:
     def _persistent_pool(self, val) -> None:
         self._coreset = list(val)[:self.pool_capacity]
         self._coreset_vivacity = [1.0] * len(self._coreset)
+        self._coreset_meta = [self._default_meta() for _ in self._coreset]
+        for m, v in zip(self._coreset_meta, self._coreset_vivacity):
+            m["vivacity"] = v
+
+    @staticmethod
+    def _default_meta(origin: str = "wake") -> dict:
+        """Default per-sequence metadata dict. All scores start unset (None)
+        and are filled during sleep passes (causal / lookahead / policy)."""
+        return {
+            "origin": origin,
+            "vivacity": 1.0,
+            "relief_score": None,
+            "learn_count": 0,
+            "causal_score": None,
+            "lookahead_score": None,
+            "dissonance": None,
+            "surprise": None,
+            "latent": None,
+            "pol_relief_score": None,
+        }
 
     @property
     def _valid_segments(self) -> list[list[list[float]]]:
@@ -574,11 +648,11 @@ class ExperienceBuffer:
                 continue
             for offset in range(0, n_windows, stride):
                 self._addendum.append(seg[offset : offset + self.seq_len])
-                self._addendum_meta.append("wake")
+                self._addendum_meta.append(self._default_meta("wake"))
                 added += 1
             if (n_windows - 1) % stride != 0:
                 self._addendum.append(seg[n_windows - 1 : n_windows - 1 + self.seq_len])
-                self._addendum_meta.append("wake")
+                self._addendum_meta.append(self._default_meta("wake"))
                 added += 1
         self._segments.clear()
         self._current.clear()
@@ -621,26 +695,41 @@ class ExperienceBuffer:
         prune_indices = set(order[:n_prune])
         new_coreset = []
         new_viv = []
+        new_meta = []
+        while len(self._coreset_meta) < len(self._coreset):
+            self._coreset_meta.append(self._default_meta("coreset"))
         for i, seq in enumerate(self._coreset):
             if i in prune_indices:
                 self._addendum.append(seq)
-                self._addendum_meta.append("coreset")
+                m = dict(self._coreset_meta[i])
+                m["origin"] = "coreset"
+                self._addendum_meta.append(m)
             else:
                 new_coreset.append(seq)
                 new_viv.append(self._coreset_vivacity[i])
+                new_meta.append(self._coreset_meta[i])
         self._coreset = new_coreset
         self._coreset_vivacity = new_viv
+        self._coreset_meta = new_meta
         return n_prune
 
     def deduplicate_addendum(self, eps: float = 0.04,
-                             weights: torch.Tensor | None = None) -> int:
+                             weights: torch.Tensor | None = None,
+                             latent_weight: float = 1.0) -> int:
         """Intra-Addendum deduplication via complete linkage clustering on RMSE distances.
         Groups sequences at distance <= eps across all channels and tokens, and keeps only the medoid of each group.
-        Optionally uses saliency feature weights.
+        Optionally uses saliency feature weights and adds cosine distance between latents.
         Returns the number of duplicate sequences removed."""
         if len(self._addendum) <= 1:
             return 0
-        D = pairwise_sequence_distances(self._addendum, weights=weights)
+        lat = _latents_tensor(self._addendum_meta, torch.device("cpu"))
+        D = pairwise_sequence_distances(self._addendum, weights=weights,
+                                        latents=lat, latent_weight=latent_weight)
+        if D.shape[0] > 1:
+            off = D[~torch.eye(D.shape[0], dtype=torch.bool, device=D.device)]
+            print(f"[dedup:intra] n={D.shape[0]} eps={eps:.3f} "
+                  f"dist min={off.min():.4f} med={off.median():.4f} max={off.max():.4f} "
+                  f"weights={'saliency' if weights is not None else 'none'} latent_w={latent_weight}")
         clusters = complete_linkage_clustering(D, eps=eps)
         medoid_indices = select_medoids(clusters, D)
         n_dropped = len(self._addendum) - len(medoid_indices)
@@ -651,7 +740,8 @@ class ExperienceBuffer:
         return n_dropped
 
     def deduplicate_against_coreset(self, eps: float = 0.04,
-                                    weights: torch.Tensor | None = None) -> dict:
+                                    weights: torch.Tensor | None = None,
+                                    latent_weight: float = 1.0) -> dict:
         """Cross-deduplicate Addendum against Coreset and refresh vivacity of existing memories.
 
         Sequences in Addendum that are within distance < eps of an existing Coreset memory
@@ -664,7 +754,11 @@ class ExperienceBuffer:
         while len(self._coreset_vivacity) < len(self._coreset):
             self._coreset_vivacity.append(1.0)
 
-        cross_D = cross_sequence_distances(self._addendum, self._coreset, weights=weights)
+        cross_D = cross_sequence_distances(
+            self._addendum, self._coreset, weights=weights,
+            latents_a=_latents_tensor(self._addendum_meta, torch.device("cpu")),
+            latents_b=_latents_tensor(self._coreset_meta, torch.device("cpu")),
+            latent_weight=latent_weight)
         min_dists, min_indices = torch.min(cross_D, dim=1)
 
         surviving = []
@@ -677,6 +771,8 @@ class ExperienceBuffer:
             idx_core = min_indices[i].item()
             if d_min < eps:
                 self._coreset_vivacity[idx_core] = 1.0
+                if idx_core < len(self._coreset_meta):
+                    self._coreset_meta[idx_core]["vivacity"] = 1.0
                 n_refreshed += 1
                 n_dropped += 1
             else:
@@ -684,7 +780,7 @@ class ExperienceBuffer:
                 if i < len(self._addendum_meta):
                     surviving_meta.append(self._addendum_meta[i])
                 else:
-                    surviving_meta.append("wake")
+                    surviving_meta.append(self._default_meta("wake"))
 
         self._addendum = surviving
         self._addendum_meta = surviving_meta
@@ -697,13 +793,16 @@ class ExperienceBuffer:
 
     def consolidate_addendum_into_coreset(self, eps: float = 0.04, decay: float = 0.01,
                                           dedup_intra: bool = True,
-                                          weights: torch.Tensor | None = None) -> dict:
+                                          weights: torch.Tensor | None = None,
+                                          evict: bool = True) -> dict:
         """Commit surviving Addendum sequences into Coreset with decay and eviction.
 
         If dedup_intra is True, removes redundant duplicates within Addendum.
         Deduplicates against Coreset if not already done, appends survivors,
-        applies memory decay across Coreset vivacities, and evicts lowest-vivacity
-        memories if exceeding pool_capacity.
+        applies memory decay across Coreset vivacities, and (when ``evict``)
+        evicts lowest-vivacity memories if exceeding pool_capacity. When called
+        from Brain.sleep, evict=False : l'éviction est faite par le tri
+        (Brain._evict_coreset_excess), pas ici.
         """
         n_intra_dropped = 0
         if dedup_intra and len(self._addendum) > 1:
@@ -715,23 +814,36 @@ class ExperienceBuffer:
 
         while len(self._coreset_vivacity) < len(self._coreset):
             self._coreset_vivacity.append(1.0)
+        while len(self._coreset_meta) < len(self._coreset):
+            self._coreset_meta.append(self._default_meta("coreset"))
 
         n_added = 0
-        for seq in self._addendum:
+        for i, seq in enumerate(self._addendum):
             self._coreset.append(seq)
             self._coreset_vivacity.append(1.0)
+            m = dict(self._addendum_meta[i]) if i < len(self._addendum_meta) else self._default_meta("coreset")
+            m["origin"] = "coreset"
+            m["vivacity"] = 1.0
+            self._coreset_meta.append(m)
             n_added += 1
 
         if decay > 0.0:
             self._coreset_vivacity = [max(0.0, v - decay) for v in self._coreset_vivacity]
+            for m, v in zip(self._coreset_meta, self._coreset_vivacity):
+                m["vivacity"] = v
 
+        # Eviction par vivacité uniquement en appel autonome (evict=True).
+        # Depuis Brain.sleep, evict=False : l'éviction est faite par le tri
+        # (Brain._evict_coreset_excess).
         n_evicted = 0
-        if len(self._coreset) > self.pool_capacity:
+        if evict and len(self._coreset) > self.pool_capacity:
             excess = len(self._coreset) - self.pool_capacity
-            paired = sorted(zip(self._coreset_vivacity, self._coreset), key=lambda x: x[0], reverse=True)
+            paired = sorted(zip(self._coreset_vivacity, self._coreset, self._coreset_meta),
+                            key=lambda x: x[0], reverse=True)
             kept = paired[:self.pool_capacity]
-            self._coreset_vivacity = [v for v, _ in kept]
-            self._coreset = [s for _, s in kept]
+            self._coreset_vivacity = [v for v, _, _ in kept]
+            self._coreset = [s for _, s, _ in kept]
+            self._coreset_meta = [m for _, _, m in kept]
             n_evicted = excess
 
         self._addendum.clear()
@@ -747,7 +859,7 @@ class ExperienceBuffer:
         }
 
     def filter_addendum(self, kept: list[list[list[float]]],
-                        kept_meta: list[str] | None = None) -> None:
+                        kept_meta: list[dict] | None = None) -> None:
         """Replace Addendum with only the retained sequences."""
         self._addendum = list(kept)
         if kept_meta is not None:
@@ -767,6 +879,8 @@ class ExperienceBuffer:
         n = len(self._addendum)
         self._coreset.extend(self._addendum)
         self._coreset_vivacity.extend([1.0] * n)
+        while len(self._coreset_meta) < len(self._coreset):
+            self._coreset_meta.append(self._default_meta("coreset"))
         self._addendum.clear()
         self._addendum_meta.clear()
         return n
@@ -787,6 +901,7 @@ class ExperienceBuffer:
         self.clear_journal()
         self._coreset.clear()
         self._coreset_vivacity.clear()
+        self._coreset_meta.clear()
         self._addendum.clear()
         self._addendum_meta.clear()
 
@@ -797,9 +912,10 @@ class ExperienceBuffer:
             "n_ctx": self.n_ctx,
             "coreset": list(self._coreset),
             "coreset_vivacity": list(self._coreset_vivacity),
+            "coreset_meta": [dict(m) for m in self._coreset_meta],
             "persistent_pool": list(self._coreset),
             "addendum": list(self._addendum),
-            "addendum_meta": list(self._addendum_meta),
+            "addendum_meta": [dict(m) for m in self._addendum_meta],
             "segments": list(self._segments),
             "current": self._current,
         }, path)
@@ -815,8 +931,15 @@ class ExperienceBuffer:
                 self._coreset_vivacity = [float(v) for v in viv]
             else:
                 self._coreset_vivacity = [1.0] * len(self._coreset)
+            cmeta = data.get("coreset_meta", None)
+            if cmeta is not None and len(cmeta) == len(self._coreset):
+                self._coreset_meta = [dict(m) for m in cmeta]
+            else:
+                self._coreset_meta = [self._default_meta("coreset") for _ in self._coreset]
+            for m, v in zip(self._coreset_meta, self._coreset_vivacity):
+                m["vivacity"] = v
             self._addendum = list(data.get("addendum", []))
-            self._addendum_meta = list(data.get("addendum_meta", []))
+            self._addendum_meta = [dict(m) for m in data.get("addendum_meta", [])]
             self._segments = deque(data.get("segments", []))
             self._current = list(data.get("current", []))
             return True
@@ -908,9 +1031,7 @@ class ExperienceBuffer:
             if len(seq) < self.seq_len:
                 relief = 0.0
             else:
-                relief = relief_score(seq, n_ctx=self.n_ctx,
-                                      decay=self.eos_decay,
-                                      poids_chemin=self.eos_poids_chemin)  # attrs du buffer
+                relief = relief_score(seq, n_ctx=self.n_ctx, decay=self.eos_decay, poids_chemin=self.eos_poids_chemin)
             relief_clamped = max(-1.0, min(1.0, relief))
             weights.append(math.exp(beta * relief_clamped))
 
@@ -932,7 +1053,7 @@ class Brain:
         brain.brain_tick(salve)       -> 5 consignes (WM forward + policy action)
         ... physics steps, sensors ...
         brain.record_tick(salve)      # at WM cadence: wake history + journal
-        brain.sleep()                 # on demand: offline training of both models
+        brain.sleep_cycle()                 # on demand: offline training of both models
     """
 
     def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 2e-4, act_std: float = 0.05,
@@ -944,8 +1065,8 @@ class Brain:
                  dim_ff: int = 384, dropout: float = 0.0,
                  pol_hidden: int = 256,
                  buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
-                 eos_force_eps_lo: float = _EOS_FORCE_EPS[0],
-                 eos_force_eps_hi: float = _EOS_FORCE_EPS[1],
+                 eos_force_amp_lo: float = _EOS_FORCE_AMP[0],
+                 eos_force_amp_hi: float = _EOS_FORCE_AMP[1],
                  eos_force_amplify: float = 1.0,
                  eos_force_amplify_threshold: float = 0.95,
                  wm_impact_floor: float = _WM_IMPACT_FLOOR,
@@ -1035,8 +1156,8 @@ class Brain:
         self._wm_loss_lookahead = (torch.compile(self._wm_loss_lookahead_impl, dynamic=False)
                                    if compile_wm else self._wm_loss_lookahead_impl)
         self.act_std = act_std
-        self.eos_force_eps_lo = eos_force_eps_lo
-        self.eos_force_eps_hi = eos_force_eps_hi
+        self.eos_force_amp_lo = eos_force_amp_lo
+        self.eos_force_amp_hi = eos_force_amp_hi
         self.eos_force_amplify = eos_force_amplify
         self.eos_force_amplify_threshold = eos_force_amplify_threshold
         self.wm_impact_floor = wm_impact_floor
@@ -1068,6 +1189,14 @@ class Brain:
         self.last_wm_coreset_loss = float("nan")
         self.last_wm_addendum_loss = float("nan")
         self.last_wm_lookahead_loss = float("nan")
+        self.wm_loss_before_sleep = float("nan")
+        self.wm_loss_ratio = float("nan")
+        self.wm_plateau = False
+        # Poids du min-flou de tri du Coreset (plateau WM) + exposant vivacité
+        self.tri_w_det = 1.0
+        self.tri_w_cons = 1.0
+        self.tri_w_viv = 1.0
+        self.tri_vivacity_pow = 1.0
         self.last_filter_stats: dict | None = None
         self.last_pol_loss = float("nan")
         self.last_pol_stats: dict | None = None
@@ -1075,6 +1204,10 @@ class Brain:
         self.sleep_cycle_stats: dict = {}
         self.sleep_wm_epochs = 0
         self.sleep_wm_step = 0
+        self.sleep_wm_batch = 0
+        self.sleep_wm_batches = 0
+        self.sleep_wm_n = 0
+        self._skip_phase = False       # set by UI (Échap) to abort the current sleep phase
         self.mode = "wake"
         # inference timing (exponential moving average, ms)
         self._wm_time = 0.0
@@ -1086,6 +1219,10 @@ class Brain:
         self._last_salve: list[list[float]] | None = None
         self._static_threshold = 6
         self._static_tol = 1e-4
+        # Décalage action/conséquence en mode brain-off : la paire enregistrée
+        # est (a_n ; s_{n-k}) au lieu de (a_n ; s_{n+1}). 0 = brain-on (k forcé à 0).
+        self.act_conseq_shift = 0
+        self._state_hist: list[list[list[float]]] = []
 
     # --- live loop -----------------------------------------------------------
     def _sync_device(self) -> None:
@@ -1181,6 +1318,16 @@ class Brain:
         """
         if hasattr(salve, "tolist"):
             salve = salve.tolist()
+
+        # Décalage action/conséquence (brain-off, k > 0) : la salve enregistrée
+        # garde l'action courante a_n mais l'état devient s_{n-k}.
+        if self.act_conseq_shift > 0:
+            self._state_hist.append(state_tokens(salve))
+            if len(self._state_hist) > self.act_conseq_shift + 1:
+                self._state_hist.pop(0)
+            if len(self._state_hist) > self.act_conseq_shift:
+                shifted = self._state_hist[-self.act_conseq_shift - 1]
+                salve = [list(t) for t in shifted] + [list(t) for t in action_tokens(salve)]
 
         if self._last_salve is None:
             moved = True
@@ -1351,10 +1498,7 @@ class Brain:
         causal pass), so the outcome-carrying sequences weigh more in the
         inversion's descent."""
         vals = self._batch_tensors(sequences)             # [B, L, 25]
-        impacts = impact(
-            sequences, n_ctx=self.n_ctx,
-            decay=self.eos_decay, poids_chemin=self.eos_poids_chemin
-        ).to(self.device)
+        impacts = impact(sequences, n_ctx=self.n_ctx, decay=self.eos_decay, poids_chemin=self.eos_poids_chemin).to(self.device)
         mult = self.lookahead_relief_mult if lookahead else 1.0
         weights = mult * impacts + self.wm_impact_floor
         self.last_wm_impact = (weights.sum() / len(sequences)).item()
@@ -1391,48 +1535,269 @@ class Brain:
             yield "wm", loss_val
         self.last_wm_loss = sum(losses) / len(losses) if losses else float("nan")
 
+    def _compute_sequence_metadata(self, batch_size: int = 16):
+        """Début de sommeil : pour chaque séquence Coreset/Addendum, calcule les
+        métadonnées par séquence (dict). Générateur : yield ``("meta", done, total)``
+        après chaque batch pour la progression de la modale de sommeil.
+          - relief_score      : relief de l'EOS enregistré
+          - causal_score      : cosinus(EOS causal prédit, EOS enregistré)
+          - lookahead_score   : cosinus(action lookahead, action enregistrée)
+          - dissonance        : 1 - cosinus(action politique, action enregistrée)
+          - pol_relief_score  : relief de l'EOS du rollout contexte + action politique
+          - latent            : latent intermédiaire (dernière position) de la
+                                passe causale sur toute la séquence
+        """
+        self.world.eval()
+        self.policy.eval()
+        device = self.device
+        ctx_len = self.decision_pos + 1
+        dp, ep = self.decision_pos, self.eos_pos
+
+        def _process(seqs, metas):
+            total = len(seqs)
+            done = 0
+            for i in range(0, len(seqs), batch_size):
+                chunk = seqs[i:i + batch_size]
+                mchunk = metas[i:i + batch_size]
+                if not chunk:
+                    continue
+                B = len(chunk)
+                vals = self._batch_tensors(chunk)                       # [B, L, 25]
+                with torch.inference_mode():
+                    # 1. Passe causale sur toute la séquence
+                    pred_full = self.world(vals, attn_mask=self.mask)
+                    latent_seq = self.latent_norm(self.world.last_latent().detach())  # [B, d]
+                    eos_pred = pred_full[:, ep, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]  # [B, 6]
+                    eos_rec = vals[:, ep, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]        # [B, 6]
+
+                    # 2. Passe causale sur le contexte seul → latent politique
+                    ctx = vals[:, :ctx_len, :].clone()
+                    self.world(ctx, attn_mask=build_salve_mask(ctx_len, device))
+                    latent_ctx = self.latent_norm(self.world.last_latent().detach())
+
+                    # 3. Inférence politique
+                    scalars = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
+                    pol_in = torch.cat([scalars, latent_ctx], dim=1)
+                    pol_action = self.policy(pol_in)                     # [B, 5]
+                    a_rec = self._decode_action_batch(
+                        vals[:, dp + 1: dp + 1 + ACTION_TOKENS, :])      # [B, 5]
+
+                    # 4. Passe lookahead → action prédite à la decision_pos
+                    pred_look = self.world(vals, attn_mask=self.mask_lookahead, is_causal=False)
+                    a_look = self._decode_action_batch(
+                        pred_look[:, dp + 1: dp + 1 + ACTION_TOKENS, :])  # [B, 5]
+
+                    # 5. Rollout WM causal après l'action politique → EOS politique
+                    # (KV-cache : bien plus rapide que predict_next_state)
+                    pol_a_toks = self._encode_action_batch(pol_action)    # [B, 3, 25]
+                    base_cache = KVCache(len(self.world.transformer.layers),
+                                         self.world.d_model, B, device)
+                    self.world.cache_forward(ctx, base_cache)
+                    eos_pol, _ = self._rollout_candidate(
+                        ctx, base_cache, pol_action,
+                        ctx[:, -STATE_TOKENS:, :].tolist()[0] if False else ctx[:, -1, :].tolist(),
+                        self.n_imagine, ctx_len, build_salve_mask(ctx_len, device),
+                        use_kv_cache=True)
+                    eos_pol = eos_pol if eos_pol is not None else torch.full(
+                        (B, _EOS_NSLOTS), 0.5, device=device)
+
+                # cosinus
+                def _cos(a, b):
+                    na = a.norm(dim=1).clamp(min=1e-8)
+                    nb = b.norm(dim=1).clamp(min=1e-8)
+                    return (a * b).sum(dim=1) / (na * nb)
+
+                rel = relief_score(eos_rec.to(device))                # [B] — token EOS enregistré
+                pol_rel = relief_score(eos_pol)                       # [B]
+                causal = _cos(eos_pred, eos_rec)                      # [B]
+                look = _cos(a_look, a_rec)                            # [B]
+                diss = 1.0 - _cos(pol_action, a_rec)                  # [B]
+
+                for j in range(B):
+                    m = mchunk[j]
+                    m["relief_score"] = float(rel[j])
+                    m["pol_relief_score"] = float(pol_rel[j])
+                    m["causal_score"] = float(causal[j])
+                    m["lookahead_score"] = float(look[j])
+                    m["dissonance"] = float(diss[j])
+                    m["latent"] = latent_seq[j].detach().cpu().tolist()
+                done += len(chunk)
+                yield len(chunk), total
+
+        total_all = self.buffer.coreset_size + self.buffer.addendum_size
+        done_all = 0
+        for d, t in _process(self.buffer._coreset, self.buffer._coreset_meta):
+            done_all += d
+            yield "meta", done_all, total_all
+            if self._skip_phase:
+                self._skip_phase = False
+                return
+        for d, t in _process(self.buffer._addendum, self.buffer._addendum_meta):
+            done_all += d
+            yield "meta", done_all, total_all
+            if self._skip_phase:
+                self._skip_phase = False
+                return
+
+    def _evict_coreset_excess(self) -> int:
+        """Si le Coreset dépasse sa capacité de m séquences, supprime les m
+        premières du tri (sorted_coreset_indices). Retourne le nombre supprimé."""
+        buf = self.buffer
+        excess = len(buf._coreset) - buf.pool_capacity
+        if excess <= 0:
+            return 0
+        order = self.sorted_coreset_indices()
+        drop = set(order[:excess])
+        buf._coreset = [s for i, s in enumerate(buf._coreset) if i not in drop]
+        buf._coreset_vivacity = [v for i, v in enumerate(buf._coreset_vivacity) if i not in drop]
+        buf._coreset_meta = [m for i, m in enumerate(buf._coreset_meta) if i not in drop]
+        return excess
+
+    def sorted_coreset_indices(self, noise: float = 0.05) -> list[int]:
+        """Ordre de tri du Coreset. Si plateau WM (wm_plateau), tri ascendant par
+        min-flou pondéré des valeurs min-max normalisées de :
+          - déterminisme = (lookahead_score + causal_score) / 2, poids tri_w_det
+          - consonance   = 1 / (1 + dissonance),              poids tri_w_cons
+          - vivacité     = vivacity ** tri_vivacity_pow,       poids tri_w_viv
+        score = min(w_det*det, w_cons*cons, w_viv*viv). Un bruit uniforme
+        [0, noise] est ajouté au critère pour l'aléa.
+        Sans plateau, ordre naturel."""
+        n = self.buffer.coreset_size
+        if not self.wm_plateau or n == 0:
+            return list(range(n))
+        metas = self.buffer._coreset_meta
+        viv = self.buffer._coreset_vivacity
+        det, cons, viv_vals = [], [], []
+        for i in range(n):
+            m = metas[i] if i < len(metas) else {}
+            cs = m.get("causal_score") or 0.0
+            ls = m.get("lookahead_score") or 0.0
+            det.append((cs + ls) / 2.0)
+            d = m.get("dissonance") or 0.0
+            cons.append(1.0 / (1.0 + d))
+            viv_vals.append(viv[i] if i < len(viv) else 1.0)
+
+        def _norm(vals):
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-12:
+                return [0.5] * len(vals)
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        det_n = _norm(det)
+        cons_n = _norm(cons)
+        viv_n = _norm(viv_vals)
+        keys = []
+        for i in range(n):
+            k = min(self.tri_w_det * det_n[i],
+                    self.tri_w_cons * cons_n[i],
+                    self.tri_w_viv * viv_n[i] ** self.tri_vivacity_pow)
+            if noise > 0:
+                k += self.buffer._rng.uniform(0.0, noise)
+            keys.append(k)
+        return sorted(range(n), key=lambda i: keys[i])
+
     def train_wm_phase(self, epochs: int, batch: int,
                        target_loss: float | None = None,
                        source: str = "coreset",
                        fixed_seq=None,
                        buffer: "ExperienceBuffer | None" = None,
-                       label: str = "wm"):
-        """One World Model training phase — the exact loop of the sleep
-        Coreset/Addendum phases — as a generator yielding
+                       label: str = "wm",
+                       surprise_factor: float | None = None,
+                       surprise_floor: float = 0.001):
+        """One World Model training phase as a generator yielding
         ``(label, epoch, loss, lookahead)`` after each epoch.
 
-        Batches are sampled from ``buffer`` (default: own buffer), coreset or
-        addendum per ``source``. ``fixed_seq`` (a sequence, or a callable
-        returning the current one) is prepended to every batch — e.g. the
-        sequence currently selected in wm_manager. Stops when the epoch
-        quota is reached AND the loss is under ``target_loss`` (overtime
-        allowed, as in the sleep)."""
+        1 epoch = tout le dataset (coreset ou addendum) parcouru en batchs de
+        taille ``batch`` sans omission ni remise. Chaque batch subit une passe
+        causale ET une passe lookahead. Coreset : batchs dans l'ordre du tri
+        (sorted_coreset_indices). Addendum : shuffle à chaque epoch.
+        ``fixed_seq`` (a sequence, or a callable) is appended to every batch.
+        Chaque séquence voit son compteur ``learn_count`` incrémenté de 1 par
+        epoch, et sa métadonnée ``surprise`` mise à jour (loss causale du batch).
+        Oubli conditionné par la surprise : à la première epoch sur l'addendum,
+        les séquences neuves (learn_count == 0) sous le seuil de surprise sont
+        supprimées dès cette epoch."""
         buf = buffer if buffer is not None else self.buffer
-        if len(buf) < 1 and fixed_seq is None:
+        if source == "addendum":
+            seqs_all, metas_all = buf._addendum, buf._addendum_meta
+        else:
+            seqs_all, metas_all = buf._coreset, buf._coreset_meta
+        n = len(seqs_all)
+        if n == 0 and fixed_seq is None:
             return
         self.world.train()
         self.sleep_wm_epochs = epochs
+        if source == "coreset":
+            order = self.sorted_coreset_indices()
+        else:
+            order = list(range(n))
         ep = 0
         while True:
             ep += 1
             self.sleep_wm_step = ep
-            if ep > self.sleep_wm_epochs:
-                self.sleep_wm_epochs = ep
+            # sleep_wm_epochs reste le quota demandé (total fixe pour la barre
+            # de progression) ; en overtime, step dépasse total et la barre
+            # se cappe à 100%.
             if source == "addendum":
-                seqs = buf.sample_addendum(batch)
-            else:
-                seqs = buf.sample_coreset(batch)
-            if fixed_seq is not None:
-                fs = fixed_seq() if callable(fixed_seq) else fixed_seq
-                seqs = [fs] + list(seqs)
-            if not seqs:
+                self.buffer._rng.shuffle(order)
+            n_batches = max(1, (n + batch - 1) // batch)
+            self.sleep_wm_batches = n_batches
+            self.sleep_wm_n = n
+            self.sleep_wm_batch = 0
+            epoch_losses = []
+            skip = False
+            # 1 epoch = tout le dataset en batchs, sans omission ni remise.
+            # Un yield PAR BATCH : la modale progresse batch par batch.
+            for start in range(0, n, batch):
+                idxs = order[start:start + batch]
+                self.sleep_wm_batch = start // batch + 1
+                batch_seqs = [seqs_all[i] for i in idxs if i < len(seqs_all)]
+                if fixed_seq is not None:
+                    fs = fixed_seq() if callable(fixed_seq) else fixed_seq
+                    batch_seqs = [fs] + batch_seqs
+                if not batch_seqs:
+                    continue
+                # passe causale puis lookahead sur le même batch
+                loss_c = self._train_wm_batch(batch_seqs, lookahead=False)
+                self._train_wm_batch(batch_seqs, lookahead=True)
+                epoch_losses.append(loss_c)
+                for i in idxs:
+                    if i < len(metas_all):
+                        metas_all[i]["surprise"] = loss_c
+                yield label, ep, loss_c, True
+                if self._skip_phase:
+                    self._skip_phase = False
+                    skip = True
+                    break
+                # oubli surprise : 1ère epoch, addendum, séquences neuves,
+                # uniquement si plateau WM
+                if (source == "addendum" and ep == 1 and self.wm_plateau
+                        and surprise_factor is not None):
+                    base = self.last_wm_coreset_loss
+                    threshold = max(base * surprise_factor, surprise_floor) \
+                        if not math.isnan(base) else surprise_floor
+                    for i in idxs:
+                        if i < len(metas_all) and metas_all[i].get("learn_count", 0) == 0:
+                            s = metas_all[i].get("surprise")
+                            if s is not None and s < threshold:
+                                metas_all[i]["_drop"] = True
+            if skip:
                 break
-            # Alternated mask: 1 EOS-lookahead pass every _WM_LOOKAHEAD_PERIOD
-            lookahead = (ep % _WM_LOOKAHEAD_PERIOD == 0)
-            loss_val = self._train_wm_batch(seqs, lookahead=lookahead)
-            yield label, ep, loss_val, lookahead
+            # nettoyage des séquences marquées (1ère epoch addendum, plateau WM)
+            if source == "addendum" and ep == 1 and self.wm_plateau:
+                keep = [i for i in range(len(buf._addendum))
+                        if not (i < len(buf._addendum_meta) and buf._addendum_meta[i].get("_drop"))]
+                if len(keep) < len(buf._addendum):
+                    buf._addendum = [buf._addendum[i] for i in keep]
+                    buf._addendum_meta = [buf._addendum_meta[i] for i in keep]
+                    seqs_all, metas_all = buf._addendum, buf._addendum_meta
+                    n = len(seqs_all)
+                    order = list(range(n))
+            # compteur +1 par epoch pour les séquences restantes
+            for m in metas_all:
+                m["learn_count"] = m.get("learn_count", 0) + 1
+            loss_val = (sum(epoch_losses) / len(epoch_losses)) if epoch_losses else float("nan")
 
-            # Stopping criterion: must have completed the quota AND reached target loss
             quota_done = (ep >= epochs)
             target_done = (target_loss is None) or (loss_val <= target_loss)
             if quota_done and target_done:
@@ -1871,6 +2236,9 @@ class Brain:
                     batch, n_imagine, use_kv_cache, step, steps)
                 losses.append(loss)   # 0.0 when the batch was fully rejected
                 yield "pol", loss
+                if self._skip_phase:
+                    self._skip_phase = False
+                    break
         else:
             self.last_pol_stats = None
             for lbl, val in self._train_policy_candidates(
@@ -1878,6 +2246,9 @@ class Brain:
                     prioritize_relief, use_kv_cache, step_offset=0):
                 losses.append(val)
                 yield lbl, val
+                if self._skip_phase:
+                    self._skip_phase = False
+                    break
         self.last_pol_loss = sum(losses) / len(losses) if losses else float("nan")
 
     # --- sleep: hindsight (EOS-lookahead) policy supervision ------------------
@@ -1898,8 +2269,8 @@ class Brain:
 
     def _build_eos_token(self, eos_vals: torch.Tensor) -> torch.Tensor:
         """Terminal EOS token [B, 25] from normalized cost-aggregate slots in
-        [0, 1] (lower = better): [effort, douleur, courbature, instabilite,
-        vertige, confort]."""
+        [0, 1] (higher = better, 0.5 = neutre): [effort, douleur, courbature, instabilite,
+        vertige], slot 5 inconfort (lower = better)."""
         B = eos_vals.shape[0]
         tok = self._eos_tmpl.unsqueeze(0).expand(B, -1).clone()
         n = min(_EOS_NSLOTS, eos_vals.shape[1])
@@ -2030,6 +2401,9 @@ class Brain:
                 for k in range(n_dec + 1):
                     mask[k * SALVE_TOKENS + _INTERO_IDX, L1 - 1] = False  # action rows attend EOS
                 mask[L1 - 1, self.decision_pos + 1:L1 - 1] = True         # EOS sees context + itself
+                # la décision ne voit pas les actions du contexte (anti-copie)
+                for k in range(n_dec):
+                    mask[self.decision_pos, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
                 out = wm(x, attn_mask=mask, is_causal=False, salve_positions=sp)
                 sig = out[:, self.decision_pos + i, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
                 tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
@@ -2083,7 +2457,10 @@ class Brain:
 
         # 2-4. Shared hindsight lookahead pipeline — the verification rollout
         #      is skipped here: it serves nothing (unconditional distillation)
-        #      and is computed for sample 0 only below, for the Dream Theater
+        #      and is computed for sample 0 only below, for the Dream Theater.
+        # En training policy, la base du forçage reste eos_pi (le rollout
+        # baseline existe) ; eos_real n'est utilisé qu'en diagnostic WM-only
+        # (wm_manager / rollout_lookahead_from_sequence).
         hl = self._hindsight_lookahead_pipeline(
             ctx, policy_action, s_dec_toks, n_imagine,
             ctx_len, ctx_mask, base_cache=base_cache,
@@ -2180,12 +2557,13 @@ class Brain:
                                       ctx_len: int,
                                       ctx_mask: torch.Tensor,
                                       base_cache = None,
-                                      eps: torch.Tensor | float | None = None,
+                                      force_amp: torch.Tensor | float | None = None,
                                       use_kv_cache: bool = False,
-                                      verify: bool = True) -> dict:
+                                      verify: bool = True,
+                                      eos_base: torch.Tensor | None = None) -> dict:
         """Core hindsight lookahead pipeline (shared between policy training and diagnostics/theater):
         1. Baseline rollout of base_action -> (eos_pi, steps_pi)
-        2. Additive EOS forcing (neutrality floor, then fixed eps) -> eos_forced
+        2. Additive EOS forcing (neutrality floor, then fixed force_amp) -> eos_forced
         3. Hindsight action generation under forced EOS -> (gen_toks, gen_action)
         4. Causal verification rollout -> (eos_gen, steps_gen), display only —
            skipped entirely when ``verify=False`` (eos_gen/steps_gen are None).
@@ -2198,31 +2576,25 @@ class Brain:
             ctx, base_cache, base_action, s_dec_toks, n_imagine,
             ctx_len, ctx_mask, use_kv_cache)
 
-        # 2. additive forcing toward a more favorable denouement: clamp at
-        #    the neutrality floor (0.5), then push further by a fixed random
-        #    eps (worsening shrinks toward 0.5, recovery deepens below it) —
-        #    the amplitude does NOT scale with the predicted delta
-        if eps is None:
-            lo, hi = self.eos_force_eps_lo, self.eos_force_eps_hi
-            eps_val = torch.rand(B, _EOS_NSLOTS, device=device) * (hi - lo) + lo
-        elif isinstance(eps, (float, int)):
-            eps_val = torch.full((B, _EOS_NSLOTS), float(eps), device=device)
+        # 2. additive forcing toward a more favorable denouement: base = EOS réel
+        #    si fourni (wm_manager / diagnostic), sinon eos_pi (policy training).
+        #    Slots 0..4 (coûts) : PLUS HAUT = mieux (slot>0.5 = coûts qui baissent,
+        #    car slot = 0.5 + 0.5*(c[n_ctx]-c[-1]-poids*A)/(1+|...|)). On pousse
+        #    vers 1.0. Slot 5 (inconfort = -confort) : PLUS BAS = mieux, on pousse
+        #    vers 0.0. Floor neutre à 0.5 avant de pousser.
+        if force_amp is None:
+            lo, hi = self.eos_force_amp_lo, self.eos_force_amp_hi
+            force_val = torch.rand(B, _EOS_NSLOTS, device=device) * (hi - lo) + lo
+        elif isinstance(force_amp, (float, int)):
+            force_val = torch.full((B, _EOS_NSLOTS), float(force_amp), device=device)
         else:
-            eps_val = eps
-        # Neutrality floor: in case of future pain/worsening, clamp at least to neutral (0.5),
-        # then push further into recovery by eps.
-        # Slots 0..4 (costs): lower is better; neutral is 0.5.
-        # If eos_pi > 0.5 (worsening), cap at 0.5 then subtract eps.
-        # If eos_pi <= 0.5 (already recovery), subtract eps to deepen recovery.
-        eos_forced = eos_pi.clone()
-        eos_base_c = torch.minimum(eos_pi[:, :5], torch.tensor(0.5, device=device))
-        eos_forced[:, :5] = (eos_base_c - eps_val[:, :5]).clamp(0.0, 1.0)
-
-        # Slot 5 (reward/comfort): higher is better; neutral is 0.5.
-        # If eos_pi < 0.5 (drop in comfort), floor at 0.5 then add eps.
-        # If eos_pi >= 0.5 (already comfort gain), add eps to increase gain.
-        eos_base_r = torch.maximum(eos_pi[:, 5], torch.tensor(0.5, device=device))
-        eos_forced[:, 5] = (eos_base_r + eps_val[:, 5]).clamp(0.0, 1.0)
+            force_val = force_amp
+        base = eos_base if eos_base is not None else eos_pi
+        eos_forced = base.clone()
+        eos_base_c = torch.maximum(base[:, :5], torch.tensor(0.5, device=device))
+        eos_forced[:, :5] = (eos_base_c + force_val[:, :5]).clamp(0.0, 1.0)
+        eos_base_r = torch.minimum(base[:, 5], torch.tensor(0.5, device=device))
+        eos_forced[:, 5] = (eos_base_r - force_val[:, 5]).clamp(0.0, 1.0)
 
         # 3. hindsight generation of action under the forced EOS
         with torch.inference_mode():
@@ -2253,7 +2625,7 @@ class Brain:
         }
 
     def rollout_lookahead_from_sequence(self, seq: list[list[list[float]]],
-                                        eps: float | None = None) -> dict:
+                                        force_amp: float | None = None) -> dict:
         """Roll out counterfactual hindsight trajectory from sequence context s0..s4:
         1. Baseline rollout with recorded a4 -> eos_pi
         2. Reinforced EOS -> eos_better
@@ -2272,13 +2644,18 @@ class Brain:
                                   dtype=torch.float32, device=device).unsqueeze(0)
         recorded_a4 = self._decode_action_batch(rec_a_toks)
 
-        if eps is None:
-            eps = (self.eos_force_eps_lo + self.eos_force_eps_hi) / 2.0
+        if force_amp is None:
+            # forçage drastique par défaut (diagnostic / wm_manager) : slots
+            # coûts forcés à 0 (min(réel, 0.5) - 0.5 <= 0), confort à 1
+            force_amp = 0.5
+
+        # base du forçage = EOS réel de la séquence (disponible au batch time)
+        eos_real = vals[:, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]
 
         hl = self._hindsight_lookahead_pipeline(
             ctx, recorded_a4, s_dec_toks, self.n_imagine,
             ctx_len, ctx_mask, base_cache=None,
-            eps=eps, use_kv_cache=False)
+            force_amp=force_amp, use_kv_cache=False, eos_base=eos_real)
         hl["recorded_a4"] = recorded_a4
         hl["eos_better"] = hl["eos_forced"]
         return hl
@@ -2445,7 +2822,7 @@ class Brain:
             yield "pol", loss.item()
 
     # --- sleep entry point ---------------------------------------------------
-    def sleep(self, wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
+    def sleep_cycle(self, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
               wm_batch: int = 64,
               pol_steps: int = 64, pol_batch: int = 32,
               pol_n_imagine: int | None = None, clear_buffer: bool = True,
@@ -2481,6 +2858,9 @@ class Brain:
         self.mode = "sleep"
         self.last_dream_record = None
 
+        # Preserve WM loss before sleep to compute the post-sleep ratio
+        self.wm_loss_before_sleep = self.last_wm_loss
+
         # Coreset avant sommeil
         coreset_before = self.buffer.coreset_size
 
@@ -2498,15 +2878,26 @@ class Brain:
 
         addendum_initial = self.buffer.addendum_size
 
+        # Métadonnées par séquence (passes causale / lookahead / politique)
+        # calculées AVANT la dedup : la distance cosinus des latents EOS est
+        # utilisée par la dedup. Étape à part entière de la modale de sommeil.
+        for _, meta_done, meta_total in self._compute_sequence_metadata():
+            yield "meta", {"done": meta_done, "total": meta_total}
+
         # 3. Déduplication géométrique :
         # 3a. Intra-Addendum
+        # La distance cosinus des latents n'est utilisée que si le WM est jugé
+        # fiable (même condition que la salience) ; sinon distance euclidienne pure.
         saliency_weights = self.trusted_saliency_weights()
-        n_intra_dropped = self.buffer.deduplicate_addendum(eps=dedup_eps, weights=saliency_weights)
+        latent_w = 1.0 if saliency_weights is not None else 0.0
+        n_intra_dropped = self.buffer.deduplicate_addendum(eps=dedup_eps, weights=saliency_weights,
+                                                           latent_weight=latent_w)
         if n_intra_dropped > 0:
             print(f"[sleep:intra-addendum] {n_intra_dropped} redundant duplicates eliminated from Addendum.")
 
         # 3b. Addendum vs Coreset
-        cross_res = self.buffer.deduplicate_against_coreset(eps=dedup_eps, weights=saliency_weights)
+        cross_res = self.buffer.deduplicate_against_coreset(eps=dedup_eps, weights=saliency_weights,
+                                                            latent_weight=latent_w)
         n_cross_dropped = cross_res["dropped"]
         n_cross_refreshed = cross_res["refreshed"]
         if n_cross_dropped > 0:
@@ -2586,10 +2977,11 @@ class Brain:
                 dropped_surprises = []
 
                 for i, (seq, s) in enumerate(zip(self.buffer._addendum, surprises)):
-                    origin = self.buffer._addendum_meta[i] if i < len(self.buffer._addendum_meta) else "wake"
+                    m = self.buffer._addendum_meta[i] if i < len(self.buffer._addendum_meta) else self.buffer._default_meta()
+                    origin = m.get("origin", "wake")
                     if s >= threshold:
                         surviving.append(seq)
-                        surviving_meta.append(origin)
+                        surviving_meta.append(m)
                         kept_surprises.append(s)
                         if origin == "coreset":
                             core_kept += 1
@@ -2651,7 +3043,8 @@ class Brain:
         if self.buffer.addendum_size > 0 and (epochs_add > 0 or wm_target_loss is not None):
             for _, ep, loss_val, lookahead in self.train_wm_phase(
                     epochs_add, wm_batch, wm_target_loss,
-                    source="addendum", label="wm_addendum"):
+                    source="addendum", label="wm_addendum",
+                    surprise_factor=surprise_factor, surprise_floor=surprise_floor):
                 add_losses.append(loss_val)
                 if lookahead:
                     lookahead_losses.append(loss_val)
@@ -2664,6 +3057,13 @@ class Brain:
         self.last_wm_lookahead_loss = (sum(lookahead_losses) / len(lookahead_losses)) \
             if lookahead_losses else float("nan")
 
+        # Post-sleep WM loss ratio: > 0.95 means plateau
+        if not math.isnan(self.wm_loss_before_sleep) and self.wm_loss_before_sleep > 0:
+            self.wm_loss_ratio = self.last_wm_loss / self.wm_loss_before_sleep
+        else:
+            self.wm_loss_ratio = float("nan")
+        self.wm_plateau = (not math.isnan(self.wm_loss_ratio)) and self.wm_loss_ratio > 0.95
+
         # 7. Train Policy (hindsight supervision, candidate fallback)
         for label, value in self.train_policy(pol_steps, pol_batch,
                                               n_imagine=pol_n_imagine,
@@ -2674,8 +3074,11 @@ class Brain:
         # 8. Consolidate surviving Addendum into Coreset with memory decay.
         saliency_weights = self.trusted_saliency_weights()
         cons_stats = self.buffer.consolidate_addendum_into_coreset(
-            eps=dedup_eps, decay=0.01, dedup_intra=False, weights=saliency_weights
+            eps=dedup_eps, decay=0.01, dedup_intra=False, weights=saliency_weights,
+            evict=False
         )
+        n_evicted = self._evict_coreset_excess()
+        cons_stats["evicted"] = n_evicted
         cons_stats["refreshed"] = n_cross_refreshed + cons_stats.get("refreshed", 0)
         cons_stats["dedup_cross_dropped"] = n_cross_dropped
         cons_stats["dedup_intra_dropped"] = n_intra_dropped
@@ -2736,6 +3139,8 @@ class Brain:
         torch.save({
             "world": self.world.state_dict(),
             "opt_wm": self.opt_wm.state_dict(),
+            "wm_loss_ratio": self.wm_loss_ratio,
+            "wm_plateau": self.wm_plateau,
         }, wm_path)
         torch.save({
             "policy": self.policy.state_dict(),
@@ -2754,6 +3159,10 @@ class Brain:
                 self.world.load_state_dict(sd["world"])
             if "opt_wm" in sd:
                 self.opt_wm.load_state_dict(sd["opt_wm"])
+            if "wm_loss_ratio" in sd:
+                self.wm_loss_ratio = sd["wm_loss_ratio"]
+            if "wm_plateau" in sd:
+                self.wm_plateau = sd["wm_plateau"]
         if os.path.exists(pol_path):
             sd = torch.load(pol_path, map_location=self.device, weights_only=True)
             if "policy" in sd:
