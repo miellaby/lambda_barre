@@ -249,6 +249,9 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
+            elif ev.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(
+                    (max(640, ev.w), max(360, ev.h)), flags)
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break

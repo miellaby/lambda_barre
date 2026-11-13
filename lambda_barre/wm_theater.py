@@ -345,6 +345,12 @@ class WMTheater:
         self.cache.clear()
 
     def handle_event(self, ev: pygame.event.Event) -> bool:
+        if ev.type == pygame.VIDEORESIZE:
+            # la fenêtre est retaillée : le layout suit (la strip du manager
+            # reste collée en bas)
+            self.width = max(640, ev.w)
+            self.height = max(360, ev.h)
+            return True
         if ev.type == pygame.KEYDOWN:
             if ev.key == pygame.K_LEFT:
                 self.prev_seq()
@@ -508,6 +514,9 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
+            elif ev.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode(
+                    (max(640, ev.w), max(360, ev.h)), flags)
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break
