@@ -73,9 +73,10 @@ class WMTheaterRecord:
     seq_idx: int
     total_seqs: int
     vivacity: float
-    real_steps: list[DreamStep]
-    argmax_steps: list[DreamStep]
-    elected_steps: list[DreamStep]
+    real_steps: list[DreamStep]        # 11 salves temporelles s0..s10 (métriques)
+    disp_real: list[DreamStep]         # 13 vignettes : s0..s3, s4, EOS réel, s4+a4, s5..s10
+    disp_argmax: list[DreamStep]       # idem, EOS = µ (plus probable), a4 = a*_µ
+    disp_elected: list[DreamStep]      # idem, EOS = élu (optimal), a4 = a*_élu
     eos_observed: list[float]
     eos_argmax: list[float]
     eos_elected: list[float]
@@ -120,28 +121,35 @@ def _salve_costs(s_toks) -> list[float]:
     return [float(c) for c in s_toks[10][SIG_OFFSET:SIG_OFFSET + 5]]
 
 
-def _gen_to_steps(brain, gen, real_steps) -> tuple[list[DreamStep], list[float]]:
-    """Transforme une génération [contexte, dénouement] en rangée temporelle
-    s0..s_{seq_steps} : contexte réel, a* sur s_{n_ctx}, états générés
-    s_{n_ctx+1}..s_{seq_steps} (conséquence inversée réordonnée)."""
+def _eos_vignette(eos_slots, label: str) -> DreamStep:
+    """Vignette étoile du dénouement (entre s4 seule et s4+a4)."""
+    return DreamStep(state_tokens=[], action=None, eos_slots=list(eos_slots),
+                     label=label)
+
+
+def _gen_to_steps(brain, gen, real_steps, eos_slots) -> tuple[list[DreamStep], list[float]]:
+    """Transforme une génération [contexte, dénouement] en rangée d'affichage
+    de 13 vignettes : s0..s3+a, s4, EOS (étoile), s4+a*, s5^..s10^ (conséquence
+    inversée générée, réordonnée)."""
     conseq = gen["conseq"][0]                                   # [conseq_len, 25]
     a_star = brain._decode_action_batch(gen["action"])[0].tolist()
     n_im = brain.n_imagine
     blocks = [conseq[j * STATE_TOKENS:(j + 1) * STATE_TOKENS].tolist()
               for j in range(n_im)]                             # s_{seq_steps}..s_{n_ctx+1}
     blocks.reverse()                                            # ordre temporel s_{n_ctx+1}..s_{seq_steps}
-    steps: list[DreamStep] = []
-    for i in range(brain.n_ctx + 1):
-        if i == brain.n_ctx:
-            steps.append(DreamStep(state_tokens=real_steps[i].state_tokens,
-                                   action=a_star, step_cost=real_steps[i].step_cost,
-                                   label=f"s{i}+a*"))
-        else:
-            steps.append(real_steps[i])
+    n_ctx = brain.n_ctx
+    s4 = real_steps[n_ctx]
+    steps: list[DreamStep] = (
+        list(real_steps[:n_ctx])                                # s0..s3 (+a)
+        + [s4]                                                  # s4 seule
+        + [_eos_vignette(eos_slots, "EOS")]                     # vignette étoile
+        + [DreamStep(state_tokens=s4.state_tokens, action=a_star,
+                     step_cost=s4.step_cost, label=f"s{n_ctx}+a*")]  # s4+a*
+    )
     for j, s_toks in enumerate(blocks):
         steps.append(DreamStep(state_tokens=s_toks, action=None,
                                step_cost=salve_cost(s_toks) if len(s_toks) >= 13 else 0.0,
-                               label=f"s{brain.n_ctx + 1 + j}^"))
+                               label=f"s{n_ctx + 1 + j}^"))
     return steps, a_star
 
 
@@ -173,18 +181,27 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
     eos_elu, p_elu = brain.sample_denouements(ctx, eos_observed=eos_obs)  # dénouement élu
     gen_el = brain.generate_from_denouement(ctx, eos_elu)
 
-    argmax_steps, a_mu = _gen_to_steps(brain, gen_mu, real_steps)
-    elected_steps, a_el = _gen_to_steps(brain, gen_el, real_steps)
+    disp_argmax, a_mu = _gen_to_steps(brain, gen_mu, real_steps, mu[0].tolist())
+    disp_elected, a_el = _gen_to_steps(brain, gen_el, real_steps, eos_elu[0].tolist())
 
     a4_real = brain._decode_action_batch(
         vals[:, brain.action_pos:brain.action_pos + 3, :])[0].tolist()
+    # rangée réelle : s0..s3, s4, EOS réel (étoile), s4+a4, s5..s10
+    s4 = real_steps[brain.n_ctx]
+    disp_real = (list(real_steps[:brain.n_ctx]) + [s4]
+                 + [_eos_vignette(eos_obs[0].tolist(), "EOS réel")]
+                 + [DreamStep(state_tokens=s4.state_tokens, action=a4_real,
+                              step_cost=s4.step_cost, label=f"s{brain.n_ctx}+a4")]
+                 + list(real_steps[brain.n_ctx + 1:]))
 
-    # métriques sur la conséquence (s_{n_ctx+1}..s_{seq_steps})
+    # métriques sur la conséquence (s_{n_ctx+1}..s_{seq_steps}) : dans les rangées
+    # d'affichage, s_k siège à l'index k+2 (vignettes EOS et s4+a* insérées)
     p_errs, c_errs = [], []
     for k in range(brain.n_ctx + 1, brain.seq_steps + 1):
-        p_rmse = compute_posture_rmse(real_steps[k].state_tokens, elected_steps[k].state_tokens)
+        p_rmse = compute_posture_rmse(real_steps[k].state_tokens,
+                                      disp_elected[k + 2].state_tokens)
         c_rmse = compute_cost_rmse(_salve_costs(real_steps[k].state_tokens),
-                                   _salve_costs(elected_steps[k].state_tokens))
+                                   _salve_costs(disp_elected[k + 2].state_tokens))
         p_errs.append(p_rmse)
         c_errs.append(c_rmse)
 
@@ -193,8 +210,9 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
         total_seqs=total_seqs,
         vivacity=vivacity,
         real_steps=real_steps,
-        argmax_steps=argmax_steps,
-        elected_steps=elected_steps,
+        disp_real=disp_real,
+        disp_argmax=disp_argmax,
+        disp_elected=disp_elected,
         eos_observed=eos_obs[0].tolist(),
         eos_argmax=mu[0].tolist(),
         eos_elected=eos_elu[0].tolist(),
@@ -244,7 +262,7 @@ class WMTheater:
     def _content_size(self, rec: WMTheaterRecord | None) -> tuple[int, int]:
         if rec is None:
             return (0, 0)
-        n = len(rec.real_steps)
+        n = len(rec.disp_real)
         w = 16 + n * (self.thumb_w + self.gap)
         h = 3 * (16 + self.thumb_h + 8) + 4 + 3 * 14   # 3 rows + marge + lignes EOS
         return (w, h)
@@ -380,8 +398,8 @@ class WMTheater:
         """Dessine une rangée de mignatures à partir de (x0, y0) — coordonnées
         déjà translatées du scroll par l'appelant. Retourne le y de fin."""
         color = ROW_COLORS[key]
-        steps = {"real": rec.real_steps, "argmax": rec.argmax_steps,
-                 "elected": rec.elected_steps}[key]
+        steps = {"real": rec.disp_real, "argmax": rec.disp_argmax,
+                 "elected": rec.disp_elected}[key]
         screen.blit(font_small.render(ROW_LABELS[key], FONT_AA, color), (x0, y0))
         yy = y0 + 16
         x = x0

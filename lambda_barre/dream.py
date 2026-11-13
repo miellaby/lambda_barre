@@ -53,6 +53,7 @@ class DreamStep:
     action: list[float] | None        # [tf, df, tb, db, tq]
     step_cost: float = 0.0
     label: str = ""
+    eos_slots: list[float] | None = None  # vignette étoile du dénouement (6 slots)
 
 
 @dataclass
@@ -133,12 +134,56 @@ def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
     }
 
 
+def draw_eos_star(surface: pygame.Surface, rect: pygame.Rect, slots: list[float],
+                  font_small: pygame.font.Font,
+                  color: tuple[int, int, int] = (255, 210, 70),
+                  label: str = "EOS") -> None:
+    """Vignette étoile (radar) d'un dénouement : un rayon par slot de coût
+    (6 canaux), polygone reliant les bouts des rayons. 0.5 = neutre (hexagone
+    de référence gris)."""
+    bx, by, bw, bh = rect.x, rect.y, rect.width, rect.height
+    pygame.draw.rect(surface, CARD_BG, rect, border_radius=4)
+    pygame.draw.rect(surface, CARD_BORDER, rect, 1, border_radius=4)
+    cx, cy = bx + bw // 2, by + bh // 2 + 3
+    R = max(6, min(bw, bh) // 2 - 13)
+    n = len(slots)
+
+    def ray(i: int, frac: float) -> tuple[float, float]:
+        a = -math.pi / 2 + 2 * math.pi * i / n
+        r = max(0.0, min(1.0, frac)) * R
+        return (cx + r * math.cos(a), cy + r * math.sin(a))
+
+    # axes + hexagone de référence à 0.5 (neutre)
+    for i in range(n):
+        pygame.draw.line(surface, (60, 66, 82), (cx, cy), ray(i, 1.0), 1)
+    pygame.draw.polygon(surface, (45, 52, 68), [ray(i, 0.5) for i in range(n)], 1)
+    # polygone des slots (rempli translucide + contour)
+    pts = [ray(i, v) for i, v in enumerate(slots)]
+    if n >= 3:
+        tmp = pygame.Surface((bw, bh), pygame.SRCALPHA)
+        pygame.draw.polygon(tmp, (*color, 70),
+                            [(px - bx, py - by) for px, py in pts])
+        surface.blit(tmp, (bx, by))
+        pygame.draw.polygon(surface, color, pts, 1)
+        for i in range(n):
+            pygame.draw.circle(surface, color, (int(pts[i][0]), int(pts[i][1])), 1)
+    if label:
+        s = font_small.render(label, FONT_AA, TEXT_MUTED)
+        surface.blit(s, (bx + 4, by + 2))
+
+
 def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
                    font_small: pygame.font.Font, facing: int = 1,
                    cand_color: tuple[int, int, int] | None = None,
                    is_best: bool = False, is_winner: bool = False,
                    highlight_label: str = "") -> None:
-    """Render a single vignette/thumbnail of a state + action target."""
+    """Render a single vignette/thumbnail of a state + action target (or an
+    EOS star when ``step.eos_slots`` is set)."""
+    if step.eos_slots is not None:
+        draw_eos_star(surface, rect, step.eos_slots, font_small,
+                      color=cand_color or (255, 210, 70),
+                      label=step.label or highlight_label or "EOS")
+        return
     bx, by, bw, bh = rect.x, rect.y, rect.width, rect.height
 
     # Card background
