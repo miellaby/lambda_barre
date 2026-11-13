@@ -1208,7 +1208,7 @@ class Brain:
                 DreamTrajectory(candidate_idx=1, regime_idx=0, regime_name="Dénouement élu",
                                 steps=predicted_steps[n_ctx:], is_best_future=True,
                                 is_winner=True,
-                                eos_pred=float(relief_score(eos_elu, p=self.eos_max_p)[0])),
+                                eos_pred=eos_elu[0].tolist()),
             ],
             best_candidate_idx=1,
             best_future_indices=[0, 0],
