@@ -56,7 +56,7 @@ def compute_seq_layout(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_
     """Compute geometric positions and token dimensions derived from seq_steps and n_ctx."""
     assert n_ctx < seq_steps, f"n_ctx ({n_ctx}) must be strictly less than seq_steps ({seq_steps})"
     seq_len = seq_steps * SALVE_TOKENS + STATE_TOKENS
-    decision_pos = n_ctx * SALVE_TOKENS + _INTERO_IDX
+    decision_pos = n_ctx * SALVE_TOKENS + STATE_TOKENS   # premier token de a4 (la décision)
     eos_pos = seq_steps * SALVE_TOKENS + _INTERO_IDX
     n_imagine = seq_steps - n_ctx
     return {
@@ -141,7 +141,7 @@ def build_lookahead_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS,
     target_valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
     target_weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
     for i in range(ACTION_TOKENS):
-        p = decision_pos + i                    # row predicting consigne token i of a_{n_ctx}
+        p = decision_pos - 1 + i                # row predicting consigne token i of a_{n_ctx} (row p predicts token p+1)
         tidx = (p + 1) % SALVE_TOKENS
         n = _N_SIGNALS[tidx]
         target_valid[p, :n] = True
@@ -149,48 +149,27 @@ def build_lookahead_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS,
     return target_valid, target_weight
 
 
-def build_lookahead_mask(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX,
-                         device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Attention mask for training WM with hindsight on a sequence.
-
-    Every action position — the intero token of each salve, whose head
-    predicts the first consigne token a_k — additionally attends the terminal
-    EOS, so the inversion P(a_k | prefix, EOS) is learned at every alignment
-    of the window, not only the decision position. The EOS token itself
-    attends only the decision context (s0..s_{n_ctx}) and itself: it must
-    never see the recorded actions, whose keys would leak the answers to
-    the action queries.
-    """
-    layout = compute_seq_layout(seq_steps, n_ctx)
-    mask = build_salve_mask(layout["seq_len"], device).clone()
-    dp, ep = layout["decision_pos"], layout["eos_pos"]
-    for k in range(seq_steps):
-        mask[k * SALVE_TOKENS + _INTERO_IDX, ep] = False
-    mask[ep, dp + 1: ep] = True
-    # Hypothèse anti-surapprentissage : la requête de décision n'ignore pas
-    # les actions du contexte — elle ne voit que les tokens états (sinon le
-    # WM recopie l'action enregistrée au lieu de conditionner sur l'EOS).
-    for k in range(n_ctx):
-        mask[dp, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
-    return mask
-
-
 def build_lookahead_gen_mask(ctx_len: int, device, decision_pos: int | None = None) -> torch.Tensor:
-    """Attention mask for hindsight generation on a [context, EOS] input of
-    ctx_len + 1 tokens. Every action position of the context (the intero
-    token of each salve s0..s_{n_ctx}) attends the appended EOS token —
-    mirroring the multi-position training mask, so the compact generation is
-    mathematically identical to the training computation at the decision
-    query. If decision_pos is None, defaults to _DECISION_POS."""
+    """Lookahead attention mask on a compact ``[ctx_len tokens, EOS]`` input.
+
+    ``decision_pos`` is the position of a4's first token. The lookahead pass
+    exists only to generate a4, so only the 3 rows that predict a4
+    (decision_pos-1..decision_pos+1) attend the EOS token. The EOS attends
+    only the context (0..decision_pos-1) and itself — never a4. The a4 rows
+    attend no recorded context action (anti-copy). Used as-is for generation
+    ([context, EOS] + tokens generated so far) and for training
+    ([context, a4 teacher-forced, EOS]). If decision_pos is None, defaults
+    to _DECISION_POS."""
     if decision_pos is None:
         decision_pos = _DECISION_POS
+    dp = decision_pos
     m = build_salve_mask(ctx_len + 1, device).clone()
-    n_ctx = decision_pos // SALVE_TOKENS
-    for k in range(n_ctx + 1):
-        m[k * SALVE_TOKENS + _INTERO_IDX, ctx_len] = False
-    # même hypothèse qu'en training : la décision ne voit pas les actions du contexte
-    for k in range(n_ctx):
-        m[decision_pos, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
+    m[dp - 1:dp - 1 + ACTION_TOKENS, ctx_len] = False  # a4 rows attend the EOS
+    m[ctx_len, dp:ctx_len] = True                      # the EOS never sees a4
+    n_ctx = dp // SALVE_TOKENS
+    for k in range(n_ctx):                             # anti-copy: no context actions
+        m[dp - 1:dp + ACTION_TOKENS - 1,
+          k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
     return m
 
 
@@ -262,7 +241,8 @@ _ACT_TEMPLATE = torch.tensor(
 _target_valid, _target_weight = build_target_masks(DEFAULT_SEQ_STEPS)
 _target_valid_look, _target_weight_look = build_lookahead_target_masks(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX)
 _MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
-_MASK_LOOKAHEAD = build_lookahead_mask(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX, torch.device("cpu"))
+_LOOK_CTX_LEN = _DECISION_POS + ACTION_TOKENS        # contexte + a4 teacher-forcé, avant l'EOS
+_MASK_LOOKAHEAD = build_lookahead_gen_mask(_LOOK_CTX_LEN, torch.device("cpu"), _DECISION_POS)
 
 
 # Structural template of the terminal EOS token: intero modality, dedicated
@@ -1127,7 +1107,8 @@ class Brain:
             self._context_w = _CONTEXT_TIME_W_T.to(self.device)
         else:
             self.mask = build_salve_mask(self.seq_len, self.device)
-            self.mask_lookahead = build_lookahead_mask(seq_steps, n_ctx, self.device)
+            self.mask_lookahead = build_lookahead_gen_mask(self.decision_pos + ACTION_TOKENS,
+                                                           self.device, self.decision_pos)
             self.target_valid = t_valid.to(self.device)
             self.target_weight = t_weight.to(self.device)
             t_valid_look, t_weight_look = build_lookahead_target_masks(seq_steps, n_ctx)
@@ -1220,9 +1201,10 @@ class Brain:
         self._static_threshold = 6
         self._static_tol = 1e-4
         # Décalage action/conséquence en mode brain-off : la paire enregistrée
-        # est (a_n ; s_{n-k}) au lieu de (a_n ; s_{n+1}). 0 = brain-on (k forcé à 0).
+        # est (a_{n-k} ; s_n) au lieu de (a_n ; s_{n+1}) — l'action est retardée,
+        # l'état reste l'état courant. 0 = brain-on (k forcé à 0).
         self.act_conseq_shift = 0
-        self._state_hist: list[list[list[float]]] = []
+        self._act_hist: list[list[list[float]]] = []
 
     # --- live loop -----------------------------------------------------------
     def _sync_device(self) -> None:
@@ -1320,14 +1302,14 @@ class Brain:
             salve = salve.tolist()
 
         # Décalage action/conséquence (brain-off, k > 0) : la salve enregistrée
-        # garde l'action courante a_n mais l'état devient s_{n-k}.
+        # garde l'état courant s_n mais l'action devient a_{n-k}.
         if self.act_conseq_shift > 0:
-            self._state_hist.append(state_tokens(salve))
-            if len(self._state_hist) > self.act_conseq_shift + 1:
-                self._state_hist.pop(0)
-            if len(self._state_hist) > self.act_conseq_shift:
-                shifted = self._state_hist[-self.act_conseq_shift - 1]
-                salve = [list(t) for t in shifted] + [list(t) for t in action_tokens(salve)]
+            self._act_hist.append(action_tokens(salve))
+            if len(self._act_hist) > self.act_conseq_shift + 1:
+                self._act_hist.pop(0)
+            if len(self._act_hist) > self.act_conseq_shift:
+                shifted = self._act_hist[-self.act_conseq_shift - 1]
+                salve = [list(t) for t in state_tokens(salve)] + [list(t) for t in shifted]
 
         if self._last_salve is None:
             moved = True
@@ -1453,17 +1435,29 @@ class Brain:
         backward pass through this graph is also compiled (AOTAutograd)."""
         return self._wm_masked_mse(self.world(vals), vals, weights)
 
+    def _lookahead_input(self, vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compact lookahead input: [context, a4 teacher-forced, EOS token] —
+        the same shape as hindsight generation, so training and generation
+        share one mask. Returns (input [B, dp+4, 25], salve_positions [dp+4])."""
+        dp, ep = self.decision_pos, self.eos_pos
+        look = torch.cat([vals[:, :dp + ACTION_TOKENS, :], vals[:, ep:ep + 1, :]], dim=1)
+        sp = torch.arange(look.shape[1], device=look.device) // SALVE_TOKENS
+        sp[-1] = self.seq_steps
+        return look, sp
+
     def _wm_loss_lookahead_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """The lookahead pass trains the inversion only: the gap between the
-        estimated a_{n_ctx} and the observed one, under the EOS-lookahead
-        attention mask (the decision position attends the realized terminal
-        EOS). Nothing else is asked of this pass — state predictions, the
-        terminal reward slots and the other actions belong to the causal
-        pass. No forcing: each sequence carries its own realized EOS, good
-        or bad outcomes alike."""
-        return self._wm_masked_mse(
-            self.world(vals, attn_mask=self.mask_lookahead, is_causal=False),
-            vals, weights, weight=self.target_weight_look)
+        estimated a_{n_ctx} and the observed one, under the compact
+        EOS-lookahead mask on [context, a4, EOS] (only the a4 rows attend the
+        realized terminal EOS). Nothing else is asked of this pass — state
+        predictions, the terminal reward slots and the other actions belong
+        to the causal pass. No forcing: each sequence carries its own
+        realized EOS, good or bad outcomes alike."""
+        look, sp = self._lookahead_input(vals)
+        pred = self.world(look, attn_mask=self.mask_lookahead, is_causal=False,
+                          salve_positions=sp)
+        w = self.target_weight_look[:look.shape[1] - 1]
+        return self._wm_masked_mse(pred, look, weights, weight=w)
 
     def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor,
                        weights: torch.Tensor,
@@ -1550,7 +1544,7 @@ class Brain:
         self.world.eval()
         self.policy.eval()
         device = self.device
-        ctx_len = self.decision_pos + 1
+        ctx_len = self.decision_pos
         dp, ep = self.decision_pos, self.eos_pos
 
         def _process(seqs, metas):
@@ -1580,12 +1574,14 @@ class Brain:
                     pol_in = torch.cat([scalars, latent_ctx], dim=1)
                     pol_action = self.policy(pol_in)                     # [B, 5]
                     a_rec = self._decode_action_batch(
-                        vals[:, dp + 1: dp + 1 + ACTION_TOKENS, :])      # [B, 5]
+                        vals[:, dp: dp + ACTION_TOKENS, :])              # [B, 5]
 
                     # 4. Passe lookahead → action prédite à la decision_pos
-                    pred_look = self.world(vals, attn_mask=self.mask_lookahead, is_causal=False)
+                    look, sp = self._lookahead_input(vals)
+                    pred_look = self.world(look, attn_mask=self.mask_lookahead,
+                                           is_causal=False, salve_positions=sp)
                     a_look = self._decode_action_batch(
-                        pred_look[:, dp + 1: dp + 1 + ACTION_TOKENS, :])  # [B, 5]
+                        pred_look[:, dp: dp + ACTION_TOKENS, :])          # [B, 5]
 
                     # 5. Rollout WM causal après l'action politique → EOS politique
                     # (KV-cache : bien plus rapide que predict_next_state)
@@ -2376,17 +2372,17 @@ class Brain:
         """Generate the hindsight action conditioned on the forced terminal EOS.
 
         The EOS token stays in the running input (last position) while each
-        of the 3 consigne tokens is generated, and every action row (the
-        intero token of each context salve) attends it — the same mask
-        pattern as the training lookahead mask (build_lookahead_mask), so
-        generation matches what the WM was trained on. The KV-cache path is
-        deliberately not used: a cache built from the bare context cannot
-        give the context rows EOS attention at any layer.
+        of the 3 consigne tokens is generated, and only the 3 a4-predicting
+        rows (decision_pos..decision_pos+2) attend it — the same compact mask
+        as training (build_lookahead_gen_mask), so generation matches what
+        the WM was trained on. The KV-cache path is deliberately not used:
+        a cache built from the bare context cannot give the a4 rows EOS
+        attention at any layer.
         """
         B, ctx_len, _ = ctx.shape
         device = ctx.device
         wm = self.world
-        assert ctx_len == self.decision_pos + 1, f"hindsight generation expects the {self.decision_pos + 1}-token context"
+        assert ctx_len == self.decision_pos, f"hindsight generation expects the {self.decision_pos}-token context"
         n_dec = self.decision_pos // SALVE_TOKENS
         eos_tok = self._build_eos_token(eos_forced)                    # [B, 25]
         toks = []
@@ -2397,15 +2393,9 @@ class Brain:
                 x = torch.cat([curr, eos_tok.unsqueeze(1)], dim=1)     # [B, L+1, 25]
                 L1 = x.shape[1]
                 sp = torch.cat([curr_sp, torch.tensor([self.seq_steps], device=device)])
-                mask = build_salve_mask(L1, device).clone()
-                for k in range(n_dec + 1):
-                    mask[k * SALVE_TOKENS + _INTERO_IDX, L1 - 1] = False  # action rows attend EOS
-                mask[L1 - 1, self.decision_pos + 1:L1 - 1] = True         # EOS sees context + itself
-                # la décision ne voit pas les actions du contexte (anti-copie)
-                for k in range(n_dec):
-                    mask[self.decision_pos, k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
+                mask = build_lookahead_gen_mask(L1 - 1, device, self.decision_pos)
                 out = wm(x, attn_mask=mask, is_causal=False, salve_positions=sp)
-                sig = out[:, self.decision_pos + i, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
+                sig = out[:, self.decision_pos - 1 + i, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
                 tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
                 tok[:, SIG_OFFSET:] = sig
                 toks.append(tok)
@@ -2436,7 +2426,7 @@ class Brain:
         n_ctx = self.n_ctx
         ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
         vals = self._batch_tensors(sequences)
-        ctx = vals[:, :self.decision_pos + 1, :].clone()
+        ctx = vals[:, :self.decision_pos, :].clone()
         s_dec_toks = ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist()
         ctx_mask = build_salve_mask(ctx_len, device)
 
@@ -2636,7 +2626,7 @@ class Brain:
         vals = self._batch_tensors([seq])
         n_ctx = self.n_ctx
         ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
-        ctx = vals[:, :self.decision_pos + 1, :].clone()
+        ctx = vals[:, :self.decision_pos, :].clone()
         s_dec_toks = ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist()
         ctx_mask = build_salve_mask(ctx_len, device)
 

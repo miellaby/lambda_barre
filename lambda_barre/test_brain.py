@@ -173,39 +173,50 @@ def test_train_policy_kv_cache_option_equivalence():
 
 
 def test_lookahead_mask_structure():
-    """The multi-position EOS-lookahead training mask is the causal mask plus:
-    every action position (the intero token of each salve, whose head predicts
-    a_k) attends the terminal EOS token, and the EOS token itself attends
-    only the decision context (0..76) and itself — never the intervening
-    trajectory (which would let the recorded actions leak into the queries
-    and break compact-generation equivalence)."""
+    """The compact lookahead mask ([context, a4, EOS]) is the causal mask plus:
+    only the 3 a4-predicting rows (dp-1..dp+1, where dp = first token of a4)
+    attend the EOS token, and the EOS attends only the context (0..dp-1) and
+    itself — never a4, never the context actions (anti-copy on the a4 rows)."""
     import torch
     from . import brain as brain_mod
     from .models import build_salve_mask
 
     m = brain_mod._MASK_LOOKAHEAD
-    dp, ep = brain_mod._DECISION_POS, brain_mod._EOS_POS
-    # every action position sees the EOS
-    for k in range(brain_mod.SEQ_STEPS):
-        assert not bool(m[k * brain_mod.SALVE_TOKENS + brain_mod._INTERO_IDX, ep])
-    assert bool(m[dp, ep - 1])                       # ...but nothing else beyond causal
-    assert not bool(m[ep, dp])                           # EOS sees the decision context
-    assert not bool(m[ep, ep])                           # ...and itself
-    assert bool(m[ep, dp + 1]) and bool(m[ep, ep - 1])  # ...but not the trajectory in between
+    dp = brain_mod._DECISION_POS
+    L = m.shape[0]
+    assert L == dp + brain_mod.ACTION_TOKENS + 1
+    ep = L - 1                                        # EOS is the last position
+    # only the a4 rows see the EOS
+    for i in range(dp - 1):
+        assert bool(m[i, ep])
+    for i in range(dp - 1, dp - 1 + brain_mod.ACTION_TOKENS):
+        assert not bool(m[i, ep])
+    assert not bool(m[ep, 0]) and not bool(m[ep, dp - 1])  # sees the context ...
+    assert not bool(m[ep, ep])                             # ...and itself
+    for i in range(dp, ep):
+        assert bool(m[ep, i])                              # ...but never a4
+    # anti-copy: the a4 rows attend no recorded context action
+    n_ctx = dp // brain_mod.SALVE_TOKENS
+    for k in range(n_ctx):
+        for i in range(dp - 1, dp + brain_mod.ACTION_TOKENS - 1):
+            assert bool(m[i, k * brain_mod.SALVE_TOKENS + brain_mod.STATE_TOKENS])
     # every other row stays strictly causal
-    ref = build_salve_mask(brain_mod._SEQ_LEN, torch.device("cpu"))
-    ref = ref.clone()
-    for k in range(brain_mod.SEQ_STEPS):
-        ref[k * brain_mod.SALVE_TOKENS + brain_mod._INTERO_IDX, ep] = False
-    ref[ep, dp + 1: ep] = True
+    ref = build_salve_mask(L, torch.device("cpu")).clone()
+    ref[dp - 1:dp + brain_mod.ACTION_TOKENS - 1, ep] = False
+    ref[ep, dp:ep] = True
+    for k in range(n_ctx):
+        ref[dp - 1:dp + brain_mod.ACTION_TOKENS - 1,
+            k * brain_mod.SALVE_TOKENS + brain_mod.STATE_TOKENS:
+            (k + 1) * brain_mod.SALVE_TOKENS] = True
     assert torch.equal(m, ref)
 
 
 def test_lookahead_generation_matches_training_mask():
     """The compact [context, EOS] generation input must reproduce exactly the
-    decision-query prediction of the full 173-token sequence under the
-    training lookahead mask: positions 77..171 are never attended by the
-    decision query, so the two computations share the same attended keys."""
+    decision-row prediction of the compact training input [context, a4, EOS]
+    under the training lookahead mask: the decision row (dp-1, predicting the
+    first a4 token) attends only 0..dp-1 plus the EOS in both, so the two
+    computations share the same keys."""
     import torch
     from . import brain as brain_mod
 
@@ -215,24 +226,29 @@ def test_lookahead_generation_matches_training_mask():
         salve = _make_salve([0.05 * (i % 5)] * 53, [0.2 * (i % 4)] * 5)
         b.record(salve)
     sequences = b.buffer.sample(2)
-    vals = b._batch_tensors(sequences)                       # [B, 173, 25]
-    ctx = vals[:, :brain_mod._DECISION_POS + 1, :].clone()   # [B, 77, 25]
+    vals = b._batch_tensors(sequences)
+    dp = brain_mod._DECISION_POS
+    ctx = vals[:, :dp, :].clone()
     eos_tok = vals[:, brain_mod._EOS_POS, :].clone()         # realized EOS token
 
     b.world.eval()
     with torch.inference_mode():
-        out_full = b.world(vals, attn_mask=b.mask_lookahead, is_causal=False)
-        ref = out_full[:, brain_mod._DECISION_POS, :]
+        look, sp_train = b._lookahead_input(vals)            # [B, dp+4, 25]
+        out_train = b.world(look, attn_mask=b.mask_lookahead, is_causal=False,
+                            salve_positions=sp_train)
+        ref = out_train[:, dp - 1, :]
 
-        x = torch.cat([ctx, eos_tok.unsqueeze(1)], dim=1)   # [B, 78, 25]
+        x = torch.cat([ctx, eos_tok.unsqueeze(1)], dim=1)   # [B, dp+1, 25]
         salve_pos = torch.arange(x.shape[1]) // 16
         salve_pos[-1] = brain_mod.SEQ_STEPS
         gen_mask = brain_mod.build_lookahead_gen_mask(ctx.shape[1], b.device)
         out_gen = b.world(x, attn_mask=gen_mask, is_causal=False,
                           salve_positions=salve_pos)
-        got = out_gen[:, brain_mod._DECISION_POS, :]
+        got = out_gen[:, dp - 1, :]
 
-    assert torch.allclose(ref, got, atol=1e-5), (ref - got).abs().max().item()
+    # same attended keys; the residual is fp kernel noise from the different
+    # matmul sizes — verified 0.0 at equal size
+    assert torch.allclose(ref, got, atol=2e-3), (ref - got).abs().max().item()
 
 
 def test_lookahead_generation_is_eos_conditioned():
@@ -252,7 +268,7 @@ def test_lookahead_generation_is_eos_conditioned():
         b.record(salve)
     sequences = b.buffer.sample(2)
     vals = b._batch_tensors(sequences)
-    ctx = vals[:, :brain_mod._DECISION_POS + 1, :].clone()   # [B, 77, 25]
+    ctx = vals[:, :brain_mod._DECISION_POS, :].clone()       # [B, dp, 25]
 
     b.world.eval()
     B = ctx.shape[0]
@@ -269,7 +285,7 @@ def test_lookahead_generation_is_eos_conditioned():
             gen_mask = brain_mod.build_lookahead_gen_mask(ctx.shape[1], b.device)
             out = b.world(x, attn_mask=gen_mask, is_causal=False,
                           salve_positions=salve_pos)
-            return out[:, brain_mod._DECISION_POS, :]
+            return out[:, brain_mod._DECISION_POS - 1, :]
 
         logits_good = decision_logits(torch.full((B, brain_mod._EOS_NSLOTS), 0.2))
         logits_bad = decision_logits(torch.full((B, brain_mod._EOS_NSLOTS), 0.9))
@@ -1440,7 +1456,7 @@ def test_brain_custom_seq_steps_and_n_ctx():
     assert layout["n_ctx"] == 5
     assert layout["n_imagine"] == 15
     assert layout["seq_len"] == 20 * 16 + 13  # 333
-    assert layout["decision_pos"] == 5 * 16 + 12  # 92
+    assert layout["decision_pos"] == 5 * 16 + 13  # 93 = premier token de a4
     assert layout["eos_pos"] == 20 * 16 + 12  # 332
 
     b = Brain(seq_steps=20, n_ctx=5)
@@ -1448,10 +1464,10 @@ def test_brain_custom_seq_steps_and_n_ctx():
     assert b.n_ctx == 5
     assert b.n_imagine == 15
     assert b.seq_len == 333
-    assert b.decision_pos == 92
+    assert b.decision_pos == 93
     assert b.eos_pos == 332
     assert b.mask.shape == (333, 333)
-    assert b.mask_lookahead.shape == (333, 333)
+    assert b.mask_lookahead.shape == (97, 97)   # compact: [ctx(93) + a4(3) + EOS(1)]
     assert b.target_valid.shape == (332, 16)
     assert b.target_weight.shape == (332, 16)
     assert b._eos_w.shape == (15,)

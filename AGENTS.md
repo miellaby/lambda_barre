@@ -54,6 +54,7 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 
 ## Rules for AI Agents
 
+- **Reload Intro Docs Before Coding**: Before any code change, re-read `README.md`, `DESIGN.md`, the latest `session_YYYY_MM_DD.md`, and **every entry in `ADL/`** (architecture decisions — currently ADR-0001 nomenclature; use its canonical terms). Never assert layout geometry (token positions, masks, who-predicts-what) from memory — cite the defining lines in `tokenize.py` / `brain.py` (`compute_seq_layout`, mask builders, `_wm_masked_mse`) and state whether an index is a row or a token position.
 - **No Premature Tests**: The baseline is that the tests run well. **No need to test suites before code changes.**
 - **No Unsolicited Numbers**: Unless ordering of information is crucial, **Avoid Numbered Lists**, **Chapter Numbers Are Bad**. Numbers are a mental burden with a maintenance cost. Avoid numbering as much as possible.
 - **Source Filename is enough when documenting** (Avoid Pathes and file:// Links)

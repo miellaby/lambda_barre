@@ -150,7 +150,7 @@ def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
         # the rollout itself stays teacher-forced with the recorded a4, but the
         # decision card displays the WM's own a4^.
         with torch.no_grad():
-            pred_a_dec = brain.world.predict_next_action(vals[:, :brain.decision_pos + 1, :])
+            pred_a_dec = brain.world.predict_next_action(vals[:, :brain.decision_pos, :])
         pred_a_dec_vals = brain._decode_action_batch(pred_a_dec)[0].tolist()
         pred_a_dec_toks = pred_a_dec[0].tolist()
         real_a_dec_toks = torch.tensor(seq[n_dec][STATE_TOKENS:SALVE_TOKENS],
