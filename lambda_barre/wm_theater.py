@@ -1,10 +1,12 @@
-"""World Model Theater: Visualizer and convergence diagnostic for the World Model.
+"""WM Theater (refonte) — surfer sur le Coreset et comparer l'enregistrement
+aux générations du World Model.
 
-Loads sequences from the Coreset (ExperienceBuffer) and compares the real
-transitions against the World Model's autoregressive rollout conditioned on s0..s4a4:
-- Row 1: Real (Coreset) sequence (s0 -> s10) with animal thumbnail and instantaneous costs
-- Row 2: World Model inference: context (s0..s4a4) + autoregressive predictions (s5^ -> s10^)
-  with predicted animal thumbnail, predicted instantaneous costs, and error metrics.
+Pour chaque séquence du Coreset, trois rangées :
+- RÉEL : la fenêtre temporelle reconstruite (s0..s10) ;
+- WM µ : génération depuis [contexte, dénouement le plus probable] (moyenne
+  conditionnelle prédite par le WM) ;
+- WM ÉLU : génération depuis [contexte, dénouement élu] (échantillonnage
+  top-K/top-p + élection f(probable, favorable) = argmax log p + w_fav·relief).
 
 Usage:
     python -m lambda_barre.wm_theater
@@ -16,7 +18,6 @@ import argparse
 import math
 import os
 import random
-import time
 from dataclasses import dataclass, field
 
 import pygame
@@ -24,7 +25,7 @@ import torch
 
 from . import body as B
 from . import config as CFG
-from .brain import Brain, ExperienceBuffer, relief_score, compute_context_time_weights
+from .brain import Brain, ExperienceBuffer, relief_score, sequence_to_window
 from .dream import (
     CARD_BG,
     CARD_BORDER,
@@ -39,36 +40,32 @@ from .dream import (
     decode_state_tokens,
     draw_thumbnail,
 )
-from .tokenize import SIG_OFFSET, SALVE_TOKENS, STATE_TOKENS, DenseEncoder, _signal_slot
+from .tokenize import SIG_OFFSET, STATE_TOKENS, salve_cost
 
-# Colors for instantaneous costs
 COST_COLORS = [
-    (245, 140, 50),   # EF: Effort (Orange)
-    (235, 75, 75),    # DO: Douleur (Red)
-    (185, 110, 245),  # CO: Courbature (Violet)
-    (240, 220, 60),   # IN: Instabilité (Yellow)
-    (60, 215, 215),   # VE: Vertige (Teal)
+    (245, 140, 50),   # EF
+    (235, 75, 75),    # DO
+    (185, 110, 245),  # CO
+    (240, 220, 60),   # IN
+    (60, 215, 215),   # VE
 ]
 COST_LABELS = ["EF", "DO", "CO", "IN", "VE"]
 
-CONTEXT_BG = (22, 25, 33)
-CONTEXT_BORDER = (45, 52, 68)
-PRED_BORDER = (100, 180, 255)
+ROW_COLORS = {
+    "real": (200, 200, 210),
+    "argmax": (110, 200, 255),
+    "elected": (255, 210, 70),
+}
+ROW_LABELS = {
+    "real": "RÉEL",
+    "argmax": "WM µ (dénouement le plus probable)",
+    "elected": "WM ÉLU (dénouement optimal)",
+}
+
 FONT_NAME = "dejavusansmono,ubuntumono,liberationmono,monospace"
 FONT_AA = False
 
-
-@dataclass
-class WMStepData:
-    step_idx: int
-    real_step: DreamStep
-    pred_step: DreamStep | None
-    real_costs: list[float]          # 5 floats [EF, DO, CO, IN, VE]
-    pred_costs: list[float] | None   # 5 floats [EF, DO, CO, IN, VE]
-    posture_rmse: float | None       # Physical posture RMSE
-    cost_rmse: float | None          # Immediate costs RMSE
-    real_salve: list[list[float]] = field(default_factory=list)
-    pred_salve: list[list[float]] | None = None
+SORT_MODES = ["coreset", "relief_desc", "relief_asc", "abs_desc"]
 
 
 @dataclass
@@ -76,23 +73,25 @@ class WMTheaterRecord:
     seq_idx: int
     total_seqs: int
     vivacity: float
-    steps: list[WMStepData]
-    overall_posture_rmse: float
-    overall_cost_rmse: float
-    real_relief: float = 0.0
-    pred_relief: float = 0.0
-    early_cost: float = 0.0
-    late_cost_real: float = 0.0
-    late_cost_pred: float = 0.0
-    # Hindsight (forced-EOS) comparison info — populated when lookahead=True
-    hindsight_info: dict | None = None
+    real_steps: list[DreamStep]
+    argmax_steps: list[DreamStep]
+    elected_steps: list[DreamStep]
+    eos_observed: list[float]
+    eos_argmax: list[float]
+    eos_elected: list[float]
+    p_elected: float
+    real_relief: float
+    argmax_relief: float
+    elected_relief: float
+    cos_argmax: float | None
+    cos_elected: float | None
+    rmse_posture_elected: float
+    rmse_cost_elected: float
 
 
-def compute_posture_rmse(real_toks: list[list[float]], pred_toks: list[list[float]]) -> float:
-    """Compute physical posture RMSE between real and predicted state tokens."""
+def compute_posture_rmse(real_toks, pred_toks) -> float:
     real_info = decode_state_tokens(real_toks, facing=1)
     pred_info = decode_state_tokens(pred_toks, facing=1)
-
     diffs = [
         real_info["tronc_angle"] - pred_info["tronc_angle"],
         real_info["tail_angle"] - pred_info["tail_angle"],
@@ -104,1245 +103,311 @@ def compute_posture_rmse(real_toks: list[list[float]], pred_toks: list[list[floa
     return math.sqrt(sum(d * d for d in diffs) / len(diffs))
 
 
-def compute_cost_rmse(real_costs: list[float], pred_costs: list[float]) -> float:
-    """Compute RMSE across the 5 instantaneous cost channels."""
+def compute_cost_rmse(real_costs, pred_costs) -> float:
     diffs = [r - p for r, p in zip(real_costs, pred_costs)]
     return math.sqrt(sum(d * d for d in diffs) / len(diffs))
 
 
-def rollout_sequence(brain: Brain, seq: list[list[list[float]]],
-                     seq_idx: int, total_seqs: int, vivacity: float,
-                     lookahead: bool = False, force_amp: float | None = None) -> WMTheaterRecord:
-    """Perform conditioning on s0..s4a4 and autoregressive rollout for s5..s10,
-    or counterfactual hindsight imagination under forced terminal EOS when lookahead=True."""
-    device = brain.device
-    num_salves = len(seq)
-    steps: list[WMStepData] = []
-    hindsight_info: dict | None = None
+def _cos(a, b) -> float:
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na < 1e-12 or nb < 1e-12:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
-    # 1. Decode real steps and costs
-    real_steps: list[DreamStep] = []
-    real_costs_list: list[list[float]] = []
 
-    for i in range(num_salves):
-        s_toks = seq[i][:13]
-        costs = [float(c) for c in s_toks[10][SIG_OFFSET : SIG_OFFSET + 5]]
-        real_costs_list.append(costs)
+def _salve_costs(s_toks) -> list[float]:
+    return [float(c) for c in s_toks[10][SIG_OFFSET:SIG_OFFSET + 5]]
 
-        if i < num_salves - 1:
-            a_toks = torch.tensor(seq[i][13:16], dtype=torch.float32, device=device).unsqueeze(0)
-            a_vals = brain._decode_action_batch(a_toks)[0].tolist()
-            lbl = f"s{i}a"
+
+def _gen_to_steps(brain, gen, real_steps) -> tuple[list[DreamStep], list[float]]:
+    """Transforme une génération [contexte, dénouement] en rangée temporelle
+    s0..s_{seq_steps} : contexte réel, a* sur s_{n_ctx}, états générés
+    s_{n_ctx+1}..s_{seq_steps} (conséquence inversée réordonnée)."""
+    conseq = gen["conseq"][0]                                   # [conseq_len, 25]
+    a_star = brain._decode_action_batch(gen["action"])[0].tolist()
+    n_im = brain.n_imagine
+    blocks = [conseq[j * STATE_TOKENS:(j + 1) * STATE_TOKENS].tolist()
+              for j in range(n_im)]                             # s_{seq_steps}..s_{n_ctx+1}
+    blocks.reverse()                                            # ordre temporel s_{n_ctx+1}..s_{seq_steps}
+    steps: list[DreamStep] = []
+    for i in range(brain.n_ctx + 1):
+        if i == brain.n_ctx:
+            steps.append(DreamStep(state_tokens=real_steps[i].state_tokens,
+                                   action=a_star, step_cost=real_steps[i].step_cost,
+                                   label=f"s{i}+a*"))
         else:
-            a_vals = None
-            lbl = f"s{i} (EOS)"
+            steps.append(real_steps[i])
+    for j, s_toks in enumerate(blocks):
+        steps.append(DreamStep(state_tokens=s_toks, action=None,
+                               step_cost=salve_cost(s_toks) if len(s_toks) >= 13 else 0.0,
+                               label=f"s{brain.n_ctx + 1 + j}^"))
+    return steps, a_star
 
-        real_steps.append(DreamStep(state_tokens=s_toks, action=a_vals, label=lbl))
 
-    if not lookahead:
-        # Standard teacher-forced autoregressive rollout
-        vals = brain._batch_tensors([seq])  # [1, L, 25]
-        n_ctx = min(brain.n_ctx + 1, num_salves - 1)
-        ctx = vals[:, :n_ctx * 16, :].clone()
-        n_dec = brain.n_ctx
+@torch.inference_mode()
+def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: float) -> WMTheaterRecord:
+    """Construit les 3 rangées d'une séquence : réel, WM-µ, WM-élu."""
+    device = brain.device
+    window = sequence_to_window(seq, n_ctx=brain.n_ctx, seq_steps=brain.seq_steps)
 
-        # WM-predicted a_{n_dec} from the decision context alone (s0..s4, sans a4) :
-        # the rollout itself stays teacher-forced with the recorded a4, but the
-        # decision card displays the WM's own a4^.
-        with torch.no_grad():
-            pred_a_dec = brain.world.predict_next_action(vals[:, :brain.decision_pos, :])
-        pred_a_dec_vals = brain._decode_action_batch(pred_a_dec)[0].tolist()
-        pred_a_dec_toks = pred_a_dec[0].tolist()
-        real_a_dec_toks = torch.tensor(seq[n_dec][STATE_TOKENS:SALVE_TOKENS],
-                                       dtype=torch.float32, device=device).unsqueeze(0)
-        a_dec_mse = float(((pred_a_dec[:, :, SIG_OFFSET:]
-                            - real_a_dec_toks[:, :, SIG_OFFSET:]) ** 2).mean().item())
+    # rangée réelle
+    real_steps: list[DreamStep] = []
+    for i, salve in enumerate(window):
+        a = None
+        if i < len(window) - 1:
+            a_toks = torch.tensor([salve[STATE_TOKENS:]], dtype=torch.float32, device=device)
+            a_vals = brain._decode_action_batch(a_toks)[0].tolist()
+            if any(abs(v) > 1e-9 for v in a_vals):
+                a = a_vals
+        real_steps.append(DreamStep(state_tokens=[list(t) for t in salve[:STATE_TOKENS]],
+                                    action=a, step_cost=salve_cost(salve),
+                                    label=f"s{i}" + ("a" if a else "")))
 
-        # Context steps (0..n_ctx-1): real only, except the decision salve which
-        # also carries the WM-predicted action a_{n_dec}^
-        for i in range(n_ctx):
-            if i == n_dec:
-                steps.append(WMStepData(
-                    step_idx=i,
-                    real_step=real_steps[i],
-                    pred_step=DreamStep(state_tokens=real_steps[i].state_tokens,
-                                        action=pred_a_dec_vals, label=f"s{i}a^"),
-                    real_costs=real_costs_list[i],
-                    pred_costs=real_costs_list[i],
-                    posture_rmse=0.0,
-                    cost_rmse=a_dec_mse,
-                    real_salve=seq[i],
-                    pred_salve=seq[i][:STATE_TOKENS] + pred_a_dec_toks,
-                ))
-            else:
-                steps.append(WMStepData(
-                    step_idx=i,
-                    real_step=real_steps[i],
-                    pred_step=None,
-                    real_costs=real_costs_list[i],
-                    pred_costs=None,
-                    posture_rmse=None,
-                    cost_rmse=None,
-                    real_salve=seq[i],
-                    pred_salve=None,
-                ))
+    vals = brain._batch_tensors([seq])
+    ctx = vals[:, :brain.ctx_len]
+    eos_obs = vals[:, brain.eos_pos, SIG_OFFSET:SIG_OFFSET + 6]
 
-        pred_posture_errors = []
-        pred_cost_errors = []
+    mu = brain.predict_denouement(ctx)                          # dénouement le plus probable
+    gen_mu = brain.generate_from_denouement(ctx, mu)
+    eos_elu, p_elu = brain.sample_denouements(ctx, eos_observed=eos_obs)  # dénouement élu
+    gen_el = brain.generate_from_denouement(ctx, eos_elu)
 
-        with torch.no_grad():
-            for k in range(n_ctx, num_salves):
-                # Predict next 13 state tokens
-                pred_s = brain.world.predict_next_state(ctx)  # [1, 13, 25]
-                pred_s_toks = pred_s[0].tolist()
-                pred_costs = [float(c) for c in pred_s_toks[10][SIG_OFFSET : SIG_OFFSET + 5]]
+    argmax_steps, a_mu = _gen_to_steps(brain, gen_mu, real_steps)
+    elected_steps, a_el = _gen_to_steps(brain, gen_el, real_steps)
 
-                # Error metrics
-                p_rmse = compute_posture_rmse(real_steps[k].state_tokens, pred_s_toks)
-                c_rmse = compute_cost_rmse(real_costs_list[k], pred_costs)
-                pred_posture_errors.append(p_rmse)
-                pred_cost_errors.append(c_rmse)
+    a4_real = brain._decode_action_batch(
+        vals[:, brain.action_pos:brain.action_pos + 3, :])[0].tolist()
 
-                if k < num_salves - 1:
-                    # Use real action for next transition
-                    a_vals = real_steps[k].action
-                    pred_step = DreamStep(state_tokens=pred_s_toks, action=a_vals, label=f"s{k}^a")
-                    # Append predicted state and real action to context
-                    # Zero out Token 12 signal slots of intermediate predicted state to match training distribution
-                    pred_s_zeroed = pred_s.clone()
-                    pred_s_zeroed[:, 12, SIG_OFFSET:] = 0.0
-                    real_a_toks = vals[:, k * 16 + 13 : (k + 1) * 16, :]
-                    ctx = torch.cat([ctx, pred_s_zeroed, real_a_toks], dim=1)
-                    pred_salve_toks = pred_s_toks + seq[k][13:16]
-                else:
-                    pred_step = DreamStep(state_tokens=pred_s_toks, action=None, label=f"s{k}^ (EOS)")
-                    pred_salve_toks = pred_s_toks
-
-                steps.append(WMStepData(
-                    step_idx=k,
-                    real_step=real_steps[k],
-                    pred_step=pred_step,
-                    real_costs=real_costs_list[k],
-                    pred_costs=pred_costs,
-                    posture_rmse=p_rmse,
-                    cost_rmse=c_rmse,
-                    real_salve=seq[k],
-                    pred_salve=pred_salve_toks,
-                ))
-
-        avg_p_rmse = sum(pred_posture_errors) / max(1, len(pred_posture_errors))
-        avg_c_rmse = sum(pred_cost_errors) / max(1, len(pred_cost_errors))
-
-        # Denouement / Relief metrics
-        n_ctx_cutoff = n_ctx - 1
-        real_relief = relief_score(seq, n_ctx=n_ctx_cutoff)
-        pred_seq = [s.real_salve for s in steps[:n_ctx]] + [s.pred_salve for s in steps[n_ctx:]]
-        pred_relief = relief_score(pred_seq, n_ctx=n_ctx_cutoff)
-
-        early_weights = compute_context_time_weights(n_ctx)
-        early_cost = sum(w * sum(s.real_costs) for w, s in zip(early_weights, steps[:n_ctx]))
-        late_cost_real = sum(sum(s.real_costs) for s in steps[n_ctx:]) / max(1, len(steps) - n_ctx)
-        late_cost_pred = sum(sum(s.pred_costs or [0.0] * 5) for s in steps[n_ctx:]) / max(1, len(steps) - n_ctx)
-
-    else:
-        # Counterfactual lookahead imagination:
-        # 1. Baseline rollout with recorded a4 -> eos_pi
-        # 2. Forced favorable terminal EOS -> eos_better
-        # 3. Hindsight action a4* generated by WM conditioned on [ctx, eos_better]
-        # 4. Closed-loop rollout with Policy reaction for s5*..s10*
-        res = brain.rollout_lookahead_from_sequence(seq, force_amp=force_amp)
-        steps_gen = res["steps_gen"]
-        gen_toks = res["gen_toks"]
-        gen_action = res["gen_action"]
-
-        # Comparison info: baseline vs hindsight (forced-EOS) — score de
-        # soulagement (relief_score) lu sur le token EOS
-        relief_pi = float(relief_score(res["eos_pi"])[0].item())
-        relief_gen = float(relief_score(res["eos_gen"])[0].item())
-        hindsight_info = {
-            "relief_pi": relief_pi,
-            "relief_gen": relief_gen,
-            "delta_relief": relief_gen - relief_pi,
-            "eos_pi": res["eos_pi"][0].tolist(),
-            "eos_forced": res["eos_forced"][0].tolist(),
-            "eos_gen": res["eos_gen"][0].tolist(),
-            "recorded_a4": res["recorded_a4"][0].tolist(),
-            "gen_a4": gen_action[0].tolist(),
-        }
-
-        n_dec = brain.n_ctx  # decision state index (s4), context is s0..s4
-
-        # Steps 0..n_dec-1: pure context
-        for i in range(n_dec):
-            steps.append(WMStepData(
-                step_idx=i,
-                real_step=real_steps[i],
-                pred_step=None,
-                real_costs=real_costs_list[i],
-                pred_costs=None,
-                posture_rmse=None,
-                cost_rmse=None,
-                real_salve=seq[i],
-                pred_salve=None,
-            ))
-
-        # Step n_dec: context state s4 with lookahead generated hindsight action a4*
-        a4_star_action = gen_action[0].tolist()
-        a4_star_toks = gen_toks[0].tolist()
-        pred_salve_dec = seq[n_dec][:13] + a4_star_toks
-        pred_step_dec = DreamStep(state_tokens=real_steps[n_dec].state_tokens,
-                                  action=a4_star_action,
-                                  label=f"s{n_dec}a*")
-        recorded_a_dec = torch.tensor(seq[n_dec][STATE_TOKENS:SALVE_TOKENS],
-                                      dtype=torch.float32, device=device).unsqueeze(0)
-        a_star_mse = float(((gen_toks[:, :, SIG_OFFSET:]
-                             - recorded_a_dec[:, :, SIG_OFFSET:]) ** 2).mean().item())
-        steps.append(WMStepData(
-            step_idx=n_dec,
-            real_step=real_steps[n_dec],
-            pred_step=pred_step_dec,
-            real_costs=real_costs_list[n_dec],
-            pred_costs=real_costs_list[n_dec],
-            posture_rmse=0.0,
-            cost_rmse=a_star_mse,
-            real_salve=seq[n_dec],
-            pred_salve=pred_salve_dec,
-        ))
-
-        # Steps n_dec+1..end: consequence rollout
-        pred_posture_errors = []
-        pred_cost_errors = []
-        for k in range(n_dec + 1, num_salves):
-            g_idx = k - n_dec
-            g_step = steps_gen[g_idx]
-            pred_s_toks = g_step.state_tokens
-            pred_costs = [float(c) for c in pred_s_toks[10][SIG_OFFSET : SIG_OFFSET + 5]]
-            p_rmse = compute_posture_rmse(real_steps[k].state_tokens, pred_s_toks)
-            c_rmse = compute_cost_rmse(real_costs_list[k], pred_costs)
-            pred_posture_errors.append(p_rmse)
-            pred_cost_errors.append(c_rmse)
-
-            if k < num_salves - 1:
-                act_vals = g_step.action
-                act_toks = brain._encode_action_batch(torch.tensor([act_vals], device=device))[0].tolist()
-                pred_salve_toks = pred_s_toks + act_toks
-                pred_step = DreamStep(state_tokens=pred_s_toks, action=act_vals, label=f"s{k}*a*")
-            else:
-                pred_salve_toks = pred_s_toks
-                pred_step = DreamStep(state_tokens=pred_s_toks, action=None, label=f"s{k}* (EOS)")
-
-            steps.append(WMStepData(
-                step_idx=k,
-                real_step=real_steps[k],
-                pred_step=pred_step,
-                real_costs=real_costs_list[k],
-                pred_costs=pred_costs,
-                posture_rmse=p_rmse,
-                cost_rmse=c_rmse,
-                real_salve=seq[k],
-                pred_salve=pred_salve_toks,
-            ))
-
-        avg_p_rmse = sum(pred_posture_errors) / max(1, len(pred_posture_errors))
-        avg_c_rmse = sum(pred_cost_errors) / max(1, len(pred_cost_errors))
-
-        n_ctx_cutoff = n_dec
-        real_relief = relief_score(seq, n_ctx=n_ctx_cutoff)
-        pred_seq = ([s.real_salve for s in steps[:n_dec]] + [steps[n_dec].pred_salve]
-                    + [s.pred_salve for s in steps[n_dec + 1:]])
-        pred_relief = relief_score(pred_seq, n_ctx=n_ctx_cutoff)
-
-        early_weights = compute_context_time_weights(n_dec + 1)
-        early_cost = sum(w * sum(s.real_costs) for w, s in zip(early_weights, steps[:n_dec + 1]))
-        late_cost_real = sum(sum(s.real_costs) for s in steps[n_dec + 1:]) / max(1, len(steps) - n_dec - 1)
-        late_cost_pred = sum(sum(s.pred_costs or [0.0] * 5) for s in steps[n_dec + 1:]) / max(1, len(steps) - n_dec - 1)
+    # métriques sur la conséquence (s_{n_ctx+1}..s_{seq_steps})
+    p_errs, c_errs = [], []
+    for k in range(brain.n_ctx + 1, brain.seq_steps + 1):
+        p_rmse = compute_posture_rmse(real_steps[k].state_tokens, elected_steps[k].state_tokens)
+        c_rmse = compute_cost_rmse(_salve_costs(real_steps[k].state_tokens),
+                                   _salve_costs(elected_steps[k].state_tokens))
+        p_errs.append(p_rmse)
+        c_errs.append(c_rmse)
 
     return WMTheaterRecord(
         seq_idx=seq_idx,
         total_seqs=total_seqs,
         vivacity=vivacity,
-        steps=steps,
-        overall_posture_rmse=avg_p_rmse,
-        overall_cost_rmse=avg_c_rmse,
-        real_relief=real_relief,
-        pred_relief=pred_relief,
-        early_cost=early_cost,
-        late_cost_real=late_cost_real,
-        late_cost_pred=late_cost_pred,
-        hindsight_info=hindsight_info,
+        real_steps=real_steps,
+        argmax_steps=argmax_steps,
+        elected_steps=elected_steps,
+        eos_observed=eos_obs[0].tolist(),
+        eos_argmax=mu[0].tolist(),
+        eos_elected=eos_elu[0].tolist(),
+        p_elected=float(p_elu[0]),
+        real_relief=float(relief_score(seq, eos_pos=brain.eos_pos)),
+        argmax_relief=float(relief_score(mu, p=brain.eos_max_p)[0]),
+        elected_relief=float(relief_score(eos_elu, p=brain.eos_max_p)[0]),
+        cos_argmax=_cos(a_mu, a4_real),
+        cos_elected=_cos(a_el, a4_real),
+        rmse_posture_elected=sum(p_errs) / max(1, len(p_errs)),
+        rmse_cost_elected=sum(c_errs) / max(1, len(c_errs)),
     )
 
 
-def draw_cost_histogram(surface: pygame.Surface, rect: pygame.Rect,
-                        costs: list[float], font_tiny: pygame.font.Font,
-                        title: str = "", is_predicted: bool = False) -> None:
-    """Render a mini histogram for the 5 instantaneous cost components."""
-    rx, ry, rw, rh = rect.x, rect.y, rect.width, rect.height
-
-    # Background card
-    bg = (20, 24, 32) if not is_predicted else (24, 28, 40)
-    border = CARD_BORDER if not is_predicted else (60, 80, 110)
-    pygame.draw.rect(surface, bg, rect, border_radius=3)
-    pygame.draw.rect(surface, border, rect, 1, border_radius=3)
-
-    # Header label
-    if title:
-        s_title = font_tiny.render(title, FONT_AA, TEXT_MUTED)
-        surface.blit(s_title, (rx + 4, ry + 2))
-
-    # Total cost sum
-    total_val = sum(costs)
-    s_tot = font_tiny.render(f"Σ {total_val:.2f}", FONT_AA, TEXT_WHITE if total_val > 0.05 else TEXT_MUTED)
-    surface.blit(s_tot, (rx + rw - s_tot.get_width() - 4, ry + 2))
-
-    # 5 Bars layout (bar width adapts to narrow cards)
-    n_bars = 5
-    bar_gap = 3
-    bar_w = max(3, min(11, (rw - 12 - (n_bars - 1) * bar_gap) // n_bars))
-    total_bars_w = n_bars * bar_w + (n_bars - 1) * bar_gap
-    start_x = rx + (rw - total_bars_w) // 2
-    base_y = ry + rh - 13
-    max_h = rh - 28
-
-    for i in range(n_bars):
-        bx = start_x + i * (bar_w + bar_gap)
-        val = max(0.0, min(1.0, costs[i] if i < len(costs) else 0.0))
-        bh = max(1, int(val * max_h))
-
-        # Empty bar background
-        pygame.draw.rect(surface, (36, 42, 56), (bx, base_y - max_h, bar_w, max_h), border_radius=1)
-
-        # Active filled bar
-        c = COST_COLORS[i]
-        if is_predicted:
-            # Slightly softer tint for predicted
-            c = tuple(min(255, int(v * 0.95)) for v in c)
-        pygame.draw.rect(surface, c, (bx, base_y - bh, bar_w, bh), border_radius=1)
-
-        # Bar label
-        lbl = COST_LABELS[i]
-        s_lbl = font_tiny.render(lbl, FONT_AA, TEXT_MUTED)
-        surface.blit(s_lbl, (bx + (bar_w - s_lbl.get_width()) // 2, base_y + 2))
-
-
-def draw_token_popin(surface: pygame.Surface, encoder: DenseEncoder,
-                     font_small: pygame.font.Font, font_tiny: pygame.font.Font,
-                     title: str, salve: list[list[float]],
-                     card_rect: pygame.Rect, screen_w: int, screen_h: int) -> None:
-    """Render an overlay pop-in tooltip displaying decoded tokens of the hovered salve."""
-    if not salve:
-        return
-
-    pop_w = 510
-    pop_h = 192
-
-    # Horizontal positioning: centered on card, clamped to screen margins
-    px = max(12, min(screen_w - pop_w - 12, card_rect.centerx - pop_w // 2))
-
-    # Vertical positioning: above or below card to avoid covering it
-    if card_rect.centery < screen_h // 2:
-        py = card_rect.bottom + 8
-        if py + pop_h > screen_h - 12:
-            py = max(12, card_rect.top - pop_h - 8)
-    else:
-        py = card_rect.top - pop_h - 8
-        if py < 12:
-            py = min(screen_h - pop_h - 12, card_rect.bottom + 8)
-
-    pop_rect = pygame.Rect(px, py, pop_w, pop_h)
-
-    # Dark translucent drop shadow
-    s_shadow = pygame.Surface((pop_w, pop_h), pygame.SRCALPHA)
-    s_shadow.fill((0, 0, 0, 160))
-    surface.blit(s_shadow, (px + 4, py + 4))
-
-    # Main pop-in container
-    pygame.draw.rect(surface, (18, 22, 32), pop_rect, border_radius=6)
-    pygame.draw.rect(surface, (90, 160, 255), pop_rect, 2, border_radius=6)
-
-    # Header bar
-    s_title = font_small.render(title, FONT_AA, (255, 215, 80))
-    surface.blit(s_title, (px + 10, py + 6))
-    s_cnt = font_tiny.render(f"{len(salve)} tokens", FONT_AA, TEXT_MUTED)
-    surface.blit(s_cnt, (px + pop_w - s_cnt.get_width() - 10, py + 8))
-
-    pygame.draw.line(surface, (45, 55, 75), (px + 8, py + 26), (px + pop_w - 8, py + 26), 1)
-
-    # Format tokens with compact Vision summary
-    raw_lines = encoder.decode(salve)
-    formatted: list[tuple[str, str, str]] = []
-    for i, line in enumerate(raw_lines):
-        parts = line.split(" ", 1)
-        tag = parts[0]
-        body = parts[1] if len(parts) > 1 else ""
-
-        if i == 4 and len(salve) > 4:
-            v_tok = salve[4]
-            vals = [_signal_slot(v_tok, k) for k in range(16)]
-            avg_v = sum(vals) / 16.0
-            body = f"Vis(16): moy={avg_v:.2f} [{min(vals):.2f}-{max(vals):.2f}]"
-
-        kind = "A" if tag.startswith("[A") else "S"
-        formatted.append((tag, kind, body))
-
-    # 2 columns layout (8 lines max per column)
-    col_w = (pop_w - 28) // 2
-    line_h = 18
-    base_y = py + 32
-
-    for idx, (tag, kind, body) in enumerate(formatted):
-        col = 0 if idx < 8 else 1
-        row = idx if idx < 8 else (idx - 8)
-        tx = px + 10 + col * (col_w + 8)
-        ty = base_y + row * line_h
-
-        tag_c = (255, 205, 90) if kind == "A" else (100, 200, 255)
-        s_tag = font_tiny.render(tag, FONT_AA, tag_c)
-        surface.blit(s_tag, (tx, ty))
-
-        s_body = font_tiny.render(body, FONT_AA, (215, 222, 235))
-        surface.blit(s_body, (tx + s_tag.get_width() + 4, ty))
-
-
 class WMTheater:
-    """Standalone interactive visualizer for World Model inference."""
+    """Coreset browser: 3 rows per sequence (real / WM argmax / WM elected)."""
 
     def __init__(self, brain: Brain, buffer: ExperienceBuffer,
-                 width: int = 1140, height: int = 700,
+                 width: int = 1600, height: int = 760,
                  initial_sort: str = "relief_desc"):
         self.brain = brain
         self.buffer = buffer
-        self.encoder = DenseEncoder()
         self.width = width
         self.height = height
-
-        self.num_seqs = len(self.buffer._coreset)
-        self.show_lookahead: bool = False
-        self.show_comparison: bool = False
-        self.cache: dict[tuple[int, bool], WMTheaterRecord] = {}
-
-        # Compute reliefs across all coreset sequences for instant sorting
-        n_ctx_cutoff = getattr(brain, "n_ctx", 4)
-        self.all_reliefs: list[float] = [
-            relief_score(seq, n_ctx=n_ctx_cutoff)
-            for seq in self.buffer._coreset
-        ]
-
-        # Sort mode: "relief_desc" (Recovery first), "relief_asc" (Falls first),
-        #            "abs_desc" (Extremes first), "coreset" (Raw order)
-        valid_sorts = ("relief_desc", "relief_asc", "abs_desc", "coreset")
-        self.sort_mode = initial_sort if initial_sort in valid_sorts else "relief_desc"
-        self.sorted_indices: list[int] = []
+        self.sort_mode = initial_sort if initial_sort in SORT_MODES else "coreset"
         self.sorted_idx = 0
-        self.seq_idx = 0
-
-        # Slider interaction with debouncing
-        self.slider_rect = pygame.Rect(98, 48, 310, 16)
-        self.slider_dragging = False
-        self.slider_preview_idx = 0
-        self.last_slider_motion_time = 0.0
-        self.pending_slider_idx: int | None = None
-
+        self.cache: dict[int, WMTheaterRecord] = {}
+        self.footer_hints = "Nav: [← / →]  |  [S] Sort  |  [R] Random  |  [Esc] Quit"
+        self.title_str = "WM THEATER"
         self._update_sorted_indices()
 
-        # Navigation buttons
-        self.btn_prev = pygame.Rect(16, 42, 76, 28)
-        self.btn_next = pygame.Rect(414, 42, 76, 28)
-        self.btn_lookahead = pygame.Rect(496, 42, 94, 28)
+    @property
+    def num_seqs(self) -> int:
+        return self.buffer.coreset_size
 
-        # Sort buttons
-        self.btn_sort_relief_desc = pygame.Rect(596, 42, 126, 28)
-        self.btn_sort_relief_asc = pygame.Rect(728, 42, 126, 28)
-        self.btn_sort_abs_desc = pygame.Rect(860, 42, 126, 28)
-        self.btn_sort_coreset = pygame.Rect(992, 42, 132, 28)
+    @property
+    def seq_idx(self) -> int:
+        if not self.order:
+            return 0
+        return self.order[self.sorted_idx % len(self.order)]
 
-        # Dimensions for columns (adapt to the number of salves per sequence)
-        n_cards = brain.seq_steps + 1
-        self.col_gap = 6
-        self.col_w = max(30, min(94, (self.width - 24 - (n_cards - 1) * self.col_gap) // n_cards))
-        self.margin_x = (self.width - (n_cards * self.col_w + (n_cards - 1) * self.col_gap)) // 2
-
-        # Footer hints (overridable by subclasses, e.g. wm_manager)
-        self.footer_hints = "Nav: [← / →]  |  [S] Sort  |  [L] Lookahead  |  Hover: Tokens  |  [Esc / Q] Quit"
-        self.footer_hints_la = "Nav: [← / →]  |  [S] Sort  |  [L] Rollout  |  [F] Compare  |  Hover: Tokens  |  [Esc / Q] Quit"
-        self.title_str = "WORLD MODEL THEATER"
-
-        # Precompute initial sequence
-        if self.sorted_indices:
-            self._load_record(self.sorted_indices[self.sorted_idx])
-
-    def toggle_lookahead(self) -> None:
-        """Toggle between teacher-forced autoregressive rollout and lookahead imagination."""
-        self.show_lookahead = not self.show_lookahead
-        self._load_record(self.seq_idx)
-
-    def toggle_comparison(self) -> None:
-        """Toggle the forced-EOS comparison overlay (only meaningful in lookahead mode)."""
-        if not self.show_lookahead:
-            return
-        self.show_comparison = not self.show_comparison
+    def _seq_relief(self, i: int) -> float:
+        return float(relief_score(self.buffer._coreset[i], eos_pos=self.brain.eos_pos))
 
     def _update_sorted_indices(self) -> None:
-        if self.sort_mode == "relief_desc":
-            self.sorted_indices = sorted(range(self.num_seqs), key=lambda i: self.all_reliefs[i], reverse=True)
-        elif self.sort_mode == "relief_asc":
-            self.sorted_indices = sorted(range(self.num_seqs), key=lambda i: self.all_reliefs[i])
-        elif self.sort_mode == "abs_desc":
-            self.sorted_indices = sorted(range(self.num_seqs), key=lambda i: abs(self.all_reliefs[i]), reverse=True)
-        else:  # "coreset"
-            self.sorted_indices = list(range(self.num_seqs))
-
-        if not self.sorted_indices:
-            self.sorted_idx = 0
-            self.seq_idx = 0
+        n = self.num_seqs
+        if self.sort_mode == "coreset":
+            self.order = list(range(n))
         else:
-            if self.seq_idx in self.sorted_indices:
-                self.sorted_idx = self.sorted_indices.index(self.seq_idx)
-            else:
-                self.sorted_idx = 0
-                self.seq_idx = self.sorted_indices[0]
-        self.slider_preview_idx = self.sorted_idx
+            rels = [self._seq_relief(i) for i in range(n)]
+            if self.sort_mode == "relief_desc":
+                self.order = sorted(range(n), key=lambda i: -rels[i])
+            elif self.sort_mode == "relief_asc":
+                self.order = sorted(range(n), key=lambda i: rels[i])
+            else:  # abs_desc
+                self.order = sorted(range(n), key=lambda i: -abs(rels[i]))
+        self.sorted_idx = min(self.sorted_idx, max(0, len(self.order) - 1))
 
     def set_sort(self, mode: str) -> None:
-        valid_sorts = ("relief_desc", "relief_asc", "abs_desc", "coreset")
-        if mode not in valid_sorts or mode == self.sort_mode:
-            return
         self.sort_mode = mode
+        self.sorted_idx = 0
         self._update_sorted_indices()
-        if self.sorted_indices:
-            self._load_record(self.sorted_indices[self.sorted_idx])
 
     def cycle_sort(self) -> None:
-        modes = ["relief_desc", "relief_asc", "abs_desc", "coreset"]
-        nxt = modes[(modes.index(self.sort_mode) + 1) % len(modes)]
-        self.set_sort(nxt)
-
-    def _load_record(self, idx: int) -> WMTheaterRecord:
-        idx = max(0, min(self.num_seqs - 1, idx))
-        cache_key = (idx, self.show_lookahead)
-        if cache_key not in self.cache:
-            seq = self.buffer._coreset[idx]
-            viv = (self.buffer._coreset_vivacity[idx]
-                   if idx < len(self.buffer._coreset_vivacity) else 1.0)
-            self.cache[cache_key] = rollout_sequence(
-                self.brain, seq, idx, self.num_seqs, viv, lookahead=self.show_lookahead, force_amp=getattr(self, "force_amp", None))
-        return self.cache[cache_key]
-
-    def set_sorted_idx(self, idx: int) -> None:
-        if not self.sorted_indices:
-            return
-        self.sorted_idx = max(0, min(len(self.sorted_indices) - 1, idx))
-        self.slider_preview_idx = self.sorted_idx
-        self.seq_idx = self.sorted_indices[self.sorted_idx]
-        self._load_record(self.seq_idx)
-        # trace console : séquence courante + coûts de chaque salve (à coller en session)
-        try:
-            from .tokenize import _COST_IDX, SIG_OFFSET
-            seq = self.buffer._coreset[self.seq_idx]
-            per_salve = [[round(float(s[_COST_IDX][SIG_OFFSET + j]), 3) for j in range(5)]
-                         for s in seq]
-            print(f"[trace] seq #{self.seq_idx} (pos {self.sorted_idx}/{self.num_seqs - 1}) "
-                  f"len={len(seq)} relief={self.all_reliefs[self.seq_idx]:+.4f}")
-            print(f"[trace] costs EF/DO/CO/IN/VE par salve: {per_salve}")
-        except Exception as e:
-            print(f"[trace] seq #{self.seq_idx} (erreur: {e})")
+        i = SORT_MODES.index(self.sort_mode)
+        self.set_sort(SORT_MODES[(i + 1) % len(SORT_MODES)])
 
     def set_seq_idx(self, idx: int) -> None:
-        if self.num_seqs <= 0:
+        if not self.order:
             return
-        idx = max(0, min(self.num_seqs - 1, idx))
-        if idx in self.sorted_indices:
-            self.set_sorted_idx(self.sorted_indices.index(idx))
-        else:
-            self.seq_idx = idx
-            self.set_sort("coreset")
-            self.set_sorted_idx(idx)
+        idx = max(0, min(idx, len(self.order) - 1))
+        self.sorted_idx = idx
+
+    def set_sorted_idx(self, idx: int) -> None:
+        self.set_seq_idx(idx)
 
     def prev_seq(self) -> None:
-        if not self.sorted_indices:
-            return
-        self.set_sorted_idx((self.sorted_idx - 1) % len(self.sorted_indices))
+        self.set_seq_idx(self.sorted_idx - 1)
 
     def next_seq(self) -> None:
-        if not self.sorted_indices:
-            return
-        self.set_sorted_idx((self.sorted_idx + 1) % len(self.sorted_indices))
+        self.set_seq_idx(self.sorted_idx + 1)
 
     def random_seq(self) -> None:
-        if self.sorted_indices:
-            self.set_sorted_idx(random.randint(0, len(self.sorted_indices) - 1))
+        if self.order:
+            self.sorted_idx = random.randrange(len(self.order))
+
+    def get_record(self, idx: int | None = None) -> WMTheaterRecord | None:
+        if self.num_seqs == 0:
+            return None
+        i = self.seq_idx if idx is None else idx
+        if i not in self.cache:
+            viv = (self.buffer._coreset_vivacity[i]
+                   if i < len(self.buffer._coreset_vivacity) else 1.0)
+            self.cache[i] = rollout_record(self.brain, self.buffer._coreset[i],
+                                           i, self.num_seqs, viv)
+            if len(self.cache) > 32:
+                self.cache.pop(next(iter(self.cache)))
+        return self.cache[i]
+
+    def invalidate_cache(self) -> None:
+        self.cache.clear()
 
     def handle_event(self, ev: pygame.event.Event) -> bool:
-        """Handle keyboard and mouse events. Returns True if handled."""
         if ev.type == pygame.KEYDOWN:
-            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
-                pygame.display.toggle_fullscreen()
-                return True
-            elif ev.key in (pygame.K_LEFT, pygame.K_a):
+            if ev.key == pygame.K_LEFT:
                 self.prev_seq()
                 return True
-            elif ev.key in (pygame.K_RIGHT, pygame.K_d):
+            elif ev.key == pygame.K_RIGHT:
                 self.next_seq()
                 return True
             elif ev.key == pygame.K_s:
                 self.cycle_sort()
                 return True
-            elif ev.key == pygame.K_l:
-                self.toggle_lookahead()
+            elif ev.key == pygame.K_r:
+                self.random_seq()
                 return True
-            elif ev.key == pygame.K_f:
-                self.toggle_comparison()
-                return True
-            elif ev.key == pygame.K_HOME:
-                self.set_sorted_idx(0)
-                return True
-            elif ev.key == pygame.K_END:
-                if self.sorted_indices:
-                    self.set_sorted_idx(len(self.sorted_indices) - 1)
-                return True
-
-        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            mx, my = ev.pos
-            if self.btn_prev.collidepoint(mx, my):
-                self.prev_seq()
-                return True
-            elif self.btn_next.collidepoint(mx, my):
-                self.next_seq()
-                return True
-            elif self.btn_lookahead.collidepoint(mx, my):
-                self.toggle_lookahead()
-                return True
-            elif self.btn_sort_relief_desc.collidepoint(mx, my):
-                self.set_sort("relief_desc")
-                return True
-            elif self.btn_sort_relief_asc.collidepoint(mx, my):
-                self.set_sort("relief_asc")
-                return True
-            elif self.btn_sort_abs_desc.collidepoint(mx, my):
-                self.set_sort("abs_desc")
-                return True
-            elif self.btn_sort_coreset.collidepoint(mx, my):
-                self.set_sort("coreset")
-                return True
-            elif (self.slider_rect.x - 8 <= mx <= self.slider_rect.x + self.slider_rect.width + 8
-                  and self.slider_rect.y - 10 <= my <= self.slider_rect.y + self.slider_rect.height + 10):
-                self.slider_dragging = True
-                t = max(0.0, min(1.0, (mx - self.slider_rect.x) / self.slider_rect.width))
-                self.slider_preview_idx = int(round(t * (self.num_seqs - 1)))
-                self.last_slider_motion_time = time.time()
-                self.pending_slider_idx = self.slider_preview_idx
-                if self.sorted_indices:
-                    cand_seq = self.sorted_indices[self.slider_preview_idx]
-                    if (cand_seq, self.show_lookahead) in self.cache:
-                        self.set_sorted_idx(self.slider_preview_idx)
-                        self.pending_slider_idx = None
-                return True
-
-        elif ev.type == pygame.MOUSEMOTION:
-            if self.slider_dragging:
-                t = max(0.0, min(1.0, (ev.pos[0] - self.slider_rect.x) / self.slider_rect.width))
-                new_idx = int(round(t * (self.num_seqs - 1)))
-                if new_idx != self.slider_preview_idx:
-                    self.slider_preview_idx = new_idx
-                    self.last_slider_motion_time = time.time()
-                    self.pending_slider_idx = new_idx
-                    if self.sorted_indices:
-                        cand_seq = self.sorted_indices[self.slider_preview_idx]
-                        if (cand_seq, self.show_lookahead) in self.cache:
-                            self.set_sorted_idx(self.slider_preview_idx)
-                            self.pending_slider_idx = None
-                return True
-
-        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-            if self.slider_dragging:
-                self.slider_dragging = False
-                commit_idx = self.slider_preview_idx
-                self.pending_slider_idx = None
-                self.set_sorted_idx(commit_idx)
-                return True
-
-        elif ev.type == pygame.MOUSEWHEEL:
-            if ev.y > 0:
-                self.prev_seq()
-            elif ev.y < 0:
-                self.next_seq()
-            return True
-
         return False
 
-    def _draw_comparison_overlay(self, screen: pygame.Surface,
-                                  font: pygame.font.Font,
-                                  font_small: pygame.font.Font,
-                                  font_tiny: pygame.font.Font,
-                                  rec: WMTheaterRecord) -> None:
-        """Overlay panel showing baseline vs hindsight (forced-EOS) comparison:
-        recorded action a4 vs generated a4*, cost C_pi vs C_gen, EOS predicted
-        vs forced vs realized, and the accept/reject verdict."""
-        info = rec.hindsight_info
-        if info is None:
-            return
+    # --- drawing ------------------------------------------------------------
+    def _draw_row(self, screen, rec: WMTheaterRecord, key: str, y: int,
+                  font_small, font_tiny) -> int:
+        color = ROW_COLORS[key]
+        steps = {"real": rec.real_steps, "argmax": rec.argmax_steps,
+                 "elected": rec.elected_steps}[key]
+        screen.blit(font_small.render(ROW_LABELS[key], FONT_AA, color), (16, y))
+        yy = y + 16
+        x = 16
+        thumb_w, thumb_h, gap = 92, 68, 6
+        for st in steps:
+            rect = pygame.Rect(x, yy, thumb_w, thumb_h)
+            draw_thumbnail(screen, rect, st, font_tiny, facing=1, cand_color=color)
+            x += thumb_w + gap
+        return yy + thumb_h + 8
 
-        # Panel on the right side
-        pw, ph = 360, 300
-        px = self.width - pw - 16
-        py = 90
-        panel = pygame.Rect(px, py, pw, ph)
-        # Semi-transparent background
-        overlay = pygame.Surface((pw, ph), pygame.SRCALPHA)
-        overlay.fill((20, 24, 36, 235))
-        screen.blit(overlay, (px, py))
-        pygame.draw.rect(screen, (185, 110, 245), panel, 2, border_radius=6)
+    def _draw_header(self, screen, rec: WMTheaterRecord | None, font, font_small) -> int:
+        pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, 56))
+        title = f"{self.title_str}  |  seq {self.sorted_idx + 1}/{len(self.order)} (idx {rec.seq_idx if rec else '-'})  |  sort {self.sort_mode}"
+        screen.blit(font.render(title, FONT_AA, TEXT_WHITE), (16, 8))
+        if rec is not None:
+            info = (f"relief réel {rec.real_relief:+.3f} | µ {rec.argmax_relief:+.3f} | "
+                    f"élu {rec.elected_relief:+.3f} (p={rec.p_elected:.2f}) | "
+                    f"cos(a*,a4) µ {rec.cos_argmax:+.2f} élu {rec.cos_elected:+.2f} | "
+                    f"rmse posture {rec.rmse_posture_elected:.3f} coût {rec.rmse_cost_elected:.3f}")
+            screen.blit(font_small.render(info, FONT_AA, TEXT_ACCENT), (16, 32))
+        return 62
 
-        y = py + 10
-
-        # Title
-        s = font_small.render("Forced-EOS Comparison  [F]", FONT_AA, (225, 175, 255))
-        screen.blit(s, (px + 12, y))
-        y += 24
-
-        # Verdict badge (affichage seul, aucune decision)
-        better = info["delta_relief"] > 0
-        badge_color = (80, 220, 130) if better else (240, 110, 120)
-        badge_txt = "hindsight meilleur que baseline" if better else "baseline meilleur que hindsight"
-        s = font_small.render(badge_txt, FONT_AA, badge_color)
-        screen.blit(s, (px + 12, y))
-        y += 26
-
-        # Action comparison: recorded a4 vs generated a4*
-        s = font_tiny.render("Action a4 (recorded vs hindsight):", FONT_AA, TEXT_MUTED)
-        screen.blit(s, (px + 12, y))
-        y += 16
-
-        names = ["θ_front", "d_front", "θ_back", "d_back", "tail"]
-        recorded = info["recorded_a4"]
-        gen = info["gen_a4"]
-        for i, name in enumerate(names):
-            rv = recorded[i]
-            gv = gen[i]
-            # Format: signed dims in degrees, unsigned in physical units
-            if i in (0, 2, 4):  # theta (signed [-1,1] -> degrees)
-                r_str = f"{rv * 180:+.0f}°"
-                g_str = f"{gv * 180:+.0f}°"
-            else:  # d (unsigned [0,1] -> physical)
-                r_str = f"{10 + rv * 22:.1f}"
-                g_str = f"{10 + gv * 22:.1f}"
-            delta = gv - rv
-            d_str = f"{delta:+.3f}" if abs(delta) > 0.001 else "  =  "
-            line = f"  {name:8s}  {r_str:>7s}  →  {g_str:>7s}   ({d_str})"
-            c = (100, 245, 160) if (delta > 0.001 if i in (0, 2, 4) else delta > 0.001) else \
-                ((240, 110, 120) if abs(delta) > 0.001 else TEXT_MUTED)
-            s = font_tiny.render(line, FONT_AA, TEXT_WHITE if abs(delta) < 0.001 else c)
-            screen.blit(s, (px + 12, y))
-            y += 15
-
-        y += 6
-
-        # Score de soulagement (relief_score du token EOS)
-        relief_pi = info["relief_pi"]
-        relief_gen = info["relief_gen"]
-        delta_relief = info["delta_relief"]
-        s = font_tiny.render("Score de soulagement (+ = recuperation):", FONT_AA, TEXT_MUTED)
-        screen.blit(s, (px + 12, y))
-        y += 16
-        s = font_tiny.render(f"  Baseline (a4)  : {relief_pi:+.3f}", FONT_AA, TEXT_WHITE)
-        screen.blit(s, (px + 12, y))
-        y += 15
-        s = font_tiny.render(f"  Hindsight (a4*) : {relief_gen:+.3f}   ({delta_relief:+.3f})",
-                             FONT_AA, (100, 245, 160) if delta_relief > 0 else (240, 110, 120))
-        screen.blit(s, (px + 12, y))
-        y += 20
-
-        # EOS comparison (6 slots: 5 costs + 1 reward)
-        s = font_tiny.render("EOS slots (higher=better, slot 5 lower=better):", FONT_AA, TEXT_MUTED)
-        screen.blit(s, (px + 12, y))
-        y += 16
-        eos_pi = info["eos_pi"]
-        eos_forced = info["eos_forced"]
-        eos_gen = info["eos_gen"]
-        slot_names = ["EF", "DO", "CO", "IN", "VE", "CF"]
-        for i, sn in enumerate(slot_names):
-            pi_v = eos_pi[i]
-            fo_v = eos_forced[i]
-            ge_v = eos_gen[i]
-            line = f"  {sn}  pred:{pi_v:.2f}  forced:{fo_v:.2f}  gen:{ge_v:.2f}"
-            screen.blit(font_tiny.render(line, FONT_AA, TEXT_WHITE), (px + 12, y))
-            y += 14
-
-    def draw(self, screen: pygame.Surface, font: pygame.font.Font,
-             font_small: pygame.font.Font, font_tiny: pygame.font.Font) -> None:
-        """Render the complete World Model Theater storyboard."""
-        # Debounce check while dragging: auto-commit if paused >= 150 ms
-        if self.pending_slider_idx is not None and (time.time() - self.last_slider_motion_time >= 0.15):
-            idx_to_load = self.pending_slider_idx
-            self.pending_slider_idx = None
-            self.set_sorted_idx(idx_to_load)
-
+    def draw(self, screen, font, font_small, font_tiny=None) -> None:
+        if font_tiny is None:
+            font_tiny = font_small
         screen.fill(DREAM_BG)
-
-        if self.num_seqs == 0:
-            msg = font.render("Coreset is empty — no sequences to display.", FONT_AA, TEXT_WHITE)
-            screen.blit(msg, (self.width // 2 - msg.get_width() // 2, self.height // 2))
-            return
-
-        header_h = 80
-        pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, header_h))
-        pygame.draw.line(screen, CARD_BORDER, (0, header_h), (self.width, header_h), 1)
-
-        # Prev button
-        pygame.draw.rect(screen, (34, 40, 54), self.btn_prev, border_radius=4)
-        pygame.draw.rect(screen, CARD_BORDER, self.btn_prev, 1, border_radius=4)
-        s_prev = font_small.render("< Prev [←]", FONT_AA, TEXT_WHITE)
-        screen.blit(s_prev, (self.btn_prev.x + (self.btn_prev.width - s_prev.get_width()) // 2,
-                             self.btn_prev.y + 6))
-
-        # Slider track
-        pygame.draw.rect(screen, (28, 32, 44), self.slider_rect, border_radius=4)
-        pygame.draw.rect(screen, CARD_BORDER, self.slider_rect, 1, border_radius=4)
-
-        # Slider fill and handle (uses slider_preview_idx if dragging, else sorted_idx)
-        active_slider_idx = self.slider_preview_idx if self.slider_dragging else self.sorted_idx
-        ratio = (active_slider_idx / max(1, self.num_seqs - 1)) if self.num_seqs > 1 else 0.0
-        fill_w = int(ratio * self.slider_rect.width)
-        if fill_w > 0:
-            fill_rect = pygame.Rect(self.slider_rect.x, self.slider_rect.y, fill_w, self.slider_rect.height)
-            pygame.draw.rect(screen, (50, 110, 190), fill_rect, border_radius=4)
-
-        # Slider handle
-        hx = self.slider_rect.x + fill_w
-        hy = self.slider_rect.centery
-        handle_color = (255, 230, 90) if self.slider_dragging else (110, 200, 255)
-        pygame.draw.circle(screen, handle_color, (hx, hy), 7)
-        pygame.draw.circle(screen, TEXT_WHITE, (hx, hy), 7, 2)
-
-        # Next button
-        pygame.draw.rect(screen, (34, 40, 54), self.btn_next, border_radius=4)
-        pygame.draw.rect(screen, CARD_BORDER, self.btn_next, 1, border_radius=4)
-        s_next = font_small.render("Next [→] >", FONT_AA, TEXT_WHITE)
-        screen.blit(s_next, (self.btn_next.x + (self.btn_next.width - s_next.get_width()) // 2,
-                             self.btn_next.y + 6))
-
-        # Lookahead toggle button
-        la_active = self.show_lookahead
-        bg = (48, 28, 64) if la_active else (34, 40, 54)
-        border_c = (185, 110, 245) if la_active else CARD_BORDER
-        txt_c = (225, 175, 255) if la_active else TEXT_WHITE
-        border_w = 2 if la_active else 1
-        pygame.draw.rect(screen, bg, self.btn_lookahead, border_radius=4)
-        pygame.draw.rect(screen, border_c, self.btn_lookahead, border_w, border_radius=4)
-        btn_txt = "★ Lookahead [L]" if la_active else "Rollout [L]"
-        s_la = font_small.render(btn_txt, FONT_AA, txt_c)
-        screen.blit(s_la, (self.btn_lookahead.x + (self.btn_lookahead.width - s_la.get_width()) // 2,
-                           self.btn_lookahead.y + 6))
-
-        # Sort buttons
-        # 1. Relief ↓ (Recovery first)
-        is_r_desc = (self.sort_mode == "relief_desc")
-        bg = (24, 60, 38) if is_r_desc else (30, 36, 48)
-        border = (80, 220, 130) if is_r_desc else CARD_BORDER
-        pygame.draw.rect(screen, bg, self.btn_sort_relief_desc, border_radius=4)
-        pygame.draw.rect(screen, border, self.btn_sort_relief_desc, 2 if is_r_desc else 1, border_radius=4)
-        s_lbl = font_small.render("★ Relief ↓", FONT_AA, (100, 245, 160) if is_r_desc else TEXT_MUTED)
-        screen.blit(s_lbl, (self.btn_sort_relief_desc.x + (self.btn_sort_relief_desc.width - s_lbl.get_width()) // 2,
-                            self.btn_sort_relief_desc.y + 6))
-
-        # 2. Relief ↑ (Falls first)
-        is_r_asc = (self.sort_mode == "relief_asc")
-        bg = (60, 24, 30) if is_r_asc else (30, 36, 48)
-        border = (240, 90, 100) if is_r_asc else CARD_BORDER
-        pygame.draw.rect(screen, bg, self.btn_sort_relief_asc, border_radius=4)
-        pygame.draw.rect(screen, border, self.btn_sort_relief_asc, 2 if is_r_asc else 1, border_radius=4)
-        s_lbl = font_small.render("⚠ Relief ↑", FONT_AA, (255, 120, 130) if is_r_asc else TEXT_MUTED)
-        screen.blit(s_lbl, (self.btn_sort_relief_asc.x + (self.btn_sort_relief_asc.width - s_lbl.get_width()) // 2,
-                            self.btn_sort_relief_asc.y + 6))
-
-        # 3. |Relief| ↓ (Extremes first)
-        is_abs = (self.sort_mode == "abs_desc")
-        bg = (60, 52, 20) if is_abs else (30, 36, 48)
-        border = (255, 210, 70) if is_abs else CARD_BORDER
-        pygame.draw.rect(screen, bg, self.btn_sort_abs_desc, border_radius=4)
-        pygame.draw.rect(screen, border, self.btn_sort_abs_desc, 2 if is_abs else 1, border_radius=4)
-        s_lbl = font_small.render("⚡ |Relief| ↓", FONT_AA, (255, 225, 90) if is_abs else TEXT_MUTED)
-        screen.blit(s_lbl, (self.btn_sort_abs_desc.x + (self.btn_sort_abs_desc.width - s_lbl.get_width()) // 2,
-                            self.btn_sort_abs_desc.y + 6))
-
-        # 4. Coreset (Raw)
-        is_core = (self.sort_mode == "coreset")
-        bg = (38, 56, 82) if is_core else (30, 36, 48)
-        border = (110, 200, 255) if is_core else CARD_BORDER
-        pygame.draw.rect(screen, bg, self.btn_sort_coreset, border_radius=4)
-        pygame.draw.rect(screen, border, self.btn_sort_coreset, 2 if is_core else 1, border_radius=4)
-        s_lbl = font_small.render("Coreset (Raw)", FONT_AA, TEXT_WHITE if is_core else TEXT_MUTED)
-        screen.blit(s_lbl, (self.btn_sort_coreset.x + (self.btn_sort_coreset.width - s_lbl.get_width()) // 2,
-                            self.btn_sort_coreset.y + 6))
-
-        rec = self._load_record(self.seq_idx)
-        n_ctx = self.brain.n_ctx
-        last = len(rec.steps) - 1
-
-        # Header Title (Line 1 left)
-        disp_idx = self.slider_preview_idx if self.slider_dragging else self.sorted_idx
-        meta = {}
-        if self.seq_idx < len(self.buffer._coreset_meta):
-            m = self.buffer._coreset_meta[self.seq_idx]
-            meta = m if isinstance(m, dict) else {}
-        def _fmt(v, nd=3):
-            return f"{v:.{nd}f}" if isinstance(v, (int, float)) else "-"
-        meta_str = (f"relief {_fmt(meta.get('relief_score'))} "
-                    f"causal {_fmt(meta.get('causal_score'))} "
-                    f"look {_fmt(meta.get('lookahead_score'))} "
-                    f"diss {_fmt(meta.get('dissonance'))} "
-                    f"surp {_fmt(meta.get('surprise'), 4)} "
-                    f"n {meta.get('learn_count', 0)}")
-        title_str = (
-            f"{self.title_str}  |  Seq #{rec.seq_idx} (pos {disp_idx}/{self.num_seqs - 1})  |  "
-            f"Viv: {rec.vivacity:.2f}  |  {meta_str}"
-        )
-        s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
-        screen.blit(s_title, (16, 12))
-
-        # DENOUEMENT PROMINENT BANNER (Line 1 right)
-        banner_rect = pygame.Rect(506, 8, 618, 26)
-        is_recov = rec.real_relief > 0.005
-        is_worse = rec.real_relief < -0.005
-        b_bg = (18, 46, 32) if is_recov else ((46, 18, 24) if is_worse else (26, 30, 42))
-        b_border = (60, 200, 110) if is_recov else ((220, 70, 80) if is_worse else (65, 75, 95))
-        pygame.draw.rect(screen, b_bg, banner_rect, border_radius=4)
-        pygame.draw.rect(screen, b_border, banner_rect, 1, border_radius=4)
-
-        # Badge tag
-        tag_text = "✅" if is_recov else ("❌" if is_worse else "●")
-        tag_c = (100, 245, 160) if is_recov else ((255, 120, 130) if is_worse else (180, 190, 210))
-        s_btag = font_small.render(f"{tag_text} ({rec.real_relief:+.3f})", FONT_AA, tag_c)
-        screen.blit(s_btag, (banner_rect.x + 8, banner_rect.y + 6))
-
-        # Details in banner
-        cost_diff_pct = ((rec.late_cost_real - rec.early_cost) / max(0.01, rec.early_cost)) * 100.0
-        details_str = (
-            f"Early Cost {rec.early_cost:.2f} ──▶ Late {rec.late_cost_real:.2f} ({cost_diff_pct:+.0f}%)   |   "
-            f"Pred Relief: {rec.pred_relief:+.3f} (Δ {abs(rec.real_relief - rec.pred_relief):.3f})"
-        )
-        s_bdet = font_tiny.render(details_str, FONT_AA, TEXT_WHITE)
-        screen.blit(s_bdet, (banner_rect.x + s_btag.get_width() + 14, banner_rect.y + 7))
-
-        # 2. Section 1: Real Sequence (Coreset)
-        sec1_y = header_h + 10
-        s_sec1 = font.render("SEQ", FONT_AA, TEXT_WHITE)
-        screen.blit(s_sec1, (self.margin_x, sec1_y))
-        s_ctx_lbl = font_small.render(f"[ s0..s{n_ctx} ]", FONT_AA, TEXT_MUTED)
-        screen.blit(s_ctx_lbl, (self.margin_x + s_sec1.get_width() + 8, sec1_y + 2))
-
-        den_x = self.margin_x + (n_ctx + 1) * (self.col_w + self.col_gap)
-        s_den_lbl = font.render(
-            f"Relief {rec.real_relief:+.3f}",
-            FONT_AA, tag_c)
-        screen.blit(s_den_lbl, (den_x + 6, sec1_y))
-
-        row1_y = sec1_y + 22
-        card_h = 246
-
-        # Draw vertical context-denouement divider line between context and consequence
-        div_x = self.margin_x + (n_ctx + 1) * self.col_w + n_ctx * self.col_gap + self.col_gap // 2
-        pygame.draw.line(screen, (55, 65, 85), (div_x, row1_y), (div_x, row1_y + card_h), 1)
-
-        hover_card_info: tuple[str, list[list[float]], pygame.Rect] | None = None
-        mouse_pos = pygame.mouse.get_pos()
-
-        for i, step_data in enumerate(rec.steps):
-            cx = self.margin_x + i * (self.col_w + self.col_gap)
-            card_rect = pygame.Rect(cx, row1_y, self.col_w, card_h)
-
-            is_context = (i <= n_ctx)
-            is_eos = (i == len(rec.steps) - 1)
-            is_hovered = card_rect.collidepoint(mouse_pos)
-            if is_hovered:
-                lbl_text = f"s{i}a" if not is_eos else f"s{last} (EOS)"
-                hover_card_info = (f"REAL SALVE {lbl_text}", step_data.real_salve, card_rect)
-
-            if is_eos:
-                bg = (20, 38, 28) if is_recov else ((38, 20, 24) if is_worse else CARD_BG)
-                border_c = (255, 255, 255) if is_hovered else ((80, 220, 130) if is_recov else ((240, 80, 90) if is_worse else CARD_BORDER))
-                border_w = 2
-            else:
-                bg = CONTEXT_BG if is_context else CARD_BG
-                border_c = (140, 210, 255) if is_hovered else (CONTEXT_BORDER if is_context else CARD_BORDER)
-                border_w = 2 if is_hovered else 1
-
-            pygame.draw.rect(screen, bg, card_rect, border_radius=4)
-            pygame.draw.rect(screen, border_c, card_rect, border_w, border_radius=4)
-
-            # Card Header label
-            if is_eos:
-                lbl_text = "★EOS"
-                c_hdr = tag_c
-            else:
-                lbl_text = f"s{i}a" if i < last else f"s{last}"
-                c_hdr = TEXT_ACCENT if is_context else TEXT_WHITE
-            s_hdr = font_small.render(lbl_text, FONT_AA, c_hdr)
-            screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row1_y + 4))
-
-            # Animal thumbnail
-            th_rect = pygame.Rect(cx + 4, row1_y + 20, self.col_w - 8, 70)
-            cand_c = CAND_COLORS[0] if step_data.real_step.action is not None else None
-            draw_thumbnail(screen, th_rect, step_data.real_step, font_tiny, facing=1,
-                           cand_color=cand_c, highlight_label="")
-
-            # Instantaneous Costs Mini-Histogram
-            cost_rect = pygame.Rect(cx + 4, row1_y + 96, self.col_w - 8, 100)
-            hist_title = "EOS" if is_eos else "Real"
-            draw_cost_histogram(screen, cost_rect, step_data.real_costs, font_tiny,
-                                title=hist_title, is_predicted=False)
-
-        # 3. Section 2: World Model Inférence (Rollout après s4a4 ou Lookahead imagination)
-        sec2_y = row1_y + card_h + 12
-        if self.show_lookahead:
-            s_sec2 = font.render("LOOKAHEAD", FONT_AA, (185, 130, 255))
-            screen.blit(s_sec2, (self.margin_x, sec2_y))
-            s_ctx2_lbl = font_small.render(f"[ Context s0..s{n_ctx}+a{n_ctx}* ]", FONT_AA, TEXT_MUTED)
-            screen.blit(s_ctx2_lbl, (self.margin_x + s_sec2.get_width() + 8, sec2_y + 2))
-
-            pred_tag_c = (185, 130, 255) if rec.pred_relief > 0 else (240, 110, 120)
-            s_roll_lbl = font.render(
-                f"Relief {rec.pred_relief:+.3f}  RMSE {rec.overall_posture_rmse:.3f}",
-                FONT_AA, pred_tag_c)
-            screen.blit(s_roll_lbl, (den_x + 6, sec2_y))
+        rec = self.get_record()
+        y = self._draw_header(screen, rec, font, font_small)
+        if rec is None:
+            screen.blit(font.render("coreset vide", FONT_AA, TEXT_MUTED), (16, y))
         else:
-            s_sec2 = font.render("WM", FONT_AA, WINNER_BORDER)
-            screen.blit(s_sec2, (self.margin_x, sec2_y))
-            s_ctx2_lbl = font_small.render(f"[ s0..s{n_ctx} ]", FONT_AA, TEXT_MUTED)
-            screen.blit(s_ctx2_lbl, (self.margin_x + s_sec2.get_width() + 8, sec2_y + 2))
-
-            pred_tag_c = (90, 200, 255) if rec.pred_relief > 0 else (240, 110, 120)
-            s_roll_lbl = font.render(
-                f"Relief {rec.pred_relief:+.3f}  RMSE {rec.overall_posture_rmse:.3f}",
-                FONT_AA, pred_tag_c)
-            screen.blit(s_roll_lbl, (den_x + 6, sec2_y))
-
-        row2_y = sec2_y + 22
-        pygame.draw.line(screen, (55, 65, 85), (div_x, row2_y), (div_x, row2_y + card_h), 1)
-
-        for i, step_data in enumerate(rec.steps):
-            cx = self.margin_x + i * (self.col_w + self.col_gap)
-            card_rect = pygame.Rect(cx, row2_y, self.col_w, card_h)
-
-            is_pure_context = (i < n_ctx)
-            is_hindsight_a4 = (self.show_lookahead and i == n_ctx)
-            is_pred_a4 = (not self.show_lookahead and i == n_ctx)
-            is_eos = (i == len(rec.steps) - 1)
-            is_hovered = card_rect.collidepoint(mouse_pos)
-
-            if is_pure_context:
-                if is_hovered:
-                    hover_card_info = (f"CONTEXT SALVE s{i}", step_data.real_salve, card_rect)
-
-                border_c = (140, 210, 255) if is_hovered else CONTEXT_BORDER
-                pygame.draw.rect(screen, CONTEXT_BG, card_rect, border_radius=4)
-                pygame.draw.rect(screen, border_c, card_rect, 2 if is_hovered else 1, border_radius=4)
-
-                s_hdr = font_small.render(f"[s{i}]", FONT_AA, TEXT_MUTED)
-                screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
-
-                th_rect = pygame.Rect(cx + 4, row2_y + 20, self.col_w - 8, 70)
-                draw_thumbnail(screen, th_rect, step_data.real_step, font_tiny, facing=1,
-                               cand_color=None, highlight_label="")
-
-                cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 100)
-                draw_cost_histogram(screen, cost_rect, step_data.real_costs, font_tiny,
-                                    title="Context", is_predicted=False)
-
-            elif is_hindsight_a4:
-                lbl_text = f"s{n_ctx}a*"
-                if is_hovered:
-                    hover_card_info = (f"HINDSIGHT SALVE {lbl_text}", step_data.pred_salve or [], card_rect)
-
-                bg = (34, 26, 46)
-                border_c = (220, 160, 255) if is_hovered else (185, 110, 245)
-                pygame.draw.rect(screen, bg, card_rect, border_radius=4)
-                pygame.draw.rect(screen, border_c, card_rect, 2 if is_hovered else 1, border_radius=4)
-
-                s_hdr = font_small.render(f"★ a{n_ctx}*", FONT_AA, (220, 160, 255))
-                screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
-
-                th_rect = pygame.Rect(cx + 4, row2_y + 20, self.col_w - 8, 70)
-                if step_data.pred_step:
-                    draw_thumbnail(screen, th_rect, step_data.pred_step, font_tiny, facing=1,
-                                   cand_color=CAND_COLORS[0], is_winner=True, highlight_label="")
-
-                cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 100)
-                draw_cost_histogram(screen, cost_rect, step_data.pred_costs or [0.0]*5, font_tiny,
-                                    title="Context", is_predicted=True)
-
-                s_err1 = font_tiny.render(f"a{n_ctx}*", FONT_AA, (200, 150, 255))
-                s_err2 = font_tiny.render(f"Δ {step_data.cost_rmse or 0.0:.4f}",
-                                          FONT_AA, TEXT_WHITE)
-                screen.blit(s_err1, (cx + 6, row2_y + 214))
-                screen.blit(s_err2, (cx + 6, row2_y + 228))
-
-            elif is_pred_a4:
-                lbl_text = f"s{n_ctx}a^"
-                if is_hovered:
-                    hover_card_info = (f"PREDICTED {lbl_text}", step_data.pred_salve or [], card_rect)
-
-                bg = (24, 30, 42)
-                border_c = (255, 255, 255) if is_hovered else PRED_BORDER
-                pygame.draw.rect(screen, bg, card_rect, border_radius=4)
-                pygame.draw.rect(screen, border_c, card_rect, 2 if is_hovered else 1, border_radius=4)
-
-                s_hdr = font_small.render(lbl_text, FONT_AA, WINNER_BORDER)
-                screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
-
-                th_rect = pygame.Rect(cx + 4, row2_y + 20, self.col_w - 8, 70)
-                if step_data.pred_step:
-                    draw_thumbnail(screen, th_rect, step_data.pred_step, font_tiny, facing=1,
-                                   cand_color=CAND_COLORS[0], is_winner=True, highlight_label="")
-
-                cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 100)
-                draw_cost_histogram(screen, cost_rect, step_data.pred_costs or [0.0] * 5, font_tiny,
-                                    title="Context", is_predicted=True)
-
-                s_err1 = font_tiny.render(f"a{n_ctx}^ (WM, causal)", FONT_AA, WINNER_BORDER)
-                s_err2 = font_tiny.render(f"Δ {step_data.cost_rmse or 0.0:.3f}", FONT_AA, TEXT_WHITE)
-                screen.blit(s_err1, (cx + 6, row2_y + 214))
-                screen.blit(s_err2, (cx + 6, row2_y + 228))
-
-            else:
-                lbl_text = "★WM EOS" if is_eos else (f"s{i}*a*" if self.show_lookahead else f"s{i}^a")
-                if is_hovered:
-                    tag_prefix = "LOOKAHEAD" if self.show_lookahead else "PREDICTED"
-                    hover_card_info = (f"{tag_prefix} SALVE {lbl_text}", step_data.pred_salve or [], card_rect)
-
-                if is_eos:
-                    bg = (20, 34, 42) if rec.pred_relief > 0 else (38, 22, 26)
-                    border_c = (255, 255, 255) if is_hovered else ((90, 200, 255) if rec.pred_relief > 0 else (240, 110, 120))
-                    border_w = 2
-                else:
-                    bg = (28, 24, 38) if self.show_lookahead else (24, 30, 42)
-                    border_c = (200, 140, 255) if (is_hovered and self.show_lookahead) else (WINNER_BORDER if is_hovered else ((160, 110, 220) if self.show_lookahead else PRED_BORDER))
-                    border_w = 2 if is_hovered else 1
-
-                pygame.draw.rect(screen, bg, card_rect, border_radius=4)
-                pygame.draw.rect(screen, border_c, card_rect, border_w, border_radius=4)
-
-                default_hdr_c = (210, 160, 255) if self.show_lookahead else WINNER_BORDER
-                hdr_color = pred_tag_c if is_eos else default_hdr_c
-                s_hdr = font_small.render(lbl_text, FONT_AA, hdr_color)
-                screen.blit(s_hdr, (cx + (self.col_w - s_hdr.get_width()) // 2, row2_y + 4))
-
-                th_rect = pygame.Rect(cx + 4, row2_y + 20, self.col_w - 8, 70)
-                cand_c = CAND_COLORS[0] if (step_data.pred_step and step_data.pred_step.action is not None) else None
-                if step_data.pred_step:
-                    draw_thumbnail(screen, th_rect, step_data.pred_step, font_tiny, facing=1,
-                                   cand_color=cand_c, is_winner=True, highlight_label="")
-
-                cost_rect = pygame.Rect(cx + 4, row2_y + 96, self.col_w - 8, 100)
-                hist_title = "EOS" if is_eos else ("Imagined" if self.show_lookahead else "Pred")
-                draw_cost_histogram(screen, cost_rect, step_data.pred_costs or [0.0]*5, font_tiny,
-                                    title=hist_title, is_predicted=True)
-
-                p_err = step_data.posture_rmse or 0.0
-                c_err = step_data.cost_rmse or 0.0
-
-                c_color = (110, 230, 140) if p_err < 0.04 else ((255, 210, 70) if p_err < 0.08 else (240, 100, 100))
-                s_err1 = font_tiny.render(f"Δpost: {p_err:.3f}", FONT_AA, c_color)
-                s_err2 = font_tiny.render(f"Δcost: {c_err:.3f}", FONT_AA, TEXT_WHITE)
-                screen.blit(s_err1, (cx + 6, row2_y + 214))
-                screen.blit(s_err2, (cx + 6, row2_y + 228))
-
-        # 4. Footer & Legend
-        footer_y = self.height - 24
-        hints = self.footer_hints_la if self.show_lookahead else self.footer_hints
-        s_hints = font_small.render(hints, FONT_AA, TEXT_MUTED)
-        screen.blit(s_hints, (self.margin_x, footer_y))
-
-        # Costs legend
-        leg_x = self.width - self.margin_x - 360
-        s_leg_title = font_tiny.render("Costs:", FONT_AA, TEXT_MUTED)
-        screen.blit(s_leg_title, (leg_x, footer_y + 1))
-        cur_lx = leg_x + 40
-        for code, c in zip(COST_LABELS, COST_COLORS):
-            pygame.draw.rect(screen, c, (cur_lx, footer_y + 3, 8, 8), border_radius=1)
-            s_c = font_tiny.render(code, FONT_AA, TEXT_WHITE)
-            screen.blit(s_c, (cur_lx + 11, footer_y + 1))
-            cur_lx += 42
-
-        # 4b. Forced-EOS comparison overlay (only in lookahead mode)
-        if self.show_comparison and self.show_lookahead and rec is not None:
-            self._draw_comparison_overlay(screen, font, font_small, font_tiny, rec)
-
-        # 5. Pop-in overlay on top of everything
-        if hover_card_info is not None:
-            pop_title, pop_salve, pop_rect = hover_card_info
-            draw_token_popin(screen, self.encoder, font_small, font_tiny,
-                             pop_title, pop_salve, pop_rect, self.width, self.height)
+            y = self._draw_row(screen, rec, "real", y, font_small, font_tiny)
+            y = self._draw_row(screen, rec, "argmax", y, font_small, font_tiny)
+            y = self._draw_row(screen, rec, "elected", y, font_small, font_tiny)
+            # dénouements (6 slots) en clair
+            if rec is not None:
+                yy = y + 4
+                for lbl, eos, col in (("EOS obs", rec.eos_observed, TEXT_MUTED),
+                                      ("EOS µ", rec.eos_argmax, ROW_COLORS["argmax"]),
+                                      ("EOS élu", rec.eos_elected, ROW_COLORS["elected"])):
+                    txt = f"{lbl}: " + " ".join(f"{v:.2f}" for v in eos)
+                    screen.blit(font_tiny.render(txt, FONT_AA, col), (16, yy))
+                    yy += 14
+        pygame.draw.rect(screen, CARD_BORDER, (0, self.height - 24, self.width, 24))
+        screen.blit(font_small.render(self.footer_hints, FONT_AA, TEXT_MUTED),
+                    (16, self.height - 20))
 
 
-def run_theater(buffer_path: str = "buf_ckpt.pt",
-                wm_path: str = "wm_ckpt.pt",
-                pol_path: str = "pol_ckpt.pt",
-                initial_index: int = 0,
-                device: str = "cpu",
-                initial_sort: str = "relief_desc",
-                # Architecture / training params (from config.toml or defaults)
+def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
+                pol_path: str = "pol_ckpt.pt", initial_index: int = 0,
+                device: str = "cpu", initial_sort: str = "relief_desc",
                 d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
-                dim_ff: int = 384, wm_dropout: float = 0.0,
-                pol_hidden: int = 256,
-                lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-                act_std: float = 0.05,
-                wm_batch: int = 64,
-                seed: int = 0,
+                dim_ff: int = 384, wm_dropout: float = 0.0, pol_hidden: int = 256,
+                lr_wm: float = 3e-4, lr_pol: float = 2e-4, seed: int = 0,
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 10, n_ctx: int = 4,
-                compile_wm: bool = False,
-                eos_force_amp_lo: float = 0.015, eos_force_amp_hi: float = 0.0375,
-                eos_force_amplify: float = 1.0,
-                wm_hz: float = 3.0, pol_hz: float = 6.0,
+                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1,
+                eos_max_p: float = 8.0, compile_wm: bool = False,
                 **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
-    try:
-        import ctypes
-        ctypes.CDLL("libSDL2-2.0.so.0").SDL_SetHint(b"SDL_HINT_RENDER_SCALE_QUALITY", b"1")
-    except Exception:
-        pass
     pygame.init()
-    pygame.display.set_caption("World Model Theater — Convergence Diagnostic")
-
-    width, height = 1140, 700
-    flags = pygame.SCALED | pygame.RESIZABLE
-    screen = pygame.display.set_mode((width, height), flags)
+    pygame.display.set_caption("WM Theater — refonte")
+    width, height = 1600, 760
+    screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
-
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
     font_small = pygame.font.SysFont(FONT_NAME, 11)
     font_tiny = pygame.font.SysFont(FONT_NAME, 10)
 
     brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
-                  d_model=d_model, nhead=nhead, layers=wm_layers,
-                  dim_ff=dim_ff, dropout=wm_dropout,
-                  pol_hidden=pol_hidden,
-                  lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std,
-                  seed=seed,
-                  buffer_capacity=buffer_capacity,
+                  d_model=d_model, nhead=nhead, layers=wm_layers, dim_ff=dim_ff,
+                  dropout=wm_dropout, pol_hidden=pol_hidden, lr_wm=lr_wm, lr_pol=lr_pol,
+                  seed=seed, buffer_capacity=buffer_capacity,
                   buffer_pool_capacity=buffer_pool_capacity,
-                  eos_force_amp_lo=eos_force_amp_lo,
-                  eos_force_amp_hi=eos_force_amp_hi,
-                  eos_force_amplify=eos_force_amplify)
-    if os.path.exists(wm_path) or os.path.exists(pol_path):
-        brain.load_checkpoint(
-            wm_path=wm_path if os.path.exists(wm_path) else "nonexistent.pt",
-            pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt",
-        )
-        if os.path.exists(wm_path):
-            print(f"Loaded World Model from {wm_path}")
-        if os.path.exists(pol_path):
-            print(f"Loaded Policy from {pol_path}")
+                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin, eos_max_p=eos_max_p)
+    if os.path.exists(wm_path):
+        brain.load_checkpoint(wm_path=wm_path,
+                              pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt")
+        print(f"Loaded World Model from {wm_path}")
     else:
-        print("Warning: World Model or Policy checkpoints not found, using initialized weights.")
+        print("Warning: WM checkpoint not found, using initialized weights.")
 
     buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
-                           seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed)
+                           seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed,
+                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin)
     if os.path.exists(buffer_path):
-        buf.load(buffer_path)
-        print(f"Loaded {len(buf._coreset)} sequences from {buffer_path}")
+        ok = buf.load(buffer_path)
+        print(f"Loaded {buf.coreset_size} sequences from {buffer_path}" if ok
+              else f"{buffer_path}: layout incompatible (legacy ?) — coreset vide")
     else:
         print(f"Warning: Buffer checkpoint {buffer_path} not found.")
 
@@ -1355,105 +420,53 @@ def run_theater(buffer_path: str = "buf_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
-            elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
-                pygame.display.toggle_fullscreen()
-                continue
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break
+            elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN and (
+                    ev.mod & pygame.KMOD_ALT or pygame.key.get_mods() & pygame.KMOD_ALT):
+                pygame.display.toggle_fullscreen()
+                continue
             theater.handle_event(ev)
-
         theater.draw(screen, font, font_small, font_tiny)
         pygame.display.flip()
         clock.tick(60)
-
     pygame.quit()
 
 
 def main() -> None:
     cfg = CFG.load_config()
-
-    # Built-in defaults
     params: dict = {
-        "buffer_path": "buf_ckpt.pt",
-        "wm_path": "wm_ckpt.pt",
-        "pol_path": "pol_ckpt.pt",
+        "buffer_path": "buf_ckpt.pt", "wm_path": "wm_ckpt.pt", "pol_path": "pol_ckpt.pt",
         "initial_index": 0,
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "initial_sort": "relief_desc",
-        "accel": False,
+        "initial_sort": "relief_desc", "accel": False,
         "d_model": 64, "nhead": 4, "wm_layers": 3,
-        "dim_ff": 384, "wm_dropout": 0.0,
-        "pol_hidden": 256,
-        "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05,
-        "wm_batch": 64,
-        "seed": 0,
+        "dim_ff": 384, "wm_dropout": 0.0, "pol_hidden": 256,
+        "lr_wm": 3e-4, "lr_pol": 2e-4, "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 10, "n_ctx": 4,
+        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
         "compile_wm": False,
-        "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
-        "eos_force_amplify": 1.0,
     }
-
-    # Override with config.toml
     CFG.apply_toml(params, cfg)
-
-    parser = argparse.ArgumentParser(description="World Model Theater GUI")
-    parser.add_argument("--buffer", type=str, default=argparse.SUPPRESS,
-                        dest="buffer_path",
-                        help="Path to ExperienceBuffer checkpoint (default: buf_ckpt.pt)")
-    parser.add_argument("--wm", type=str, default=argparse.SUPPRESS,
-                        dest="wm_path",
-                        help="Path to WorldModel checkpoint (default: wm_ckpt.pt)")
-    parser.add_argument("--pol", type=str, default=argparse.SUPPRESS,
-                        dest="pol_path",
-                        help="Path to Policy checkpoint (default: pol_ckpt.pt)")
-    parser.add_argument("--index", type=int, default=argparse.SUPPRESS,
-                        dest="initial_index",
-                        help="Initial sequence index to display (default: 0)")
-    parser.add_argument("--device", type=str, default=argparse.SUPPRESS,
-                        choices=["cpu", "cuda", "auto", "cpu-fast"],
-                        help="Torch device (default: cpu)")
-    parser.add_argument("--sort", type=str, default=argparse.SUPPRESS,
-                        dest="initial_sort",
-                        choices=["relief_desc", "relief_asc", "abs_desc", "coreset"],
-                        help="Sort mode: 'relief_desc' (default: recovery first), 'relief_asc' (falls first), 'abs_desc' (extremes first), or 'coreset' (raw)")
-    # NOTE: checkpoint-structure options (--d-model, --nhead, --wm-layers,
-    # --dim-ff, --wm-dropout, --pol-hidden, --seq-steps, --n-ctx,
-    # --buffer-capacity, --buffer-pool-capacity) are intentionally NOT
-    # exposed on the CLI.  They define the shape of wm_ckpt.pt, pol_ckpt.pt
-    # and buf_ckpt.pt — changing any of them invalidates existing checkpoints.
-    # Set them in config.toml instead.
-    # Training hyperparameters (safe to override per-invocation)
-    parser.add_argument("--lr-wm", type=float, default=argparse.SUPPRESS,
-                        help="World Model learning rate")
-    parser.add_argument("--lr-pol", type=float, default=argparse.SUPPRESS,
-                        help="Policy learning rate")
-    parser.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
-                        help="action sampling std during wake")
-    parser.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
-                        help="World Model training batch size")
-    parser.add_argument("--seed", type=int, default=argparse.SUPPRESS,
-                        help="random seed")
-    parser.add_argument("--compile", action="store_true", default=argparse.SUPPRESS,
-                        dest="compile_wm",
-                        help="torch.compile the World Model training step")
-
-    args = parser.parse_args()
-    cli = vars(args)
-
-    # CLI overrides config
-    CFG.merge_cli(params, cli)
-
-    # Resolve device: accel (config.toml) overrides device
+    p = argparse.ArgumentParser(description="WM Theater — coreset browser (refonte)")
+    p.add_argument("--buffer", type=str, default=argparse.SUPPRESS, dest="buffer_path")
+    p.add_argument("--wm", type=str, default=argparse.SUPPRESS, dest="wm_path")
+    p.add_argument("--pol", type=str, default=argparse.SUPPRESS, dest="pol_path")
+    p.add_argument("--index", type=int, default=argparse.SUPPRESS, dest="initial_index")
+    p.add_argument("--device", type=str, default=argparse.SUPPRESS,
+                   choices=["cpu", "cuda", "auto", "cpu-fast"])
+    p.add_argument("--sort", type=str, default=argparse.SUPPRESS, dest="initial_sort",
+                   choices=SORT_MODES)
+    p.add_argument("--seed", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--compile", action="store_true", default=argparse.SUPPRESS, dest="compile_wm")
+    CFG.merge_cli(params, vars(p.parse_args()))
     accel = params.pop("accel", False)
     if accel:
         params["device"] = "auto"
-
     run_theater(**params)
 
 
 if __name__ == "__main__":
     main()
-

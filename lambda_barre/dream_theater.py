@@ -135,15 +135,7 @@ def run(device: str | None = None,
                 sleep_gen = brain.sleep_cycle(wm_coreset_epoch=wm_coreset_epoch,
                                         wm_addendum_epoch=wm_addendum_epoch,
                                         pol_steps=pol_steps,
-                                        wm_target_loss=wm_target_loss,
-                                        prune_pct=prune_pct,
-                                        surprise_factor=surprise_factor,
-                                        prune_min_fill=prune_min_fill,
-                                        prune_beta=prune_beta,
-                                        dedup_eps=dedup_eps,
-                                        surprise_floor=surprise_floor,
-                                        use_kv_cache=use_kv_cache,
-                                        pol_eos_lookahead=pol_eos_lookahead)
+                                        wm_target_loss=wm_target_loss)
                 status = "sleeping..."
 
         # consume one sleep step per frame to keep the UI responsive

@@ -855,15 +855,17 @@ class Brain:
     def train_wm_phase(self, epochs: int, batch: int,
                        target_loss: float | None = None,
                        source: str = "coreset",
-                       label: str = "wm"):
+                       label: str = "wm",
+                       fixed_seq=None):
         """One WM training phase as a generator yielding ``(label, epoch, loss)``
         after each batch. 1 epoch = the whole dataset swept in batches without
-        omission or replacement; addendum is shuffled each epoch."""
+        omission or replacement; addendum is shuffled each epoch. ``fixed_seq``
+        (a sequence or a callable) is prepended to every batch."""
         buf = self.buffer
         seqs_all, metas_all = ((buf._addendum, buf._addendum_meta) if source == "addendum"
                                else (buf._coreset, buf._coreset_meta))
         n = len(seqs_all)
-        if n == 0:
+        if n == 0 and fixed_seq is None:
             return
         self.world.train()
         self.sleep_wm_epochs = epochs
@@ -882,7 +884,13 @@ class Brain:
             for start in range(0, n, batch):
                 idxs = order[start:start + batch]
                 self.sleep_wm_batch = start // batch + 1
-                loss_c = self._train_wm_batch([seqs_all[i] for i in idxs])
+                batch_seqs = [seqs_all[i] for i in idxs]
+                if fixed_seq is not None:
+                    fs = fixed_seq() if callable(fixed_seq) else fixed_seq
+                    batch_seqs = [fs] + batch_seqs
+                if not batch_seqs:
+                    continue
+                loss_c = self._train_wm_batch(batch_seqs)
                 epoch_losses.append(loss_c)
                 for i in idxs:
                     if i < len(metas_all):

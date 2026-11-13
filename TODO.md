@@ -19,7 +19,7 @@ causale/lookahead : à relire avec recul.
 
 ## À faire
 
-- [ ] wm_theater / wm_manager / dream_theater : refaire à partir de leurs fonctionnalités sur le nouveau layout (comparaison ground-truth vs rollout WM, training epoch-by-epoch sur séquence sélectionnée)
+- [x] wm_theater / wm_manager refaits sur le nouveau layout : 3 rangées (réel / WM µ plus probable / WM dénouement élu optimal), training epoch-by-epoch [T]/[W], testés headless ; dream_theater : appel sleep_cycle adapté (rendu à valider en interactif)
 - [ ] Optimisation du dataset (remise à plus tard par décision) : métadonnées riches, dedup, filtrage par surprise, pruning / oubli actif, tri plateau, pondération d'impact de la loss WM
 - [ ] DESIGN.md, README.md, ADR-0002 (refonte), session log
 - [ ] Nettoyer main.py des branches mortes (prune/meta/filter) quand l'optimisation dataset reviendra
