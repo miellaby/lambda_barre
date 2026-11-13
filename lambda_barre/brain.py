@@ -1064,6 +1064,11 @@ class Brain:
             sig = sig * vm
             tok = tmpl.unsqueeze(0).expand(B, -1).clone()
             tok[:, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = sig
+            # cohérence entraînement/génération : le token intero des états de
+            # la conséquence est masqué (à 0) dans les entrées du WM
+            if self.conseq_start <= q < self.action_pos \
+                    and (q - self.conseq_start) % STATE_TOKENS == _INTERO_IDX:
+                tok[:, SIG_OFFSET:] = 0.0
             gen.append(tok)
             curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
         gen = torch.stack(gen, dim=1)                            # [B, n_gen, 25]
