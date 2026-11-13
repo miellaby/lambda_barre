@@ -1,62 +1,47 @@
-- bugfix: le mask fait que la passe lookahead tient compte du contexte?
-il faut que l'action-décision voit l'EOS, mais aussi le contexte bien évidemment.
-- calculer la progression de la loss WM. préserver la loss WM
-  avant sommeil, calculer et stocker le ratio avec la nouvelle loss WM.
-  Si le ratio apres/avant > 0.95 = plateau WM
-- rajouter des métadonnées dans les séquences enregistrés:
-  * relief_score score de soulagement par l'EOS enregistré
-  * compteur d'apprentissage (+1 à chaque apprentissage causal dans un batch WM)
-  * vivacité (déja fait)
-  * causal_score similarité cosin de l'EOS causal et enregistré
-  * lookahead_score similarité cosin de la décision lookahead et enregistrée.
-  * dissonance: distance cosin entre l'action enregistrée et l'action politique
-  * surprise: loss au dernier entrainement causal
-  * latent: vecteur latent (capturé de façon similaire au latent  
-    intermédiaire d'entrée de politique) à la génération du token EOS
-  * score de soulagement politique (voir ci-après)
-- au début du sommeil, pour chaque séquence coreset/addendum. Faire les
-  passes causale et lookahead.
-  Et faire tourner la politique sur le contexte enregistré
-  puis le WM causal sur la suite de l'action politque.
-  Puis stocker dans les métadonnées:
-  * latent: vecteur capturé dans la passe causale au moment de générer
-    le token EOS.
-  * dissonance
-  * causal_score
-  * lookahead_score
-  * score de soulagement politique
-- Combiner la distance entre séquences pondérées par la salience
-  avec une distance cosin entre les latents des séquences.
-  Combiner (additionner/max) les 2 distances pour le clustering, le seuillage...
-- si plateau WM atteint uniquement, faire une version triée
- *temporaire* du coreset, triée par min-flou sur les valeurs
-  normées et pondérées de:
-      * déterminisme = (lookahed_score + causal_score) / 2
-      * consonnance = l'inverse de la dissonance
-      * vivacité
-  Les moins déterministes et les moins vivaces en premier.
-- Si le coreset dépasse la capacité de m séquences, 
-  supprimer du coreset les m première séquences du coreset trié
-  (supprimer aussi dans le coreset). Ne plus faire d'écratage du
-  coreset à d'autres endroits.
-- apprentissage WM. faire de vrais epoch WM pour coreset et addendum:
-  * 1 epoch = tout le dataset réparti en batchs sans omission ni remise
-    de séquences. Batcher dans l'ordre du coreset trié.
-  * L'epoch passe à 5 dans les configs.
-- l'oubli conditionné par la surprise ne concerne que les nouvelles séquences
-  de l'addendum (compteur apprentissage == 0 avant le premier entrainement)
-  à la premiere epoch: la séquence peut être supprimée aussitot (pas dans les epoch suivantes).
-- apps wm_manager/wm_theater: reporter les changements. pour l'entrainement
-  rajouter la séquence sélectionnée dans tous les batchs.
-- décalage action/conséquence à l'enregistrement en mode brain-off
-- si brain off, enregistrer chaque paire action-conséquence en mode $(a_n\ ;\ s_{n-k})$ avec $k$ paramétrable (k>=0) défaut 2. Enregistrement Brain ON équivaut à k forcé à 0
-- mettre à jour BACKLOG.md
-- faire des propositions d'ajoute dans ADR-0001-nomenclature.md
-- mettre à jour IDEAS.md et DESIGN.md
-- renommer Brain.sleep() en sleep_cycle() (traduction de "cycle de sommeil"),
-  mettre à jour les appelants (main.py, tests, docs) — FAIT 2026-11-12
-- à creuser: poids du terme latent dans la distance combinée dedup
-  (latent_weight=1.0 par défaut, addition vs max non tranché)
-- à creuser: amplitude du bruit sur le critère de tri (sorted_coreset_indices noise=0.05)
-- à creuser: vivacity_pow (p) actuellement 1.0, tester > 1
+# TODO — Refonte du World Model (REFONTE.md)
 
+Spec source : REFONTE.md. Le WM passe à un entraînement rétrotemporel à
+ dénouement. Le reste de la doc (README.md, DESIGN.md, sessions, ADL) décrit
+l'ancien fonctionnement à deux passes causale/lookahead : doc legacy, à
+relire avec recul.
+
+## Layout des séquences enregistrées
+
+- [ ] Fenêtre ordonnée : `contexte | dénouement | conséquence inversée | action de décision`
+- [ ] Dénouement = valeur observée réelle (ground truth), placée juste après le contexte
+- [ ] Conséquence inversée : états post-décision du plus tardif au plus précoce
+- [ ] Action de décision = dernier token de la séquence
+- [ ] Changement de layout = checkpoints invalides (`buf_ckpt.pt`, `wm_ckpt.pt`) : prévoir le `--reset`
+
+## Entraînement du WM
+
+- [ ] Un seul masque, un seul entraînement : loss sur tous les tokens à partir du dénouement
+- [ ] Contexte = prompt à poids 0 (loss sur la cible, pas sur la source, comme un transformer de traduction)
+- [ ] Dans le même forward : dénouement prédit depuis le contexte ; conséquence inversée puis action de décision prédites conditionnellement au dénouement
+- [ ] Aucun dénouement contrefactuel injecté à l'entraînement (pas de faux dataset, pas d'actions factices)
+
+## Sorties
+
+- [ ] Régressions continues [0,1] sur tous les tokens intermédiaires, aucune quantification
+- [ ] Seul le dénouement est discret : slots + softmax (sert à l'échantillonnage et à la proba p)
+
+## Inférence
+
+- [ ] Depuis le contexte, distribution de dénouements : échantillonnage top-K / top-p avec température (pas d'argmax)
+- [ ] Classement des dénouements échantillonnés selon f(probable, favorable) ; le meilleur est élu, pas nécessairement le plus probable
+- [ ] Génération auto-régressive depuis `[contexte, dénouement élu]` : dérouler la conséquence inversée jusqu'à l'action de décision (dernier token)
+- [ ] Dénouement élu meilleur que l'observé (extrapolation cross-contexte) uniquement si aucun dénouement observé depuis ce contexte n'est satisfaisant
+
+## Policy
+
+- [ ] Latent d'entrée de la policy = sortie du WM sur la partie contexte
+- [ ] Apprentissage par imitation de l'action de décision générée
+- [ ] Loss pondérée linéairement par la proba du dénouement élu : `loss *= p.detach()` par séquence du batch, p lu dans les logits (softmax des slots du dénouement)
+
+## Intégration & doc
+
+- [ ] Reporter les changements dans wm_manager, wm_theater, dream
+- [ ] Mettre à jour DESIGN.md, README.md, tokens.md / encodeur.md si le layout évolue
+- [ ] Proposer un ADR dans ADL/ pour la nomenclature de la refonte
+- [ ] Ouvrir session_YYYY_MM_DD.md pour tracer la refonte
+- [ ] Tests test_brain.py : masque unique (poids 0 sur le contexte), forward conditionnel au dénouement, échantillonnage top-K/température, pondération policy par `p.detach()`
