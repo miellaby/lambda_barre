@@ -213,7 +213,7 @@ class WMTheater:
     """Coreset browser: 3 rows per sequence (real / WM argmax / WM elected)."""
 
     def __init__(self, brain: Brain, buffer: ExperienceBuffer,
-                 width: int = 1600, height: int = 760,
+                 width: int = 1120, height: int = 640,
                  initial_sort: str = "relief_desc"):
         self.brain = brain
         self.buffer = buffer
@@ -222,9 +222,38 @@ class WMTheater:
         self.sort_mode = initial_sort if initial_sort in SORT_MODES else "coreset"
         self.sorted_idx = 0
         self.cache: dict[int, WMTheaterRecord] = {}
-        self.footer_hints = "Nav: [← / →]  |  [S] Sort  |  [R] Random  |  [Esc] Quit"
+        self.footer_hints = "Nav: [← / →]  |  [S] Sort  |  [R] Random  |  drag: scroll mignatures  |  [Esc] Quit"
         self.title_str = "WM THEATER"
+        # géométrie du container scrollable des mignatures
+        self.thumb_w, self.thumb_h, self.gap = 76, 56, 4
+        self.header_h = 62
+        self.bottom_margin = 24          # footer ; le manager ajoute sa strip
+        self.scroll_x = 0
+        self.scroll_y = 0
+        self._drag: tuple | None = None  # (mouse_pos, scroll au départ du drag)
         self._update_sorted_indices()
+
+    @property
+    def _container_rect(self) -> pygame.Rect:
+        """Zone scrollable (mignatures + lignes EOS) : sous le header, au-dessus
+        du footer (et de la strip du manager)."""
+        top = self.header_h
+        bottom = self.height - self.bottom_margin
+        return pygame.Rect(0, top, self.width, max(0, bottom - top))
+
+    def _content_size(self, rec: WMTheaterRecord | None) -> tuple[int, int]:
+        if rec is None:
+            return (0, 0)
+        n = len(rec.real_steps)
+        w = 16 + n * (self.thumb_w + self.gap)
+        h = 3 * (16 + self.thumb_h + 8) + 4 + 3 * 14   # 3 rows + marge + lignes EOS
+        return (w, h)
+
+    def _clamp_scroll(self, rec: WMTheaterRecord | None) -> None:
+        cw, ch = self._content_size(rec)
+        cont = self._container_rect
+        self.scroll_x = max(0, min(self.scroll_x, max(0, cw - cont.w)))
+        self.scroll_y = max(0, min(self.scroll_y, max(0, ch - cont.h)))
 
     @property
     def num_seqs(self) -> int:
@@ -311,57 +340,98 @@ class WMTheater:
             elif ev.key == pygame.K_r:
                 self.random_seq()
                 return True
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if self._container_rect.collidepoint(ev.pos):
+                self._drag = ev.pos
+                return True
+        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            self._drag = None
+        elif ev.type == pygame.MOUSEMOTION and self._drag is not None:
+            self._apply_scroll(ev.pos[0] - self._drag[0], ev.pos[1] - self._drag[1])
+            self._drag = ev.pos
+            return True
+        elif ev.type == pygame.MOUSEWHEEL:
+            pos = getattr(ev, "pos", None) or pygame.mouse.get_pos()
+            if self._container_rect.collidepoint(pos):
+                self._apply_scroll(-ev.x * 40, ev.y * 40)
+                return True
         return False
 
+    def _apply_scroll(self, dx: float, dy: float) -> None:
+        """Applique un delta de scroll (convention drag naturel : scroll -= delta
+        souris). Scroll horizontal prioritaire : si le contenu déborde en
+        largeur mais pas en hauteur, le mouvement vertical (trackpad deux
+        doigts, molette) est mappé sur l'horizontal."""
+        rec = self.get_record()
+        cont = self._container_rect
+        cw, ch = self._content_size(rec)
+        h_overflow = cw - cont.w > 0
+        v_overflow = ch - cont.h > 0
+        if h_overflow and not v_overflow:
+            self.scroll_x -= dx + dy
+        else:
+            self.scroll_x -= dx
+            self.scroll_y -= dy
+        self._clamp_scroll(rec)
+
     # --- drawing ------------------------------------------------------------
-    def _draw_row(self, screen, rec: WMTheaterRecord, key: str, y: int,
+    def _draw_row(self, screen, rec: WMTheaterRecord, key: str, x0: int, y0: int,
                   font_small, font_tiny) -> int:
+        """Dessine une rangée de mignatures à partir de (x0, y0) — coordonnées
+        déjà translatées du scroll par l'appelant. Retourne le y de fin."""
         color = ROW_COLORS[key]
         steps = {"real": rec.real_steps, "argmax": rec.argmax_steps,
                  "elected": rec.elected_steps}[key]
-        screen.blit(font_small.render(ROW_LABELS[key], FONT_AA, color), (16, y))
-        yy = y + 16
-        x = 16
-        thumb_w, thumb_h, gap = 92, 68, 6
+        screen.blit(font_small.render(ROW_LABELS[key], FONT_AA, color), (x0, y0))
+        yy = y0 + 16
+        x = x0
         for st in steps:
-            rect = pygame.Rect(x, yy, thumb_w, thumb_h)
+            rect = pygame.Rect(x, yy, self.thumb_w, self.thumb_h)
             draw_thumbnail(screen, rect, st, font_tiny, facing=1, cand_color=color)
-            x += thumb_w + gap
-        return yy + thumb_h + 8
+            x += self.thumb_w + self.gap
+        return yy + self.thumb_h + 8
 
     def _draw_header(self, screen, rec: WMTheaterRecord | None, font, font_small) -> int:
-        pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, 56))
+        pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h - 6))
         title = f"{self.title_str}  |  seq {self.sorted_idx + 1}/{len(self.order)} (idx {rec.seq_idx if rec else '-'})  |  sort {self.sort_mode}"
         screen.blit(font.render(title, FONT_AA, TEXT_WHITE), (16, 8))
         if rec is not None:
-            info = (f"relief réel {rec.real_relief:+.3f} | µ {rec.argmax_relief:+.3f} | "
-                    f"élu {rec.elected_relief:+.3f} (p={rec.p_elected:.2f}) | "
-                    f"cos(a*,a4) µ {rec.cos_argmax:+.2f} élu {rec.cos_elected:+.2f} | "
-                    f"rmse posture {rec.rmse_posture_elected:.3f} coût {rec.rmse_cost_elected:.3f}")
+            info = (f"relief reel {rec.real_relief:+.3f} | mu {rec.argmax_relief:+.3f} | "
+                    f"elu {rec.elected_relief:+.3f} (p={rec.p_elected:.2f}) | "
+                    f"cos(a*,a4) mu {rec.cos_argmax:+.2f} elu {rec.cos_elected:+.2f} | "
+                    f"rmse posture {rec.rmse_posture_elected:.3f} cout {rec.rmse_cost_elected:.3f}")
             screen.blit(font_small.render(info, FONT_AA, TEXT_ACCENT), (16, 32))
-        return 62
+        return self.header_h
 
     def draw(self, screen, font, font_small, font_tiny=None) -> None:
         if font_tiny is None:
             font_tiny = font_small
         screen.fill(DREAM_BG)
         rec = self.get_record()
-        y = self._draw_header(screen, rec, font, font_small)
+        self._draw_header(screen, rec, font, font_small)
+        # container scrollable des mignatures (drag / molette), dessiné avec clip
+        cont = self._container_rect
+        self._clamp_scroll(rec)
+        prev_clip = screen.get_clip()
+        screen.set_clip(cont)
+        pygame.draw.rect(screen, (14, 16, 22), cont)
         if rec is None:
-            screen.blit(font.render("coreset vide", FONT_AA, TEXT_MUTED), (16, y))
+            screen.blit(font.render("coreset vide", FONT_AA, TEXT_MUTED),
+                        (cont.x + 16 - self.scroll_x, cont.y - self.scroll_y))
         else:
-            y = self._draw_row(screen, rec, "real", y, font_small, font_tiny)
-            y = self._draw_row(screen, rec, "argmax", y, font_small, font_tiny)
-            y = self._draw_row(screen, rec, "elected", y, font_small, font_tiny)
-            # dénouements (6 slots) en clair
-            if rec is not None:
-                yy = y + 4
-                for lbl, eos, col in (("EOS obs", rec.eos_observed, TEXT_MUTED),
-                                      ("EOS µ", rec.eos_argmax, ROW_COLORS["argmax"]),
-                                      ("EOS élu", rec.eos_elected, ROW_COLORS["elected"])):
-                    txt = f"{lbl}: " + " ".join(f"{v:.2f}" for v in eos)
-                    screen.blit(font_tiny.render(txt, FONT_AA, col), (16, yy))
-                    yy += 14
+            ox = cont.x + 16 - self.scroll_x
+            oy = cont.y - self.scroll_y
+            y = self._draw_row(screen, rec, "real", ox, oy, font_small, font_tiny)
+            y = self._draw_row(screen, rec, "argmax", ox, y, font_small, font_tiny)
+            y = self._draw_row(screen, rec, "elected", ox, y, font_small, font_tiny)
+            yy = y + 4
+            for lbl, eos, col in (("EOS obs", rec.eos_observed, TEXT_MUTED),
+                                  ("EOS mu", rec.eos_argmax, ROW_COLORS["argmax"]),
+                                  ("EOS elu", rec.eos_elected, ROW_COLORS["elected"])):
+                txt = f"{lbl}: " + " ".join(f"{v:.2f}" for v in eos)
+                screen.blit(font_tiny.render(txt, FONT_AA, col), (ox, yy))
+                yy += 14
+        screen.set_clip(prev_clip)
         pygame.draw.rect(screen, CARD_BORDER, (0, self.height - 24, self.width, 24))
         screen.blit(font_small.render(self.footer_hints, FONT_AA, TEXT_MUTED),
                     (16, self.height - 20))
@@ -381,7 +451,7 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Theater — refonte")
-    width, height = 1600, 760
+    width, height = 1120, 640
     screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)

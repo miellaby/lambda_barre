@@ -37,6 +37,7 @@ class WMManager(WMTheater):
                  phase_epochs: int = 512, phase_batch: int = 64,
                  phase_target: float | None = 0.01, **kwargs):
         super().__init__(brain, buffer, **kwargs)
+        self.bottom_margin = 24 + 8 + STRIP_H   # footer + strip d'entraînement
         self.wm_path = wm_path
         self.training = False
         self.phase_gen = None
@@ -206,7 +207,7 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Manager — refonte")
-    width, height = 1600, 830
+    width, height = 1120, 712
     screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
