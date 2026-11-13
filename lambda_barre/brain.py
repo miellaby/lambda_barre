@@ -1,28 +1,29 @@
-"""The brain of λ̄: orchestrates the world model and the policy.
+"""Cerveau de λ̄ — refonte WM à dénouement (REFONTE.md).
 
-This wires the "IA à 2 modèles" (``models.py``) into the live loop. During
-*éveil* (wake) the policy drives the actuator consignes and every transition
-(state, action, next-state) is journaled into an experience buffer. During
-*sommeil* (sleep) the brain trains offline:
+Pendant l'*éveil* (wake) la policy pilote les consignes et chaque transition
+est journalisée dans un buffer d'expérience. Pendant le *sommeil* (sleep) le
+cerveau entraîne hors ligne :
 
-  1. the world model learns to predict the signal slots of the next token
-     across a trajectory of SEQ_STEPS consecutive transitions (teacher forcing,
-     salve-within-type attention mask);
-  2. the policy is trained by reinforcement learning on *imagined*
-     trajectories: it samples an action, the (frozen) world model rolls the
-     state forward, and the policy is pushed (REINFORCE) toward actions whose
-     imagined trajectories have low predicted cost.
+  1. le world model apprend la séquence enregistrée réordonnée :
+     ``contexte | dénouement | conséquence inversée | action de décision``
+     (voir ``compute_seq_layout`` / ``build_sequence``) ;
+  2. la policy imite l'action de décision générée par le WM conditionné sur
+     un dénouement élu (échantillonné puis élu selon f(probable, favorable)),
+     la loss étant pondérée par la probabilité du dénouement élu.
 
-That is the model-based RL loop of `Lambda barre.md`: the policy learns from
-the world model's anticipation of consequences, not from direct reward.
+Une salve est une liste de 16 tokens denses (13 capteurs + 3 moteurs), chaque
+token un vecteur de 25 floats (voir ``tokenize``). Une *séquence enregistrée*
+est une liste plate de ``seq_len`` tokens dans l'ordre rétrotemporel ci-dessus.
+Le journal de veille reste un flux de salves temporelles ; le réordonnancement
+(et le calcul du token dénouement, qui dépend des salves futures) se fait à
+l'extraction des séquences (``ExperienceBuffer.extract_addendum``).
 
-A salve is a list of 16 dense tokens (13 sensory + 3 motor), each a 25-float
-vector (see ``tokenize``). All tensors live on CPU. The buffer stores plain
-Python lists of tokens (list[list[float]]).
+Un seul masque (strictement causal), un seul forward par batch d'entraînement :
+la loss porte sur tous les tokens à partir du dénouement, le contexte sert de
+prompt (poids 0).
 """
 from __future__ import annotations
 
-import bisect
 import itertools
 import math
 import os
@@ -33,8 +34,8 @@ from collections import deque
 import torch
 
 from . import models as M
-from .dream import DreamStep, DreamTrajectory, DreamRecord, REGIME_NAMES
-from .models import build_salve_mask, KVCache
+from .dream import DreamStep, DreamTrajectory, DreamRecord
+from .models import build_salve_mask
 from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
                        _M_INTERO, _EOS_CHANNEL_W,
@@ -53,210 +54,217 @@ _N_CTX = N_CTX  # backward-compatible alias
 
 
 def compute_seq_layout(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX) -> dict:
-    """Compute geometric positions and token dimensions derived from seq_steps and n_ctx."""
+    """Géométrie de la séquence enregistrée (REFONTE.md) :
+
+        contexte | dénouement | conséquence inversée | action de décision
+
+    - contexte : ``[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]`` (``ctx_len`` tokens) ;
+    - dénouement : 1 token EOS à la position ``eos_pos = ctx_len`` ;
+    - conséquence inversée : les états post-décision du plus tardif au plus
+      précoce, ``s_{seq_steps} .. s_{n_ctx+1}`` (``n_imagine`` salves de 13
+      tokens, ``conseq_len`` tokens) ;
+    - action de décision : ``a_{n_ctx}`` (3 tokens) en fin de séquence.
+
+    ``decision_pos`` reste ``ctx_len`` : c'est la fin du contexte (dernier
+    token = s_{n_ctx}) ; l'action de décision siège à ``action_pos``.
+    """
     assert n_ctx < seq_steps, f"n_ctx ({n_ctx}) must be strictly less than seq_steps ({seq_steps})"
-    seq_len = seq_steps * SALVE_TOKENS + STATE_TOKENS
-    decision_pos = n_ctx * SALVE_TOKENS + STATE_TOKENS   # premier token de a4 (la décision)
-    eos_pos = seq_steps * SALVE_TOKENS + _INTERO_IDX
+    ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
+    eos_pos = ctx_len
     n_imagine = seq_steps - n_ctx
+    conseq_start = eos_pos + 1
+    conseq_len = n_imagine * STATE_TOKENS
+    action_pos = conseq_start + conseq_len
+    seq_len = action_pos + ACTION_TOKENS
     return {
         "seq_steps": seq_steps,
         "n_ctx": n_ctx,
         "seq_len": seq_len,
-        "decision_pos": decision_pos,
+        "ctx_len": ctx_len,
+        "decision_pos": ctx_len,
         "eos_pos": eos_pos,
+        "conseq_start": conseq_start,
+        "conseq_len": conseq_len,
+        "action_pos": action_pos,
         "n_imagine": n_imagine,
     }
 
 
-def compute_eos_time_weights(n_imagine: int) -> list[float]:
-    """Poids de la fenêtre de conséquence dans l'EOS : progression linéaire du
-    premier état (qui suit immédiatement l'action) au dernier état, le dernier
-    pesant exactement 2x le premier. Normalisés."""
-    if n_imagine <= 0:
-        return []
-    if n_imagine == 1:
-        return [1.0]
-    w = [1.0 + i / (n_imagine - 1) for i in range(n_imagine)]
-    total = sum(w)
-    return [x / total for x in w]
+def compute_salve_positions(seq_steps: int = DEFAULT_SEQ_STEPS,
+                            n_ctx: int = DEFAULT_N_CTX) -> list[int]:
+    """Position temporelle (indice de salve) de chaque token de la séquence
+    enregistrée, pour l'encodage positionnel sinusoïdal keyed by salve :
+    contexte 0..n_ctx, EOS à ``seq_steps``, conséquence inversée
+    ``seq_steps..n_ctx+1`` (décroissant), action de décision à ``n_ctx``."""
+    layout = compute_seq_layout(seq_steps, n_ctx)
+    sp = [0] * layout["seq_len"]
+    for i in range(n_ctx):
+        for t in range(SALVE_TOKENS):
+            sp[i * SALVE_TOKENS + t] = i
+    for t in range(STATE_TOKENS):
+        sp[n_ctx * SALVE_TOKENS + t] = n_ctx
+    sp[layout["eos_pos"]] = seq_steps
+    for j, k in enumerate(range(seq_steps, n_ctx, -1)):
+        for t in range(STATE_TOKENS):
+            sp[layout["conseq_start"] + j * STATE_TOKENS + t] = k
+    for t in range(ACTION_TOKENS):
+        sp[layout["action_pos"] + t] = n_ctx
+    return sp
 
 
-def compute_context_time_weights(n_early: int) -> list[float]:
-    """Poids du contexte de décision dans l'EOS : uniquement la salve de la
-    prise de décision s4 (dernière du contexte s0..s4) — one-hot sur le
-    dernier état."""
-    if n_early <= 0:
-        return []
-    return [0.0] * (n_early - 1) + [1.0]
+def build_target_tables(seq_steps: int = DEFAULT_SEQ_STEPS,
+                        n_ctx: int = DEFAULT_N_CTX) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tables (valid, weight) de la loss WM, une par ligne prédictrice p
+    (la ligne p prédit le token p+1) :
 
-
-def build_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX,
-                       w_state_post: float = 1.0, w_act_post: float = 1.0,
-                       w_eos: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build _target_valid and _target_weight tensors for a given seq_steps.
-
-    Row weights are relative to the context baseline 1.0: ``w_state_post`` /
-    ``w_act_post`` scale the rows predicting a state / action token of a
-    post-decision salve (k > n_ctx), ``w_eos`` scales the terminal denouement
-    rows (last salve's cost/reward slots and the EOS token). Defaults
-    reproduce the historical "full" weighting (1.0 everywhere, boost on the
-    terminal rows)."""
-    if w_eos is None:
-        w_eos = _WM_REWARD_BOOST
-    seq_len = seq_steps * SALVE_TOKENS + STATE_TOKENS
-    target_valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
-    target_weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
-    for p in range(seq_len - 1):
-        tidx = (p + 1) % SALVE_TOKENS
-        if tidx == _INTERO_IDX and (p + 1) < (seq_len - 1):
-            continue
-        n = _EOS_NSLOTS if (p + 1) == (seq_len - 1) else _N_SIGNALS[tidx]
-        target_valid[p, :n] = True
-        k = (p + 1) // SALVE_TOKENS
-        if p + 1 >= seq_steps * SALVE_TOKENS + _COST_IDX:
-            w = w_eos                     # terminal cost/reward/EOS rows
-        elif k > n_ctx:
-            w = w_act_post if tidx >= STATE_TOKENS else w_state_post
-        else:
-            w = 0.0                       # contexte : pas de loss (prédiction triviale)
-        target_weight[p, :n] = w
-
-    return target_valid, target_weight
-
-
-def build_lookahead_target_masks(seq_steps: int = DEFAULT_SEQ_STEPS,
-                                  n_ctx: int = DEFAULT_N_CTX) -> tuple[torch.Tensor, torch.Tensor]:
-    """Target tables for the lookahead pass: the inversion only — the gap
-    between the estimated a_{n_ctx} and the observed one. The only trained
-    rows are the three predicting the consigne tokens of salve ``n_ctx``.
-    Nothing else is asked of this pass: reconstructing the future after a4
-    serves no consumer (generation queries a4 only, the causal rollout is
-    display), and training it would dilute the inversion back into state
-    prediction. The state dynamics and the dénouement prediction remain the
-    causal pass's job."""
+    - poids 0 sur le contexte (tokens 0..ctx_len-1) : prompt, pas appris ;
+    - poids 1.0 sur tous les tokens à partir du dénouement (inclus) ;
+    - ``valid`` = slots de signal valides du token cible (EOS : 6 slots,
+      états : _N_SIGNALS[tidx], actions : _N_SIGNALS[13..15]).
+    """
     layout = compute_seq_layout(seq_steps, n_ctx)
     seq_len = layout["seq_len"]
-    decision_pos = layout["decision_pos"]
-    target_valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
-    target_weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
-    for i in range(ACTION_TOKENS):
-        p = decision_pos - 1 + i                # row predicting consigne token i of a_{n_ctx} (row p predicts token p+1)
-        tidx = (p + 1) % SALVE_TOKENS
-        n = _N_SIGNALS[tidx]
-        target_valid[p, :n] = True
-        target_weight[p, :n] = 1.0
-    return target_valid, target_weight
+    ctx_len = layout["ctx_len"]
+    eos_pos = layout["eos_pos"]
+    conseq_start = layout["conseq_start"]
+    action_pos = layout["action_pos"]
+    valid = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.bool)
+    weight = torch.zeros(seq_len - 1, N_SIGNAL, dtype=torch.float32)
+    for p in range(seq_len - 1):
+        q = p + 1
+        if q == eos_pos:
+            n = _EOS_NSLOTS
+        elif q < ctx_len:
+            n = _N_SIGNALS[q % SALVE_TOKENS]
+        elif q < action_pos:
+            n = _N_SIGNALS[(q - conseq_start) % STATE_TOKENS]
+        else:
+            n = _N_SIGNALS[STATE_TOKENS + (q - action_pos)]
+        valid[p, :n] = True
+        weight[p, :n] = 0.0 if q < ctx_len else 1.0
+    return valid, weight
 
 
-def build_lookahead_gen_mask(ctx_len: int, device, decision_pos: int | None = None) -> torch.Tensor:
-    """Lookahead attention mask on a compact ``[ctx_len tokens, EOS]`` input.
-
-    ``decision_pos`` is the position of a4's first token. The lookahead pass
-    exists only to generate a4, so only the 3 rows that predict a4
-    (decision_pos-1..decision_pos+1) attend the EOS token. The EOS attends
-    only the context (0..decision_pos-1) and itself — never a4. The a4 rows
-    attend no recorded context action (anti-copy). Used as-is for generation
-    ([context, EOS] + tokens generated so far) and for training
-    ([context, a4 teacher-forced, EOS]). If decision_pos is None, defaults
-    to _DECISION_POS."""
-    if decision_pos is None:
-        decision_pos = _DECISION_POS
-    dp = decision_pos
-    m = build_salve_mask(ctx_len + 1, device).clone()
-    m[dp - 1:dp - 1 + ACTION_TOKENS, ctx_len] = False  # a4 rows attend the EOS
-    m[ctx_len, dp:ctx_len] = True                      # the EOS never sees a4
-    n_ctx = dp // SALVE_TOKENS
-    for k in range(n_ctx):                             # anti-copy: no context actions
-        m[dp - 1:dp + ACTION_TOKENS - 1,
-          k * SALVE_TOKENS + STATE_TOKENS: (k + 1) * SALVE_TOKENS] = True
-    return m
-
-
-_LAYOUT_DEFAULT = compute_seq_layout(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX)
-_SEQ_LEN = _LAYOUT_DEFAULT["seq_len"]
-_DECISION_POS = _LAYOUT_DEFAULT["decision_pos"]
-_EOS_POS = _LAYOUT_DEFAULT["eos_pos"]
-_EOS_IMAGINE = _LAYOUT_DEFAULT["n_imagine"]
-_EXPLORE_MARGIN_PCT = 0.001                                # 0.1% cost reduction margin required for alternative candidates
-_WM_SALIENCY_MAX_LOSS = 0.02                               # Coreset WM loss below which EOS-saliency distances are trusted
-_WM_IMPACT_FLOOR = 0.25                     # additive floor on every sequence's cost impact (~3x impact/neutral contrast at relief 0.5)
-_WM_REWARD_BOOST = 2.0                                       # gradient boost on S10 reward slots and terminal EOS delta
-_WM_LOOKAHEAD_PERIOD = 2                                     # WM mask alternation: 1 lookahead pass every 2 (1:1 causal:lookahead)
-_EOS_FORCE_AMP = (0.015, 0.0375)                            # default hindsight forcing range, en unites de slot EOS (1 slot = 0.5 de delta de cout)
+# --- dénouement (EOS) ---------------------------------------------------------
 _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
 _EOS_DECAY = 0.9          # décroissance temporelle de l'écart au but dans l'EOS
 _EOS_POIDS_CHEMIN = 0.1   # poids du coût du chemin dans le progrès par canal
 _EOS_MAX_P = 8.0          # exposant du max flou agrégeant les canaux (relief_score)
-_EOS_TIME_W = compute_eos_time_weights(_EOS_IMAGINE)
-_EOS_TIME_W_T = torch.tensor(_EOS_TIME_W, dtype=torch.float32)
-_CONTEXT_TIME_W = compute_context_time_weights(DEFAULT_N_CTX + 1)
-_CONTEXT_TIME_W_T = torch.tensor(_CONTEXT_TIME_W, dtype=torch.float32)
 _EOS_CHANNEL_W_T = (torch.tensor(_EOS_CHANNEL_W, dtype=torch.float32)
                     / sum(_EOS_CHANNEL_W))                   # sums to 1
 
-
-# Precomputed cost metadata (from the dense layout) for the vectorized
-# trajectory-cost: 5 unsigned cost signals (token 10) + 1 signed confort
-# signal (token 11). Denormalize: unsigned -> t*scale, signed -> (2t-1)*scale.
-_COST_SCALES = torch.tensor([_BY_KEY[k].max_val for k in _COST_KEYS],
-                            dtype=torch.float32)              # [5]
-_COST_SIGNED = torch.tensor([_BY_KEY[k].signed for k in _COST_KEYS],
-                            dtype=torch.bool)                  # [5]
-_COST_W = torch.tensor([_COST_WEIGHTS[k] for k in _COST_KEYS],
-                      dtype=torch.float32)                    # [5]
-_CONFORT_SCALE = _BY_KEY["confort"].max_val
-_CONFORT_W = _COST_WEIGHTS["confort"]
-
-# Flat signal-grid indices for the 45 policy scalars: tokens 0..9, first
-# _N_SIGNALS[i] slots each. Used to gather them in one op from a [B, 13, 16]
-# signal grid.
-_POL_SCALAR_IDX = []
-for _i in range(_INTERO_IDX):             # tokens 0..11 (hors bilan métabolique 12)
-    for _k in range(_N_SIGNALS[_i]):
-        _POL_SCALAR_IDX.append(_i * N_SIGNAL + _k)
-assert len(_POL_SCALAR_IDX) == N_POLICY_STATE  # 51
-# print(f"policy scalars: {_POL_SCALAR_IDX} (len={len(_POL_SCALAR_IDX)})")
-
-# Action encoding metadata: 5 consignes → (token-within-action-block, slot,
-# scale, signed). The action block is tokens 13..15 (3 tokens).
-_ACT_KEYS = ("membre_avant_theta", "membre_avant_d", "membre_arriere_theta", "membre_arriere_d",
-             "queue_theta")
-_ACT_LAYOUT = []   # (tok_in_block, slot)
-for _i in range(STATE_TOKENS, SALVE_TOKENS):    # 13, 14, 15
-    for _k, _key in enumerate(_LAYOUT[_i].signals):
-        _ACT_LAYOUT.append((_i - STATE_TOKENS, _k, _key))
-_ACT_TOK = torch.tensor([t for t, _, _ in _ACT_LAYOUT], dtype=torch.long)
-_ACT_SLOT = torch.tensor([s for _, s, _ in _ACT_LAYOUT], dtype=torch.long)
-_ACT_SCALES = torch.tensor([_BY_KEY[k].max_val for _, _, k in _ACT_LAYOUT],
-                           dtype=torch.float32)
-_ACT_SIGNED = torch.tensor([_BY_KEY[k].signed for _, _, k in _ACT_LAYOUT],
-                           dtype=torch.bool)
-# Template: 3 action tokens with structural prefix, zeroed signals.
-_ACT_TEMPLATE = torch.tensor(
-    [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
-     for i in range(STATE_TOKENS, SALVE_TOKENS)], dtype=torch.float32)
-
-_target_valid, _target_weight = build_target_masks(DEFAULT_SEQ_STEPS)
-_target_valid_look, _target_weight_look = build_lookahead_target_masks(DEFAULT_SEQ_STEPS, DEFAULT_N_CTX)
-_MASK = build_salve_mask(_SEQ_LEN, torch.device("cpu"))
-_LOOK_CTX_LEN = _DECISION_POS + ACTION_TOKENS        # contexte + a4 teacher-forcé, avant l'EOS
-_MASK_LOOKAHEAD = build_lookahead_gen_mask(_LOOK_CTX_LEN, torch.device("cpu"), _DECISION_POS)
-
-
-# Structural template of the terminal EOS token: intero modality, dedicated
-# canal, state type, zeroed signal slots (filled with the 6 cost-aggregate
-# slots at batch time / generation time).
+# Structural template of the dénouement token: intero modality, dedicated
+# canal, state type, signal slots filled with the 6 cost-aggregate slots.
 _EOS_TEMPLATE = torch.tensor(
     [0.0] + list(_M_INTERO) + list(_EOS_CANAL) + [0.0] * N_SIGNAL,
     dtype=torch.float32)
 
-# Channels tracked for static detection:
-#   - animal: proprioception (tokens 0..3) and touch (tokens 8..9)
-#   - environnement: vision (tokens 4, 6), ball/sound (tokens 5, 7), touch (tokens 8..9)
-#   - consignes: action (tokens 13..15)
-# Excludes reward/cost accumulators (tokens 10, 11) and interoception (token 12).
+
+def _eos_slots_of_window(window: list, n_ctx: int = DEFAULT_N_CTX,
+                         decay: float = _EOS_DECAY,
+                         poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[float]:
+    """Les 6 slots du token dénouement d'une fenêtre temporelle de salves
+    (seq_steps+1 salves de 16 tokens) : progrès par canal
+    f = P - poids_chemin*A, P = c[s_{n_ctx}] - c[fin], A = Σ_k decay^k (c[s_{n_ctx+1+k}] - c[fin]).
+    Slot 5 = inconfort (-confort). 0.5 = neutre."""
+    L = len(window)
+    if L <= n_ctx + 1:
+        return [0.5] * _EOS_NSLOTS
+    try:
+        c = []
+        for salve in window:
+            row = [salve[_COST_IDX][SIG_OFFSET + j] for j in range(5)]
+            row.append(-salve[_REWARD_IDX][SIG_OFFSET])    # inconfort = -confort
+            c.append(row)
+        P = [c[n_ctx][j] - c[-1][j] for j in range(_EOS_NSLOTS)]
+        out = []
+        for j in range(_EOS_NSLOTS):
+            diffs = [(c[k][j] - c[-1][j]) * decay ** (k - n_ctx - 1) for k in range(n_ctx + 1, L)]
+            A = sum(diffs)
+            r = P[j] - poids_chemin * A
+            out.append(0.5 + 0.5 * r / (1.0 + abs(r)))
+        return out
+    except (IndexError, TypeError):
+        return [0.5] * _EOS_NSLOTS
+
+
+def eos_token_from_slots(slots) -> list[float]:
+    """Token dénouement (25 floats) depuis 6 slots [0,1] (liste ou tensor)."""
+    if hasattr(slots, "tolist"):
+        slots = slots.tolist()
+    tok = [0.0] + list(_M_INTERO) + list(_EOS_CANAL) + list(slots[:_EOS_NSLOTS])
+    tok += [0.0] * (N_SIGNAL - _EOS_NSLOTS)
+    return tok
+
+
+def build_sequence(window: list, n_ctx: int = DEFAULT_N_CTX,
+                   decay: float = _EOS_DECAY,
+                   poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[list[float]]:
+    """Réordonne une fenêtre temporelle de ``seq_steps+1`` salves en séquence
+    enregistrée (liste plate de ``seq_len`` tokens) :
+
+        contexte | dénouement | conséquence inversée | action de décision
+
+    - contexte : salves complètes ``s_i+a_i`` (i < n_ctx) puis ``s_{n_ctx}`` seul ;
+    - dénouement : 1 token calculé depuis la fenêtre (ground truth) ;
+    - conséquence inversée : états seuls ``s_{seq_steps} .. s_{n_ctx+1}`` ;
+    - action de décision : ``a_{n_ctx}`` (3 tokens), dernier token de la séquence.
+    """
+    seq_steps = len(window) - 1
+    seq: list[list[float]] = []
+    for i in range(n_ctx):
+        seq.extend(window[i])                              # s_i + a_i
+    seq.extend(state_tokens(window[n_ctx]))                # s_{n_ctx}
+    seq.append(eos_token_from_slots(
+        _eos_slots_of_window(window, n_ctx=n_ctx, decay=decay, poids_chemin=poids_chemin)))
+    for k in range(seq_steps, n_ctx, -1):                  # conséquence inversée
+        seq.extend(state_tokens(window[k]))
+    seq.extend(action_tokens(window[n_ctx]))               # a_{n_ctx}
+    return seq
+
+
+def sequence_to_window(seq: list, n_ctx: int = DEFAULT_N_CTX,
+                       seq_steps: int = DEFAULT_SEQ_STEPS) -> list[list[list[float]]]:
+    """Inverse de ``build_sequence`` (pour l'affichage) : reconstruit la fenêtre
+    temporelle de ``seq_steps+1`` salves. Les actions a_{n_ctx+1..} ne sont pas
+    dans la séquence enregistrée : elles sont laissées à zéro."""
+    layout = compute_seq_layout(seq_steps, n_ctx)
+    ctx_len = layout["ctx_len"]
+    conseq_start = layout["conseq_start"]
+    action_pos = layout["action_pos"]
+    window: list[list[list[float]]] = []
+    for i in range(n_ctx):
+        window.append([list(t) for t in seq[i * SALVE_TOKENS:(i + 1) * SALVE_TOKENS]])
+    s_dec = [list(t) for t in seq[ctx_len - STATE_TOKENS:ctx_len]]
+    a_dec = [list(t) for t in seq[action_pos:action_pos + ACTION_TOKENS]]
+    window.append(s_dec + a_dec)
+    for k in range(n_ctx + 1, seq_steps + 1):              # s_{n_ctx+1} .. s_{seq_steps}
+        j = seq_steps - k                                  # position dans la conséquence inversée
+        s = [list(t) for t in seq[conseq_start + j * STATE_TOKENS:
+                                  conseq_start + (j + 1) * STATE_TOKENS]]
+        window.append(s + [[0.0] * DENSE_DIM] * ACTION_TOKENS)
+    return window
+
+
+def relief_score(x, eos_pos: int | None = None, p: float = _EOS_MAX_P):
+    """Score de soulagement : max flou pondéré des 6 slots du token dénouement
+    (poids de canaux normalisés, exposant p). Accepte un tensor de slots
+    [..., 6] ou une séquence enregistrée (liste plate : le token dénouement est
+    lu à ``eos_pos``). Retourne un tensor [...] ; positif = gain."""
+    if isinstance(x, torch.Tensor):
+        slots = x
+    else:
+        if eos_pos is None:
+            eos_pos = compute_seq_layout()[ "eos_pos"]
+        slots = torch.tensor(x[eos_pos][SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS],
+                             dtype=torch.float32)
+    w = _EOS_CHANNEL_W_T.to(slots.device)
+    mf = ((w * slots ** p).sum(dim=-1)) ** (1.0 / p)
+    return 2.0 * (mf - 0.5)
+
+
+# --- static detection ---------------------------------------------------------
 _STATIC_SOURCES = {"proprio", "touch", "ball", "vision", "action"}
 _STATIC_TOKENS = tuple(ch.idx for ch in _LAYOUT if ch.source in _STATIC_SOURCES)
 
@@ -277,229 +285,51 @@ def _salve_moved(s1: list[list[float]], s2: list[list[float]],
     return False
 
 
-def _eos_progres(c: list[float], n_ctx: int, decay: float, poids_chemin: float) -> float:
-    """Progrès d'un canal sur sa série de niveaux c (une valeur par salve) :
-    f = P - poids_chemin*A, avec P = c[s_{n_ctx}] - c[fin] (progrès final, signe
-    du score) et A = Σ_k decay^k (c[s_{n_ctx+1+k}] - c[fin]) (écart au but sur
-    le chemin, pondéré décroissant). Retourne le slot en [0,1], 0.5 = neutre."""
-    L = len(c)
-    P = c[n_ctx] - c[L - 1]
-    A = sum(decay ** k * (c[n_ctx + 1 + k] - c[L - 1]) for k in range(L - 1 - n_ctx))
-    r = P - poids_chemin * A
-    return 0.5 + 0.5 * r / (1.0 + abs(r))
+# --- action encode/decode metadata ---------------------------------------------
+_ACT_KEYS = ("membre_avant_theta", "membre_avant_d", "membre_arriere_theta", "membre_arriere_d",
+             "queue_theta")
+_ACT_LAYOUT = []   # (tok_in_block, slot, key)
+for _i in range(STATE_TOKENS, SALVE_TOKENS):    # 13, 14, 15
+    for _k, _key in enumerate(_LAYOUT[_i].signals):
+        _ACT_LAYOUT.append((_i - STATE_TOKENS, _k, _key))
+_ACT_TOK = torch.tensor([t for t, _, _ in _ACT_LAYOUT], dtype=torch.long)
+_ACT_SLOT = torch.tensor([s for _, s, _ in _ACT_LAYOUT], dtype=torch.long)
+_ACT_SIGNED = torch.tensor([_BY_KEY[k].signed for _, _, k in _ACT_LAYOUT],
+                           dtype=torch.bool)
+_ACT_TEMPLATE = torch.tensor(
+    [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
+     for i in range(STATE_TOKENS, SALVE_TOKENS)], dtype=torch.float32)
 
+# Flat signal-grid indices for the 51 policy scalars (tokens 0..11, hors intero 12).
+_POL_SCALAR_IDX = []
+for _i in range(_INTERO_IDX):
+    for _k in range(_N_SIGNALS[_i]):
+        _POL_SCALAR_IDX.append(_i * N_SIGNAL + _k)
+assert len(_POL_SCALAR_IDX) == N_POLICY_STATE
 
-def _eos_slots_of_seq(seq: list, n_ctx: int = DEFAULT_N_CTX,
-                      decay: float = _EOS_DECAY,
-                      poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[float]:
-    """Les 6 slots du token EOS d'une séquence, calculés comme au batch time
-    (_batch_tensors) : progrès par canal f = P - poids_chemin*A.
-    Slot 5 = inconfort (-confort). 0.5 = neutre."""
-    L = len(seq)
-    if L <= n_ctx + 1:
-        return [0.5] * _EOS_NSLOTS
-    try:
-        c = []
-        for salve in seq:
-            row = [salve[_COST_IDX][SIG_OFFSET + j] for j in range(5)]
-            row.append(-salve[_REWARD_IDX][SIG_OFFSET])    # inconfort = -confort
-            c.append(row)
-        P = [c[n_ctx][j] - c[-1][j] for j in range(_EOS_NSLOTS)]
-        out = []
-        for j in range(_EOS_NSLOTS):
-            diffs = [(c[k][j] - c[-1][j]) * decay ** (k - n_ctx - 1) for k in range(n_ctx + 1, L)]
-            A = sum(diffs)
-            r = P[j] - poids_chemin * A
-            out.append(0.5 + 0.5 * r / (1.0 + abs(r)))
-        return out
-    except (IndexError, TypeError):
-        return [0.5] * _EOS_NSLOTS
-
-
-def relief_score(x, n_ctx: int = DEFAULT_N_CTX,
-                 decay: float = _EOS_DECAY,
-                 poids_chemin: float = _EOS_POIDS_CHEMIN,
-                 p: float = _EOS_MAX_P):
-    """Score de soulagement : max flou pondéré des 6 slots du token EOS
-    (poids de canaux normalisés, exposant p). Positif = gain. Accepte un token
-    EOS (tenseur [..., 6]) ou une séquence (liste de salves) :
-    relief_score(sequence) = relief_score(eos(sequence)), les slots EOS étant
-    calculés comme au batch time (_eos_slots_of_seq)."""
-    if isinstance(x, torch.Tensor):
-        slots = x
-    else:
-        slots = torch.tensor(_eos_slots_of_seq(x, n_ctx=n_ctx, decay=decay,
-                                               poids_chemin=poids_chemin))
-    w = _EOS_CHANNEL_W_T.to(slots.device)
-    mf = ((w * slots ** p).sum(dim=-1)) ** (1.0 / p)
-    return 2.0 * (mf - 0.5)
-
-
-def impact(sequences, n_ctx: int = DEFAULT_N_CTX, decay: float = _EOS_DECAY, poids_chemin: float = _EOS_POIDS_CHEMIN) -> torch.Tensor:
-    """Impact d'entraînement WM [B] = abs(relief_score) par séquence."""
-    if not sequences:
-        return torch.empty(0)
-    return torch.tensor([abs(relief_score(s))
-                         for s in sequences], dtype=torch.float32)
-
-
-# --- naive sequence distance & clustering across all channels -----------------
-def _sequence_signals_tensor(sequences: list[list[list[float]]],
-                             device: torch.device = torch.device("cpu")) -> torch.Tensor:
-    """Flatten all signal slots across all tokens in each sequence into a [N, D] float tensor.
-    D = len(seq) * SALVE_TOKENS * N_SIGNAL (e.g. 11 * 16 * 16 = 2816).
-    Naive distance takes all channels into account."""
-    if not sequences:
-        return torch.empty(0, 0, device=device)
-    flat_list = []
-    for seq in sequences:
-        seq_sigs = []
-        for salve in seq:
-            for tok in salve:
-                seq_sigs.extend(tok[SIG_OFFSET:])
-        flat_list.append(seq_sigs)
-    return torch.tensor(flat_list, dtype=torch.float32, device=device)
-
-
-def _latents_tensor(metas: list[dict], device: torch.device) -> torch.Tensor | None:
-    """Stack per-sequence latent vectors from metadata dicts into [N, d].
-    Returns None when no latent is available."""
-    latents = [m.get("latent") for m in metas]
-    if not latents or latents[0] is None:
-        return None
-    try:
-        return torch.tensor(latents, dtype=torch.float32, device=device)
-    except (TypeError, ValueError):
-        return None
-
-
-def latent_cosine_distances(latents: torch.Tensor) -> torch.Tensor:
-    """[N, d] → [N, N] cosine distance matrix (1 - cos)."""
-    n = latents.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    L = latents / n
-    return 1.0 - L @ L.T
-
-
-def pairwise_sequence_distances(sequences: list[list[list[float]]],
-                                device: torch.device = torch.device("cpu"),
-                                weights: torch.Tensor | None = None,
-                                latents: torch.Tensor | None = None,
-                                latent_weight: float = 0.0) -> torch.Tensor:
-    """Pairwise RMSE distance matrix [N, N] across all channels and tokens,
-    optionally weighted by saliency. When ``latents`` [N, d] and
-    ``latent_weight`` > 0 are given, adds ``latent_weight`` * cosine distance
-    between sequence latents."""
-    X = _sequence_signals_tensor(sequences, device)
-    N, D = X.shape
-    if N <= 1 or D == 0:
-        return torch.zeros(N, N, device=device)
-    if weights is not None:
-        w = weights.to(device=device, dtype=X.dtype).view(1, D)
-        X = X * torch.sqrt(w)
-    Dm = torch.cdist(X, X) / (D ** 0.5)
-    if latents is not None and latent_weight > 0:
-        Dm = Dm + latent_weight * latent_cosine_distances(latents.to(device))
-    return Dm
-
-
-def cross_sequence_distances(seqs_a: list[list[list[float]]],
-                             seqs_b: list[list[list[float]]],
-                             device: torch.device = torch.device("cpu"),
-                             weights: torch.Tensor | None = None,
-                             latents_a: torch.Tensor | None = None,
-                             latents_b: torch.Tensor | None = None,
-                             latent_weight: float = 0.0) -> torch.Tensor:
-    """Cross RMSE distance matrix [N_a, N_b] across all channels and tokens,
-    optionally weighted by saliency. When latents are given, adds the cosine
-    distance between the two latent sets."""
-    Xa = _sequence_signals_tensor(seqs_a, device)
-    Xb = _sequence_signals_tensor(seqs_b, device)
-    if Xa.shape[0] == 0 or Xb.shape[0] == 0 or Xa.shape[1] == 0:
-        return torch.empty(Xa.shape[0], Xb.shape[0], device=device)
-    D = Xa.shape[1]
-    if weights is not None:
-        w = weights.to(device=device, dtype=Xa.dtype).view(1, D)
-        w_sqrt = torch.sqrt(w)
-        Xa = Xa * w_sqrt
-        Xb = Xb * w_sqrt
-    Dm = torch.cdist(Xa, Xb) / (D ** 0.5)
-    if latents_a is not None and latents_b is not None and latent_weight > 0:
-        na = latents_a.to(device).norm(dim=1, keepdim=True).clamp(min=1e-8)
-        nb = latents_b.to(device).norm(dim=1, keepdim=True).clamp(min=1e-8)
-        La = latents_a.to(device) / na
-        Lb = latents_b.to(device) / nb
-        Dm = Dm + latent_weight * (1.0 - La @ Lb.T)
-    return Dm
-
-
-def complete_linkage_clustering(dist_matrix: torch.Tensor, eps: float) -> list[list[int]]:
-    """Complete linkage agglomerative clustering with threshold eps.
-    Guarantees that all members within a cluster have pairwise distance <= eps."""
-    n = dist_matrix.shape[0]
-    clusters = [[i] for i in range(n)]
-    if n <= 1:
-        return clusters
-
-    active = list(range(n))
-    cdist = dist_matrix.clone()
-
-    while len(active) > 1:
-        sub_dist = cdist[active][:, active]
-        diag_mask = torch.eye(len(active), dtype=torch.bool, device=dist_matrix.device)
-        sub_dist[diag_mask] = float("inf")
-        min_val, flat_idx = torch.min(sub_dist.view(-1), dim=0)
-        if min_val.item() > eps:
-            break
-
-        i_idx = flat_idx.item() // len(active)
-        j_idx = flat_idx.item() % len(active)
-        ci = active[i_idx]
-        cj = active[j_idx]
-
-        clusters[ci].extend(clusters[cj])
-        clusters[cj] = []
-
-        cdist[ci] = torch.maximum(cdist[ci], cdist[cj])
-        cdist[:, ci] = cdist[ci]
-
-        active.remove(cj)
-
-    return [c for c in clusters if c]
-
-
-def select_medoids(clusters: list[list[int]], dist_matrix: torch.Tensor) -> list[int]:
-    """Select the medoid (most central representative) for each cluster."""
-    medoids = []
-    for c in clusters:
-        if len(c) == 1:
-            medoids.append(c[0])
-        else:
-            sub_d = dist_matrix[c][:, c]
-            sum_d = sub_d.sum(dim=1)
-            best_idx = torch.argmin(sum_d).item()
-            medoids.append(c[best_idx])
-    return medoids
+# Precomputed cost metadata for the vectorized salve cost.
+_COST_SCALES = torch.tensor([_BY_KEY[k].max_val for k in _COST_KEYS], dtype=torch.float32)
+_COST_SIGNED = torch.tensor([_BY_KEY[k].signed for k in _COST_KEYS], dtype=torch.bool)
+_COST_W = torch.tensor([_COST_WEIGHTS[k] for k in _COST_KEYS], dtype=torch.float32)
+_CONFORT_SCALE = _BY_KEY["confort"].max_val
+_CONFORT_W = _COST_WEIGHTS["confort"]
 
 
 class ExperienceBuffer:
-    """Two-tier experience memory: Coreset (long-term consolidated) + Addendum (wake session journal).
+    """Two-tier experience memory: Coreset (long-term) + Addendum (wake session).
 
-    Conforming to the Lambda barre specification:
-      - Wake session: transitions are journaled into linear segments.
-      - At sleep time:
-          1. extract_addendum() extracts all sliding-window sequences of length seq_len
-             from the wake session into _addendum.
-          2. prune_coreset(pct) randomly moves ~33% of _coreset sequences into _addendum
-             as active forgetting candidates.
-          3. filter_addendum() retains only surprising sequences evaluated by the World Model.
-          4. commit_addendum() merges the surviving sequences into _coreset.
+    The wake journal is a linear stream of temporal salves (16 tokens each),
+    sealed into segments at discontinuities. ``extract_addendum`` cuts
+    sliding windows of ``seq_len`` salves and stores them in the Addendum as
+    *recorded sequences* — flat token lists reordered by ``build_sequence``
+    (contexte | dénouement | conséquence inversée | action de décision).
     """
 
     def __init__(self, seq_len: int = DEFAULT_SEQ_STEPS + 1, capacity: int = 1000,
                  pool_capacity: int = 1000, seed: int = 0,
                  n_ctx: int | None = None,
                  eos_decay: float = _EOS_DECAY, eos_poids_chemin: float = _EOS_POIDS_CHEMIN):
-        self.seq_len = seq_len
+        self.seq_len = seq_len                      # salves per temporal window
         self.capacity = capacity
         self.pool_capacity = pool_capacity
         self.seq_steps = seq_len - 1
@@ -507,11 +337,8 @@ class ExperienceBuffer:
             self.n_ctx = min(DEFAULT_N_CTX, max(1, self.seq_steps // 2))
         else:
             self.n_ctx = n_ctx
-        self.n_imagine = max(1, self.seq_steps - self.n_ctx)
         self.eos_decay = eos_decay
         self.eos_poids_chemin = eos_poids_chemin
-        self._eos_time_w = compute_eos_time_weights(self.n_imagine)
-        self._context_time_w = compute_context_time_weights(self.n_ctx + 1)
         self._segments: deque[list[list[float]]] = deque()
         self._current: list[list[float]] = []
         self._coreset: list[list[list[float]]] = []
@@ -521,39 +348,18 @@ class ExperienceBuffer:
         self._addendum_meta: list[dict] = []
         self._rng = random.Random(seed)
 
-    @property
-    def _persistent_pool(self) -> list[list[list[float]]]:
-        """Backward compatibility alias for _coreset."""
-        return self._coreset
-
-    @_persistent_pool.setter
-    def _persistent_pool(self, val) -> None:
-        self._coreset = list(val)[:self.pool_capacity]
-        self._coreset_vivacity = [1.0] * len(self._coreset)
-        self._coreset_meta = [self._default_meta() for _ in self._coreset]
-        for m, v in zip(self._coreset_meta, self._coreset_vivacity):
-            m["vivacity"] = v
-
     @staticmethod
     def _default_meta(origin: str = "wake") -> dict:
-        """Default per-sequence metadata dict. All scores start unset (None)
-        and are filled during sleep passes (causal / lookahead / policy)."""
         return {
             "origin": origin,
             "vivacity": 1.0,
-            "relief_score": None,
             "learn_count": 0,
-            "causal_score": None,
-            "lookahead_score": None,
-            "dissonance": None,
+            "relief_score": None,
             "surprise": None,
-            "latent": None,
-            "pol_relief_score": None,
         }
 
     @property
     def _valid_segments(self) -> list[list[list[float]]]:
-        """Return all segments (archived or active) that have at least ``seq_len`` salves."""
         segs = list(self._segments)
         if len(self._current) >= self.seq_len:
             segs.append(self._current)
@@ -561,7 +367,6 @@ class ExperienceBuffer:
 
     @property
     def num_segments(self) -> int:
-        """Number of active + archived segments in the current session journal with at least 1 salve."""
         n = len(self._segments)
         if self._current:
             n += 1
@@ -569,315 +374,88 @@ class ExperienceBuffer:
 
     @property
     def pool_size(self) -> int:
-        """Backward-compatible alias for coreset_size."""
         return len(self._coreset)
 
     @property
     def coreset_size(self) -> int:
-        """Number of sequences stored in the long-term consolidated Coreset."""
         return len(self._coreset)
 
     @property
     def addendum_size(self) -> int:
-        """Number of sequences currently in the Addendum (including extractable wake journal)."""
         return len(self._addendum) + self.journal_len
 
     @property
     def journal_len(self) -> int:
-        """Number of extractable sliding-window sequences in the session journal."""
         total = sum(len(s) - self.seq_len + 1 for s in self._segments)
         if len(self._current) >= self.seq_len:
             total += len(self._current) - self.seq_len + 1
         return total
 
     def __len__(self) -> int:
-        """Total number of sequences available (coreset + addendum + session journal)."""
         return len(self._coreset) + len(self._addendum) + self.journal_len
 
     def push(self, salve: list[list[float]]) -> None:
-        """Append one transition salve to the current active segment."""
+        """Append one temporal salve to the current active segment."""
         self._current.append(salve)
         self._enforce_capacity()
 
     def boundary(self) -> None:
-        """Seal the active segment and start a new one.
-
-        If the active segment contains at least ``seq_len`` salves, it is archived
-        into the completed segments deque. Otherwise it is discarded, as it cannot
-        form a valid training sequence.
-        """
+        """Seal the active segment (discontinuity: flip, reset, teleport)."""
         if len(self._current) >= self.seq_len:
             self._segments.append(self._current)
         self._current = []
 
     def new_segment(self) -> None:
-        """Alias for boundary()."""
         self.boundary()
 
     def extract_addendum(self, stride: int = 1) -> int:
-        """Extract sliding-window sequences from all valid segments in the session
-        journal into the Addendum. Clears the session segments so they are not re-processed.
-
-        Returns the number of new sequences added.
-        """
-        valid_segs = self._valid_segments
+        """Cut sliding windows from the journal segments and store them in the
+        Addendum as recorded sequences (``build_sequence``). Clears the journal."""
         added = 0
-        for seg in valid_segs:
+        for seg in self._valid_segments:
             n_windows = len(seg) - self.seq_len + 1
             if n_windows <= 0:
                 continue
-            for offset in range(0, n_windows, stride):
-                self._addendum.append(seg[offset : offset + self.seq_len])
-                self._addendum_meta.append(self._default_meta("wake"))
-                added += 1
+            offsets = list(range(0, n_windows, stride))
             if (n_windows - 1) % stride != 0:
-                self._addendum.append(seg[n_windows - 1 : n_windows - 1 + self.seq_len])
+                offsets.append(n_windows - 1)
+            for offset in offsets:
+                window = seg[offset:offset + self.seq_len]
+                self._addendum.append(build_sequence(
+                    window, n_ctx=self.n_ctx, decay=self.eos_decay,
+                    poids_chemin=self.eos_poids_chemin))
                 self._addendum_meta.append(self._default_meta("wake"))
                 added += 1
         self._segments.clear()
         self._current.clear()
         return added
 
-    def prune_coreset(self, pct: float = 0.33, beta: float = 2.0) -> int:
-        """Move pct (default 33%) of sequences from Coreset into Addendum.
-        These become candidates for active forgetting.
-
-        Uses stochastic sampling without replacement (Efraimidis-Spirakis)
-        biased towards memories with lower vivacity:
-          weight w_i = exp(-beta * vivacity_i)
-        Lower vivacity yields higher probability, while still allowing any memory
-        to be stochastically revisited.
-
-        Returns the number of sequences moved.
-        """
-        if len(self._coreset) <= 1 or pct <= 0.0:
-            return 0
-        return self.prune_coreset_n(max(1, int(len(self._coreset) * pct)), beta=beta)
-
-    def prune_coreset_n(self, n_prune: int, beta: float = 2.0) -> int:
-        """Move exactly ``n_prune`` sequences from Coreset into Addendum, with
-        the same vivacity-biased sampling without replacement as
-        ``prune_coreset``. Returns the number of sequences moved."""
-        if len(self._coreset) <= 1:
-            return 0
-        n_prune = min(n_prune, len(self._coreset) - 1)
-        if n_prune <= 0:
-            return 0
-        while len(self._coreset_vivacity) < len(self._coreset):
-            self._coreset_vivacity.append(1.0)
-        # Weighted stochastic keys: key_i = -ln(u_i) / w_i with u_i ~ U(0, 1).
-        # Smallest keys correspond to selected items without replacement.
-        keys = [
-            -math.log(max(1e-12, self._rng.random())) / math.exp(-beta * v)
-            for v in self._coreset_vivacity
-        ]
-        order = sorted(range(len(self._coreset)), key=lambda i: keys[i])
-        prune_indices = set(order[:n_prune])
-        new_coreset = []
-        new_viv = []
-        new_meta = []
-        while len(self._coreset_meta) < len(self._coreset):
-            self._coreset_meta.append(self._default_meta("coreset"))
-        for i, seq in enumerate(self._coreset):
-            if i in prune_indices:
-                self._addendum.append(seq)
-                m = dict(self._coreset_meta[i])
-                m["origin"] = "coreset"
-                self._addendum_meta.append(m)
-            else:
-                new_coreset.append(seq)
-                new_viv.append(self._coreset_vivacity[i])
-                new_meta.append(self._coreset_meta[i])
-        self._coreset = new_coreset
-        self._coreset_vivacity = new_viv
-        self._coreset_meta = new_meta
-        return n_prune
-
-    def deduplicate_addendum(self, eps: float = 0.04,
-                             weights: torch.Tensor | None = None,
-                             latent_weight: float = 1.0) -> int:
-        """Intra-Addendum deduplication via complete linkage clustering on RMSE distances.
-        Groups sequences at distance <= eps across all channels and tokens, and keeps only the medoid of each group.
-        Optionally uses saliency feature weights and adds cosine distance between latents.
-        Returns the number of duplicate sequences removed."""
-        if len(self._addendum) <= 1:
-            return 0
-        lat = _latents_tensor(self._addendum_meta, torch.device("cpu"))
-        D = pairwise_sequence_distances(self._addendum, weights=weights,
-                                        latents=lat, latent_weight=latent_weight)
-        if D.shape[0] > 1:
-            off = D[~torch.eye(D.shape[0], dtype=torch.bool, device=D.device)]
-            print(f"[dedup:intra] n={D.shape[0]} eps={eps:.3f} "
-                  f"dist min={off.min():.4f} med={off.median():.4f} max={off.max():.4f} "
-                  f"weights={'saliency' if weights is not None else 'none'} latent_w={latent_weight}")
-        clusters = complete_linkage_clustering(D, eps=eps)
-        medoid_indices = select_medoids(clusters, D)
-        n_dropped = len(self._addendum) - len(medoid_indices)
-        if n_dropped > 0:
-            self._addendum = [self._addendum[i] for i in medoid_indices]
-            if len(self._addendum_meta) >= len(medoid_indices):
-                self._addendum_meta = [self._addendum_meta[i] for i in medoid_indices]
-        return n_dropped
-
-    def deduplicate_against_coreset(self, eps: float = 0.04,
-                                    weights: torch.Tensor | None = None,
-                                    latent_weight: float = 1.0) -> dict:
-        """Cross-deduplicate Addendum against Coreset and refresh vivacity of existing memories.
-
-        Sequences in Addendum that are within distance < eps of an existing Coreset memory
-        are dropped from Addendum, while the corresponding Coreset memory has its vivacity
-        refreshed to 1.0. Surviving Addendum sequences are kept.
-        """
-        if not self._coreset or not self._addendum:
-            return {"dropped": 0, "refreshed": 0, "surviving": len(self._addendum)}
-
-        while len(self._coreset_vivacity) < len(self._coreset):
-            self._coreset_vivacity.append(1.0)
-
-        cross_D = cross_sequence_distances(
-            self._addendum, self._coreset, weights=weights,
-            latents_a=_latents_tensor(self._addendum_meta, torch.device("cpu")),
-            latents_b=_latents_tensor(self._coreset_meta, torch.device("cpu")),
-            latent_weight=latent_weight)
-        min_dists, min_indices = torch.min(cross_D, dim=1)
-
-        surviving = []
-        surviving_meta = []
-        n_dropped = 0
-        n_refreshed = 0
-
-        for i, seq in enumerate(self._addendum):
-            d_min = min_dists[i].item()
-            idx_core = min_indices[i].item()
-            if d_min < eps:
-                self._coreset_vivacity[idx_core] = 1.0
-                if idx_core < len(self._coreset_meta):
-                    self._coreset_meta[idx_core]["vivacity"] = 1.0
-                n_refreshed += 1
-                n_dropped += 1
-            else:
-                surviving.append(seq)
-                if i < len(self._addendum_meta):
-                    surviving_meta.append(self._addendum_meta[i])
-                else:
-                    surviving_meta.append(self._default_meta("wake"))
-
-        self._addendum = surviving
-        self._addendum_meta = surviving_meta
-
-        return {
-            "dropped": n_dropped,
-            "refreshed": n_refreshed,
-            "surviving": len(self._addendum),
-        }
-
-    def consolidate_addendum_into_coreset(self, eps: float = 0.04, decay: float = 0.01,
-                                          dedup_intra: bool = True,
-                                          weights: torch.Tensor | None = None,
-                                          evict: bool = True) -> dict:
-        """Commit surviving Addendum sequences into Coreset with decay and eviction.
-
-        If dedup_intra is True, removes redundant duplicates within Addendum.
-        Deduplicates against Coreset if not already done, appends survivors,
-        applies memory decay across Coreset vivacities, and (when ``evict``)
-        evicts lowest-vivacity memories if exceeding pool_capacity. When called
-        from Brain.sleep, evict=False : l'éviction est faite par le tri
-        (Brain._evict_coreset_excess), pas ici.
-        """
-        n_intra_dropped = 0
-        if dedup_intra and len(self._addendum) > 1:
-            n_intra_dropped = self.deduplicate_addendum(eps=eps, weights=weights)
-
-        cross_res = self.deduplicate_against_coreset(eps=eps, weights=weights)
-        n_cross_dropped = cross_res["dropped"]
-        n_refreshed = cross_res["refreshed"]
-
-        while len(self._coreset_vivacity) < len(self._coreset):
-            self._coreset_vivacity.append(1.0)
-        while len(self._coreset_meta) < len(self._coreset):
-            self._coreset_meta.append(self._default_meta("coreset"))
-
-        n_added = 0
-        for i, seq in enumerate(self._addendum):
-            self._coreset.append(seq)
-            self._coreset_vivacity.append(1.0)
-            m = dict(self._addendum_meta[i]) if i < len(self._addendum_meta) else self._default_meta("coreset")
-            m["origin"] = "coreset"
-            m["vivacity"] = 1.0
-            self._coreset_meta.append(m)
-            n_added += 1
-
-        if decay > 0.0:
-            self._coreset_vivacity = [max(0.0, v - decay) for v in self._coreset_vivacity]
-            for m, v in zip(self._coreset_meta, self._coreset_vivacity):
-                m["vivacity"] = v
-
-        # Eviction par vivacité uniquement en appel autonome (evict=True).
-        # Depuis Brain.sleep, evict=False : l'éviction est faite par le tri
-        # (Brain._evict_coreset_excess).
-        n_evicted = 0
-        if evict and len(self._coreset) > self.pool_capacity:
-            excess = len(self._coreset) - self.pool_capacity
-            paired = sorted(zip(self._coreset_vivacity, self._coreset, self._coreset_meta),
-                            key=lambda x: x[0], reverse=True)
-            kept = paired[:self.pool_capacity]
-            self._coreset_vivacity = [v for v, _, _ in kept]
-            self._coreset = [s for _, s, _ in kept]
-            self._coreset_meta = [m for _, _, m in kept]
-            n_evicted = excess
-
-        self._addendum.clear()
-        self._addendum_meta.clear()
-
-        return {
-            "dedup_intra_dropped": n_intra_dropped,
-            "dedup_cross_dropped": n_cross_dropped,
-            "added": n_added,
-            "refreshed": n_refreshed,
-            "evicted": n_evicted,
-            "coreset_size": len(self._coreset),
-        }
-
-    def filter_addendum(self, kept: list[list[list[float]]],
-                        kept_meta: list[dict] | None = None) -> None:
-        """Replace Addendum with only the retained sequences."""
-        self._addendum = list(kept)
-        if kept_meta is not None:
-            self._addendum_meta = list(kept_meta)
-        else:
-            self._addendum_meta = self._addendum_meta[:len(kept)]
-
-    def commit_addendum(self, dedup: bool = False, eps: float = 0.04, decay: float = 0.01,
-                        weights: torch.Tensor | None = None) -> int:
-        """Merge all surviving Addendum sequences into Coreset, then clear Addendum.
-        If dedup=True, uses consolidate_addendum_into_coreset; otherwise uses direct extend.
-        Returns the number of sequences committed.
-        """
-        if dedup:
-            stats = self.consolidate_addendum_into_coreset(eps=eps, decay=decay, weights=weights)
-            return stats["added"]
+    def commit_addendum(self) -> int:
+        """Move all Addendum sequences into the Coreset (simple FIFO capacity
+        eviction), then clear the Addendum. Returns the number committed."""
         n = len(self._addendum)
         self._coreset.extend(self._addendum)
         self._coreset_vivacity.extend([1.0] * n)
-        while len(self._coreset_meta) < len(self._coreset):
-            self._coreset_meta.append(self._default_meta("coreset"))
+        self._coreset_meta.extend(self._addendum_meta)
         self._addendum.clear()
         self._addendum_meta.clear()
+        while len(self._coreset) > self.pool_capacity:
+            self._coreset.pop(0)
+            self._coreset_vivacity.pop(0)
+            self._coreset_meta.pop(0)
         return n
 
     def consolidate(self, stride: int = 1) -> int:
-        """Backward-compatible extraction + immediate commit."""
+        """Extraction + immediate commit (headless bootstrap)."""
         added = self.extract_addendum(stride=stride)
         self.commit_addendum()
         return added
 
     def clear_journal(self) -> None:
-        """Discard active and archived segments in the session journal, preserving Coreset and Addendum."""
         self._segments.clear()
         self._current.clear()
 
     def clear(self) -> None:
-        """Discard all session segments, Addendum, and Coreset."""
         self.clear_journal()
         self._coreset.clear()
         self._coreset_vivacity.clear()
@@ -886,14 +464,12 @@ class ExperienceBuffer:
         self._addendum_meta.clear()
 
     def save(self, path: str) -> None:
-        """Save Coreset, Addendum, and active segments to disk."""
         torch.save({
             "seq_len": self.seq_len,
             "n_ctx": self.n_ctx,
             "coreset": list(self._coreset),
             "coreset_vivacity": list(self._coreset_vivacity),
             "coreset_meta": [dict(m) for m in self._coreset_meta],
-            "persistent_pool": list(self._coreset),
             "addendum": list(self._addendum),
             "addendum_meta": [dict(m) for m in self._addendum_meta],
             "segments": list(self._segments),
@@ -901,32 +477,33 @@ class ExperienceBuffer:
         }, path)
 
     def load(self, path: str) -> bool:
-        """Load Coreset, Addendum, and segments from disk. Returns True if loaded."""
-        if os.path.exists(path):
-            data = torch.load(path, weights_only=False)
-            pool = data.get("coreset", data.get("persistent_pool", []))
-            self._coreset = [list(seq) for seq in pool][:self.pool_capacity]
-            viv = data.get("coreset_vivacity", None)
-            if viv is not None and len(viv) == len(self._coreset):
-                self._coreset_vivacity = [float(v) for v in viv]
-            else:
-                self._coreset_vivacity = [1.0] * len(self._coreset)
-            cmeta = data.get("coreset_meta", None)
-            if cmeta is not None and len(cmeta) == len(self._coreset):
-                self._coreset_meta = [dict(m) for m in cmeta]
-            else:
-                self._coreset_meta = [self._default_meta("coreset") for _ in self._coreset]
-            for m, v in zip(self._coreset_meta, self._coreset_vivacity):
-                m["vivacity"] = v
-            self._addendum = list(data.get("addendum", []))
-            self._addendum_meta = [dict(m) for m in data.get("addendum_meta", [])]
-            self._segments = deque(data.get("segments", []))
-            self._current = list(data.get("current", []))
-            return True
-        return False
+        """Load from disk. Returns False (and leaves the buffer empty) when the
+        file is missing or holds sequences of an incompatible layout."""
+        if not os.path.exists(path):
+            return False
+        data = torch.load(path, weights_only=False)
+        pool = data.get("coreset", [])
+        expected = compute_seq_layout(self.seq_steps, self.n_ctx)["seq_len"]
+        if pool and len(pool[0]) != expected:
+            return False  # legacy layout — checkpoints invalid after the refonte
+        self._coreset = [list(seq) for seq in pool][:self.pool_capacity]
+        viv = data.get("coreset_vivacity", None)
+        self._coreset_vivacity = ([float(v) for v in viv] if viv is not None
+                                  and len(viv) == len(self._coreset)
+                                  else [1.0] * len(self._coreset))
+        cmeta = data.get("coreset_meta", None)
+        self._coreset_meta = ([dict(m) for m in cmeta] if cmeta is not None
+                              and len(cmeta) == len(self._coreset)
+                              else [self._default_meta("coreset") for _ in self._coreset])
+        for m, v in zip(self._coreset_meta, self._coreset_vivacity):
+            m["vivacity"] = v
+        self._addendum = list(data.get("addendum", []))
+        self._addendum_meta = [dict(m) for m in data.get("addendum_meta", [])]
+        self._segments = deque(data.get("segments", []))
+        self._current = list(data.get("current", []))
+        return True
 
     def _enforce_capacity(self) -> None:
-        """Ensure total extractable sequences in the session journal do not exceed ``capacity``."""
         excess = self.journal_len - self.capacity
         while excess > 0 and self._segments:
             s0 = self._segments[0]
@@ -942,87 +519,39 @@ class ExperienceBuffer:
             trim = min(excess, removable)
             self._current = self._current[trim:]
 
-    def sample_coreset(self, batch: int) -> list[list[list[float]]]:
-        """Sample ``batch`` sequences from the Coreset."""
+    def sample_coreset(self, batch: int) -> list:
         if not self._coreset:
             return []
-        k = min(batch, len(self._coreset))
-        return self._rng.sample(list(self._coreset), k)
+        return self._rng.sample(list(self._coreset), min(batch, len(self._coreset)))
 
-    def sample_addendum(self, batch: int) -> list[list[list[float]]]:
-        """Sample ``batch`` sequences from the Addendum."""
+    def sample_addendum(self, batch: int) -> list:
         if not self._addendum:
             return []
-        k = min(batch, len(self._addendum))
-        return self._rng.sample(self._addendum, k)
+        return self._rng.sample(self._addendum, min(batch, len(self._addendum)))
 
-    def sample(self, batch: int) -> list[list[list[float]]]:
-        """Sample ``batch`` sequences of length ``seq_len``.
-
-        Prioritizes Coreset + Addendum if available.
-        Otherwise falls back to sliding windows in the journal.
-        Returns [] if empty.
-        """
+    def sample(self, batch: int) -> list:
+        """Uniform sample over Coreset + Addendum, falling back to journal windows."""
         pool = list(self._coreset) + self._addendum
         if pool:
-            k = min(batch, len(pool))
-            return self._rng.sample(pool, k)
-
+            return self._rng.sample(pool, min(batch, len(pool)))
         valid_segs = self._valid_segments
         if not valid_segs:
             return []
-
         counts = [len(s) - self.seq_len + 1 for s in valid_segs]
         total = sum(counts)
-        if total == 0:
+        if total <= 0:
             return []
-
-        k = min(batch, total)
-        indices = self._rng.sample(range(total), k)
-
-        # Prefix sums for fast segment lookup
+        indices = self._rng.sample(range(total), min(batch, total))
         cum = list(itertools.accumulate(counts))
-        samples = []
+        out = []
         for idx in indices:
-            seg_idx = bisect.bisect_right(cum, idx)
-            offset = idx - (cum[seg_idx - 1] if seg_idx > 0 else 0)
-            seq = valid_segs[seg_idx][offset:offset + self.seq_len]
-            samples.append(seq)
-        return samples
-
-    def sample_for_policy(self, batch: int, beta: float = 2.0) -> list[list[list[float]]]:
-        """Sample ``batch`` sequences prioritized by long-term cost relief.
-
-        Higher probability is given to sequences whose consequence window
-        (s5..s10, time-weighted like the EOS — the long term dominates) is
-        cheaper than the decision window before it (s0..s4): recovery
-        trajectories. Channels carry equally (no salve_cost weighting).
-        Uses weighted stochastic sampling without replacement (Efraimidis-Spirakis).
-        """
-        pool = list(self._coreset) + self._addendum
-        if not pool:
-            pool = self.sample(batch)
-            if not pool or len(pool) <= batch:
-                return pool
-
-        k = min(batch, len(pool))
-        weights = []
-        for seq in pool:
-            if len(seq) < self.seq_len:
-                relief = 0.0
-            else:
-                relief = relief_score(seq, n_ctx=self.n_ctx, decay=self.eos_decay, poids_chemin=self.eos_poids_chemin)
-            relief_clamped = max(-1.0, min(1.0, relief))
-            weights.append(math.exp(beta * relief_clamped))
-
-        # Efraimidis-Spirakis weighted sampling without replacement
-        keys = [
-            -math.log(max(1e-12, self._rng.random())) / w
-            for w in weights
-        ]
-        order = sorted(range(len(pool)), key=lambda i: keys[i])
-        return [pool[i] for i in order[:k]]
-
+            seg_i = next(i for i, c in enumerate(cum) if idx < c)
+            offset = idx - (cum[seg_i - 1] if seg_i > 0 else 0)
+            seg = valid_segs[seg_i]
+            out.append(build_sequence(seg[offset:offset + self.seq_len],
+                                      n_ctx=self.n_ctx, decay=self.eos_decay,
+                                      poids_chemin=self.eos_poids_chemin))
+        return out
 
 
 class Brain:
@@ -1031,12 +560,11 @@ class Brain:
     Lifecycle in the main loop:
 
         brain.brain_tick(salve)       -> 5 consignes (WM forward + policy action)
-        ... physics steps, sensors ...
         brain.record_tick(salve)      # at WM cadence: wake history + journal
-        brain.sleep_cycle()                 # on demand: offline training of both models
+        brain.sleep_cycle()           # on demand: offline training of both models
     """
 
-    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 2e-4, act_std: float = 0.05,
+    def __init__(self, lr_wm: float = 3e-4, lr_pol: float = 2e-4, act_std: float = 0.0,
                  device: str | None = None, seed: int = 0,
                  compile_wm: bool = False,
                  seq_steps: int = DEFAULT_SEQ_STEPS,
@@ -1045,40 +573,36 @@ class Brain:
                  dim_ff: int = 384, dropout: float = 0.0,
                  pol_hidden: int = 256,
                  buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
-                 eos_force_amp_lo: float = _EOS_FORCE_AMP[0],
-                 eos_force_amp_hi: float = _EOS_FORCE_AMP[1],
-                 eos_force_amplify: float = 1.0,
-                 eos_force_amplify_threshold: float = 0.95,
-                 wm_impact_floor: float = _WM_IMPACT_FLOOR,
-                 lookahead_relief_mult: float = 1.0,
-                 wm_w_state_post: float = 1.0,
-                 wm_w_act_post: float = 1.0,
-                 wm_w_eos: float = _WM_REWARD_BOOST,
-                 wm_w_a4_lookahead: float = 1.0,
                  eos_decay: float = _EOS_DECAY,
                  eos_poids_chemin: float = _EOS_POIDS_CHEMIN,
-                 eos_max_p: float = _EOS_MAX_P):
+                 eos_max_p: float = _EOS_MAX_P,
+                 # inférence du dénouement : échantillonnage + élection
+                 eos_temperature: float = 0.05,
+                 eos_top_k: int = 8,
+                 eos_top_p: float = 0.9,
+                 eos_w_fav: float = 1.0,
+                 eos_satisfying: float = 0.0,
+                 **_legacy):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
-        # Intra-op parallelism cap: 2 threads wins or ties in both regimes on
-        # this class of CPU (measured: batch-1 inference 3-6x slower with 4
-        # threads; batch-64 training slightly slower with 4 than with 2).
         if self.device.type == "cpu":
             torch.set_num_threads(min(2, torch.get_num_threads()))
         self.seq_steps = seq_steps
         self.n_ctx = n_ctx
         layout = compute_seq_layout(seq_steps, n_ctx)
         self.seq_len = layout["seq_len"]
+        self.ctx_len = layout["ctx_len"]
         self.decision_pos = layout["decision_pos"]
         self.eos_pos = layout["eos_pos"]
+        self.conseq_start = layout["conseq_start"]
+        self.conseq_len = layout["conseq_len"]
+        self.action_pos = layout["action_pos"]
         self.n_imagine = layout["n_imagine"]
 
         self.world = M.WorldModel(d_model=d_model, nhead=nhead, layers=layers,
                                   dim_ff=dim_ff, dropout=dropout).to(self.device)
         self.policy = M.Policy(n_state=N_POLICY_STATE + d_model,
                                hidden=pol_hidden).to(self.device)
-        # Normalizes the world model's intermediate latent before feeding it
-        # to the policy, so scalars [0,1] and latent are on the same scale.
         self.latent_norm = torch.nn.LayerNorm(d_model).to(self.device)
         self.opt_wm = torch.optim.Adam(self.world.parameters(), lr=lr_wm)
         self.opt_pol = torch.optim.Adam(
@@ -1088,97 +612,44 @@ class Brain:
                                        eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
                                        capacity=buffer_capacity,
                                        pool_capacity=buffer_pool_capacity)
-        self.wm_w_state_post = wm_w_state_post
-        self.wm_w_act_post = wm_w_act_post
-        self.wm_w_eos = wm_w_eos
-        self.wm_w_a4_lookahead = wm_w_a4_lookahead
-        t_valid, t_weight = build_target_masks(seq_steps, n_ctx,
-                                                w_state_post=wm_w_state_post,
-                                                w_act_post=wm_w_act_post,
-                                                w_eos=wm_w_eos)
-        if seq_steps == DEFAULT_SEQ_STEPS and n_ctx == DEFAULT_N_CTX:
-            self.mask = _MASK.to(self.device)
-            self.mask_lookahead = _MASK_LOOKAHEAD.to(self.device)
-            self.target_valid = t_valid.to(self.device)
-            self.target_weight = t_weight.to(self.device)
-            self.target_valid_look = _target_valid_look.to(self.device)
-            self.target_weight_look = _target_weight_look.to(self.device)
-            self._eos_w = _EOS_TIME_W_T.to(self.device)
-            self._context_w = _CONTEXT_TIME_W_T.to(self.device)
-        else:
-            self.mask = build_salve_mask(self.seq_len, self.device)
-            self.mask_lookahead = build_lookahead_gen_mask(self.decision_pos + ACTION_TOKENS,
-                                                           self.device, self.decision_pos)
-            self.target_valid = t_valid.to(self.device)
-            self.target_weight = t_weight.to(self.device)
-            t_valid_look, t_weight_look = build_lookahead_target_masks(seq_steps, n_ctx)
-            self.target_valid_look = t_valid_look.to(self.device)
-            self.target_weight_look = t_weight_look.to(self.device)
-            eos_w = compute_eos_time_weights(self.n_imagine)
-            self._eos_w = torch.tensor(eos_w, dtype=torch.float32, device=self.device)
-            context_w = compute_context_time_weights(self.n_ctx + 1)
-            self._context_w = torch.tensor(context_w, dtype=torch.float32, device=self.device)
+        # Positions temporelles (PE sinusoïdal) et tables de loss du layout.
+        self.salve_positions = torch.tensor(
+            compute_salve_positions(seq_steps, n_ctx), dtype=torch.long, device=self.device)
+        self.mask = build_salve_mask(self.seq_len, self.device)
+        t_valid, t_weight = build_target_tables(seq_steps, n_ctx)
+        self.target_valid = t_valid.to(self.device)
+        self.target_weight = t_weight.to(self.device)
         self._eos_tmpl = _EOS_TEMPLATE.to(self.device)
-        self._eos_cw = _EOS_CHANNEL_W_T.to(self.device)  # innate channel weights
         self.eos_decay = eos_decay
         self.eos_poids_chemin = eos_poids_chemin
         self.eos_max_p = eos_max_p
+        self.eos_temperature = eos_temperature
+        self.eos_top_k = eos_top_k
+        self.eos_top_p = eos_top_p
+        self.eos_w_fav = eos_w_fav
+        self.eos_satisfying = eos_satisfying
         n_im = max(1, self.seq_steps - self.n_ctx)
         self._eos_decay_pow = torch.tensor([eos_decay ** k for k in range(n_im)],
                                            dtype=torch.float32, device=self.device)
-        # WM training step: eager by default, optionally compiled as one
-        # fused graph (static shapes [B, 173, 25] — the training loop is the
-        # only caller, so no recompilation churn). The module itself stays
-        # eager: the latent-capture hook and the checkpoints remain intact.
-        # Separate compiled entry for the lookahead pass: its mask is baked
-        # in, so causal and lookahead keep disjoint compiled graphs.
         self._wm_loss = (torch.compile(self._wm_loss_impl, dynamic=False)
                          if compile_wm else self._wm_loss_impl)
-        self._wm_loss_lookahead = (torch.compile(self._wm_loss_lookahead_impl, dynamic=False)
-                                   if compile_wm else self._wm_loss_lookahead_impl)
         self.act_std = act_std
-        self.eos_force_amp_lo = eos_force_amp_lo
-        self.eos_force_amp_hi = eos_force_amp_hi
-        self.eos_force_amplify = eos_force_amplify
-        self.eos_force_amplify_threshold = eos_force_amplify_threshold
-        self.wm_impact_floor = wm_impact_floor
-        self.lookahead_relief_mult = lookahead_relief_mult
-        # Precomputed cost tensors, moved to device for the vectorized
-        # trajectory-cost in train_policy.
         self._cost_scales = _COST_SCALES.to(self.device)
         self._cost_signed = _COST_SIGNED.to(self.device)
         self._cost_w = _COST_W.to(self.device)
-        # Policy-scalar and action-encode indices/templates for the vectorized
-        # train_policy path.
-        self._pol_idx = torch.tensor(_POL_SCALAR_IDX, dtype=torch.long,
-                                      device=self.device)
+        self._pol_idx = torch.tensor(_POL_SCALAR_IDX, dtype=torch.long, device=self.device)
         self._act_tok = _ACT_TOK.to(self.device)
         self._act_slot = _ACT_SLOT.to(self.device)
-        self._act_scales = _ACT_SCALES.to(self.device)
         self._act_signed = _ACT_SIGNED.to(self.device)
-        self._act_min = torch.where(self._act_signed, -1.0, 0.0).to(self.device)
-        self._act_max = torch.tensor(1.0, device=self.device)
         self._act_tmpl = _ACT_TEMPLATE.to(self.device)
-        self._kalman_max_v = torch.tensor([0.20, 0.15, 0.20, 0.15, 0.20], device=self.device)
-        # Rolling history of recent (state_tokens, action_tokens) for the
-        # wake-time world model context. The policy reads the world model's
-        # intermediate latent, computed from the last n_ctx transitions.
         self._wake_history: list[tuple[list, list]] = []
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
-        self.last_wm_impact = float("nan")
         self.last_wm_coreset_loss = float("nan")
         self.last_wm_addendum_loss = float("nan")
-        self.last_wm_lookahead_loss = float("nan")
         self.wm_loss_before_sleep = float("nan")
         self.wm_loss_ratio = float("nan")
         self.wm_plateau = False
-        # Poids du min-flou de tri du Coreset (plateau WM) + exposant vivacité
-        self.tri_w_det = 1.0
-        self.tri_w_cons = 1.0
-        self.tri_w_viv = 1.0
-        self.tri_vivacity_pow = 1.0
-        self.last_filter_stats: dict | None = None
         self.last_pol_loss = float("nan")
         self.last_pol_stats: dict | None = None
         self.last_dream_record: DreamRecord | None = None
@@ -1188,29 +659,25 @@ class Brain:
         self.sleep_wm_batch = 0
         self.sleep_wm_batches = 0
         self.sleep_wm_n = 0
-        self._skip_phase = False       # set by UI (Échap) to abort the current sleep phase
+        self.sleep_pol_steps = 0
+        self.sleep_pol_step = 0
+        self._skip_phase = False
         self.mode = "wake"
-        # inference timing (exponential moving average, ms)
         self._wm_time = 0.0
         self._pol_time = 0.0
         self._time_alpha = 0.1
-        # Experience recording control (pause when stationary)
         self._recording = True
         self._static_ticks = 0
         self._last_salve: list[list[float]] | None = None
         self._static_threshold = 6
         self._static_tol = 1e-4
         # Décalage action/conséquence en mode brain-off : la paire enregistrée
-        # est (a_{n-k} ; s_n) au lieu de (a_n ; s_{n+1}) — l'action est retardée,
-        # l'état reste l'état courant. 0 = brain-on (k forcé à 0).
+        # est (a_{n-k} ; s_n) — action retardée, état courant. 0 = brain-on.
         self.act_conseq_shift = 0
         self._act_hist: list[list[list[float]]] = []
 
     # --- live loop -----------------------------------------------------------
     def _sync_device(self) -> None:
-        """Block until queued device work finishes. CPU is eager, but
-        CUDA/MPS launch kernels asynchronously: without this, perf_counter
-        timings measure launch overhead (~0.1 ms) instead of execution."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         elif self.device.type == "mps":
@@ -1218,21 +685,16 @@ class Brain:
 
     @torch.inference_mode()
     def _wm_forward(self, salve) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the World Model forward on the wake history + current state
-        and return (latent, scalars) for the policy. Does NOT modify the
-        wake history — that is done by record_tick() at WM cadence."""
+        """WM forward on the wake history + current state; returns (latent, scalars)."""
         self.mode = "wake"
         cur_state = state_tokens(salve)
         ctx = self._build_context(cur_state)
         self.world.eval()
         t0 = time.perf_counter()
         self.world(ctx)
-        latent = self.latent_norm(self.world.last_latent())  # [1, d_model]
+        latent = self.latent_norm(self.world.last_latent())
         self._sync_device()
         dt_ms = (time.perf_counter() - t0) * 1000
-        # seed the EMA with the first measurement: blending into a zero
-        # prior under-reports the first ~10 ticks (a brain that ticks only
-        # once would otherwise display 10% of its real inference time).
         if self._wm_time <= 0.0:
             self._wm_time = dt_ms
         else:
@@ -1240,20 +702,12 @@ class Brain:
                 + self._time_alpha * dt_ms
         scalars = self._policy_scalars_batch(
             torch.tensor(cur_state, dtype=torch.float32,
-                         device=self.device).unsqueeze(0))   # [1, 47]
+                         device=self.device).unsqueeze(0))
         return latent, scalars
 
     @torch.inference_mode()
     def brain_tick(self, salve, std=None) -> tuple[float, float, float, float, float]:
-        """One brain tick at policy cadence: WM forward pass + policy action.
-
-        The WM runs on the wake history + current state to produce a fresh
-        latent; the policy then produces an action from (scalars, latent).
-        The latent is always fresh — never stale. Does NOT modify the wake
-        history; call record_tick() at WM cadence to journal the salve.
-
-        Returns 5 consignes: (theta_front, d_front, theta_back, d_back, tail_t).
-        """
+        """One brain tick at policy cadence: WM forward pass + policy action."""
         latent, scalars = self._wm_forward(salve)
         pol_in = torch.cat([scalars, latent], dim=1)
         t0 = time.perf_counter()
@@ -1269,9 +723,16 @@ class Brain:
         a = action[0].tolist()
         return a[0], a[1], a[2], a[3], a[4]
 
+    def act(self, salve, std=None):
+        """Legacy alias for brain_tick()."""
+        return self.brain_tick(salve, std=std)
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
     def record_tick(self, salve) -> None:
-        """Record a salve at WM cadence: append (state, action) to the
-        wake history and journal to the experience buffer."""
+        """Record a salve at WM cadence: wake history + journal."""
         cur_state = state_tokens(salve)
         a_toks = action_tokens(salve)
         self._wake_history.append((cur_state, a_toks))
@@ -1279,30 +740,11 @@ class Brain:
             self._wake_history.pop(0)
         self.record(salve)
 
-    def act(self, salve, std=None) -> tuple[float, float, float, float, float]:
-        """Return 5 actuator consignes. Legacy alias for brain_tick(), kept
-        for tests and external callers."""
-        return self.brain_tick(salve, std=std)
-
-    @property
-    def is_recording(self) -> bool:
-        """Whether experience recording into the buffer is currently active."""
-        return self._recording
-
     def record(self, salve) -> bool:
-        """Journal one transition into the experience buffer.
-
-        If the current sequence is long enough (>= buffer.seq_len) and the
-        tokens (animal, environment, consignes) do not move for 6 successive
-        ticks, recording is stopped. Recording resumes as soon as tokens move again.
-        The context and in-progress segment are preserved without clearing or boundary.
-        Returns True if the salve was recorded into the buffer, False if skipped.
-        """
+        """Journal one temporal salve into the experience buffer (with the
+        brain-off action/consequence shift k when act_conseq_shift > 0)."""
         if hasattr(salve, "tolist"):
             salve = salve.tolist()
-
-        # Décalage action/conséquence (brain-off, k > 0) : la salve enregistrée
-        # garde l'état courant s_n mais l'action devient a_{n-k}.
         if self.act_conseq_shift > 0:
             self._act_hist.append(action_tokens(salve))
             if len(self._act_hist) > self.act_conseq_shift + 1:
@@ -1310,17 +752,14 @@ class Brain:
             if len(self._act_hist) > self.act_conseq_shift:
                 shifted = self._act_hist[-self.act_conseq_shift - 1]
                 salve = [list(t) for t in state_tokens(salve)] + [list(t) for t in shifted]
-
         if self._last_salve is None:
             moved = True
         else:
             moved = _salve_moved(salve, self._last_salve, tol=self._static_tol)
-
         if moved:
             self._static_ticks = 0
         else:
             self._static_ticks += 1
-
         recorded = False
         if self._recording:
             self.buffer.push(salve)
@@ -1333,12 +772,10 @@ class Brain:
                 self._recording = True
                 self.buffer.push(salve)
                 recorded = True
-
         self._last_salve = salve
         return recorded
 
     def clear_history(self) -> None:
-        """Clear the wake context history and seal the buffer segment."""
         self._wake_history.clear()
         self._recording = True
         self._static_ticks = 0
@@ -1346,12 +783,11 @@ class Brain:
         self.buffer.boundary()
 
     def boundary(self) -> None:
-        """Signal a temporal discontinuity (facing flip, reset, teleportation)."""
         self.clear_history()
 
     def _build_context(self, cur_state: list):
         """Build a [1, L, 25] context tensor from the wake history + current
-        state. The layout is [s0, a0, s1, a1, ..., s_{k-1}, a_{k-1}, s_k]."""
+        state: [s0, a0, s1, a1, ..., s_{k-1}, a_{k-1}, s_k]."""
         n = len(self._wake_history)
         ctx_len = n * SALVE_TOKENS + STATE_TOKENS
         ctx = torch.zeros(1, ctx_len, DENSE_DIM, device=self.device)
@@ -1369,1823 +805,535 @@ class Brain:
         ctx[0, pos + _INTERO_IDX, SIG_OFFSET:] = 0.0
         return ctx
 
-    # --- sleep: world model training ----------------------------------------
-    def _batch_tensors(self, sequences):
-        """Build a [B, L, 25] tensor for a batch of multi-step transition
-        sequences.
-
-        Each sequence is a list of seq_steps salves of 16 Sensor tokens and 3 Actuator tokens:
-        [s0, a0, s1, a1, ..., a_{N-1}, sN]"""
+    # --- batch tensors ---------------------------------------------------------
+    def _batch_tensors(self, sequences) -> torch.Tensor:
+        """Stack recorded sequences (flat token lists) into [B, seq_len, 25].
+        Zeroes the interoception slots of every state salve (the carrier of the
+        outcome signal stays masked from the WM inputs)."""
         B = len(sequences)
-
         vals = torch.zeros(B, self.seq_len, DENSE_DIM, device=self.device)
         for b, seq in enumerate(sequences):
-            pos = 0
-            for i, salve in enumerate(seq):
-                assert len(salve) == SALVE_TOKENS
-                vals[b, pos:pos + STATE_TOKENS] = torch.tensor(
-                    salve[:STATE_TOKENS], dtype=torch.float32, device=self.device)
-                pos += STATE_TOKENS
-                # last action tokens are not predicted
-                if i < len(seq) - 1:
-                    vals[b, pos:pos + ACTION_TOKENS] = torch.tensor(
-                        salve[STATE_TOKENS:SALVE_TOKENS], dtype=torch.float32, device=self.device)
-                    pos += ACTION_TOKENS
-            assert pos == self.seq_len, f"Expected pos={self.seq_len}, got {pos}"
-
-            # Zero-padding for intermediate Token 12 (interoception) in salves
-            # 0..seq_steps-1. The fatigue/souffrance absolute level is the
-            # CARRIER (onde porteuse) of the outcome signal: a slow baseline
-            # with no effect on the simulation (excluded from the policy
-            # inputs). Masking it from every input keeps the carrier from
-            # leaking back in as a spurious baseline.
-            for k in range(self.seq_steps):
-                p_intero = k * SALVE_TOKENS + _INTERO_IDX
-                vals[b, p_intero, SIG_OFFSET:] = 0.0
-
-            # Terminal EOS token (position eos_pos): progrès par canal,
-            # f(c) = P - poids_chemin*A (voir _eos_progres). Slot 5 = inconfort.
-            p_final = self.eos_pos
-            ks = range(self.seq_steps + 1)
-            c_cost = torch.stack([vals[b, k * SALVE_TOKENS + _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-                                  for k in ks])                                  # [L, 5]
-            c_rew = torch.stack([vals[b, k * SALVE_TOKENS + _REWARD_IDX, SIG_OFFSET]
-                                 for k in ks])                                       # [L]
-            c = torch.cat([c_cost, -c_rew.unsqueeze(-1)], dim=-1)                    # [L, 6]
-            P = c[self.n_ctx] - c[-1]                                                # [6]
-            diff = c[self.n_ctx + 1:] - c[-1]                                        # [n_imagine, 6]
-            A = (diff * self._eos_decay_pow.unsqueeze(-1)).sum(dim=0)                # [6]
-            r = P - self.eos_poids_chemin * A
-            slots = 0.5 + 0.5 * r / (1.0 + r.abs())
-            vals[b, p_final, :SIG_OFFSET] = self._eos_tmpl[:SIG_OFFSET]
-            vals[b, p_final, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS] = slots
-            vals[b, p_final, SIG_OFFSET + _EOS_NSLOTS:] = 0.0
+            assert len(seq) == self.seq_len, \
+                f"recorded sequence has {len(seq)} tokens, expected {self.seq_len}"
+            vals[b] = torch.tensor(seq, dtype=torch.float32, device=self.device)
+        # intero slots: contexte (salves 0..n_ctx) + conséquence inversée
+        intero_pos = [k * SALVE_TOKENS + _INTERO_IDX for k in range(self.n_ctx + 1)]
+        intero_pos += [self.conseq_start + j * STATE_TOKENS + _INTERO_IDX
+                       for j in range(self.n_imagine)]
+        vals[:, intero_pos, SIG_OFFSET:] = 0.0
         return vals
 
-    def _wm_loss_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """Teacher-forced forward + impact-weighted masked-MSE loss over valid
-        signal slots.
-
-        ``weights`` [B] scales each sequence's contribution to the loss, so
-        its descent step is proportional to its measured cost impact
-        (|cost(S10) - cost(S4)|). The weighted mean keeps the overall step
-        magnitude on the same scale as the uniform loss, independent of the
-        cost-unit scale of the impacts.
-        Side-effect free so torch.compile can capture it as one graph; the
-        backward pass through this graph is also compiled (AOTAutograd)."""
-        return self._wm_masked_mse(self.world(vals), vals, weights)
-
-    def _lookahead_input(self, vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compact lookahead input: [context, a4 teacher-forced, EOS token] —
-        the same shape as hindsight generation, so training and generation
-        share one mask. Returns (input [B, dp+4, 25], salve_positions [dp+4])."""
-        dp, ep = self.decision_pos, self.eos_pos
-        look = torch.cat([vals[:, :dp + ACTION_TOKENS, :], vals[:, ep:ep + 1, :]], dim=1)
-        sp = torch.arange(look.shape[1], device=look.device) // SALVE_TOKENS
-        sp[-1] = self.seq_steps
-        return look, sp
-
-    def _wm_loss_lookahead_impl(self, vals: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """The lookahead pass trains the inversion only: the gap between the
-        estimated a_{n_ctx} and the observed one, under the compact
-        EOS-lookahead mask on [context, a4, EOS] (only the a4 rows attend the
-        realized terminal EOS). Nothing else is asked of this pass — state
-        predictions, the terminal reward slots and the other actions belong
-        to the causal pass. No forcing: each sequence carries its own
-        realized EOS, good or bad outcomes alike."""
-        look, sp = self._lookahead_input(vals)
-        pred = self.world(look, attn_mask=self.mask_lookahead, is_causal=False,
-                          salve_positions=sp)
-        w = self.target_weight_look[:look.shape[1] - 1]
-        return self._wm_masked_mse(pred, look, weights, weight=w)
-
-    def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor,
-                       weights: torch.Tensor,
-                       weight: torch.Tensor | None = None) -> torch.Tensor:
-        """Masked, impact-weighted MSE over valid signal slots. ``weight``
-        selects the target table: the full sequence table (default, causal
-        pass) or the inversion-only lookahead table."""
+    # --- WM training -----------------------------------------------------------
+    def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+        """Masked MSE over valid signal slots. The target table weights 0 the
+        context rows (prompt) and 1.0 every row from the dénouement on."""
         pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
         tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
-        w = weight if weight is not None else self.target_weight
-        w_b = w.unsqueeze(0).expand_as(pred_signals)     # [B, L-1, 16]
+        w = self.target_weight.unsqueeze(0).expand_as(pred_signals)
         sq = (pred_signals - tgt_signals) ** 2
-        sqm = (sq * w_b).sum(dim=(1, 2))                  # [B] per-sequence weighted squared error
-        wsum = w_b.sum(dim=(1, 2)).clamp(min=1.0)          # [B] total slot weight per sequence
-        mse = sqm / wsum                                   # [B] per-sequence weighted MSE
-        return (mse * weights).sum() / weights.sum().clamp(min=1e-8)
+        sqm = (sq * w).sum(dim=(1, 2))                   # [B]
+        wsum = w.sum(dim=(1, 2)).clamp(min=1.0)          # [B]
+        return (sqm / wsum).mean()
 
-    def _train_wm_batch(self, sequences: list[list[list[float]]],
-                        lookahead: bool = False) -> float:
-        """Run one training optimization step on a batch of transition sequences.
+    def _wm_loss_impl(self, vals: torch.Tensor) -> torch.Tensor:
+        """One forward, one loss: causal mask + salve positions over the whole
+        recorded sequence, MSE on all tokens from the dénouement on."""
+        pred = self.world(vals, attn_mask=self.mask, is_causal=True,
+                          salve_positions=self.salve_positions)
+        return self._wm_masked_mse(pred, vals)
 
-        Each sequence's descent step is proportional to its actual biological impact
-        |relief|: the absolute magnitude of change between the decision window
-        and the consequence window. A small floor weight (``_WM_IMPACT_FLOOR``)
-        keeps neutral sequences learning at a trickle and prevents an all-neutral
-        batch from yielding a zero loss that would trip the target-loss stopping criterion.
-
-        ``lookahead=True`` runs the same loss under the multi-position
-        EOS-lookahead attention mask (see ``_wm_loss_lookahead_impl``); the
-        per-sequence relief contrast is then amplified by the configurable
-        multiplier ``lookahead_relief_mult`` (1.0 = same weighting as the
-        causal pass), so the outcome-carrying sequences weigh more in the
-        inversion's descent."""
-        vals = self._batch_tensors(sequences)             # [B, L, 25]
-        impacts = impact(sequences, n_ctx=self.n_ctx, decay=self.eos_decay, poids_chemin=self.eos_poids_chemin).to(self.device)
-        mult = self.lookahead_relief_mult if lookahead else 1.0
-        weights = mult * impacts + self.wm_impact_floor
-        self.last_wm_impact = (weights.sum() / len(sequences)).item()
-        if lookahead:
-            # wm_w_a4_lookahead scales the whole hindsight pass (its target
-            # table holds only the a4 rows, where a uniform row weight would
-            # cancel in the wsum normalization — hence a loss-level multiplier).
-            # The reported loss stays unscaled for comparability.
-            raw = self._wm_loss_lookahead(vals, weights)
-            loss = raw * self.wm_w_a4_lookahead
-        else:
-            raw = self._wm_loss(vals, weights)
-            loss = raw
+    def _train_wm_batch(self, sequences) -> float:
+        """One WM optimization step on a batch of recorded sequences."""
+        vals = self._batch_tensors(sequences)
+        loss = self._wm_loss(vals)
         self.opt_wm.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
         self.opt_wm.step()
-        return raw.item()
-
-    def train_world(self, epochs: int = 512, batch: int = 32):
-        """Train the world model. Generator: yields (label, value) after each
-        epoch."""
-        if len(self.buffer) < 1:
-            return
-        self.world.train()
-        losses = []
-        for ep in range(epochs):
-            self.sleep_wm_step = ep + 1
-            sequences = self.buffer.sample(batch)
-            if not sequences:
-                break
-            loss_val = self._train_wm_batch(sequences)
-            losses.append(loss_val)
-            yield "wm", loss_val
-        self.last_wm_loss = sum(losses) / len(losses) if losses else float("nan")
-
-    def _compute_sequence_metadata(self, batch_size: int = 16):
-        """Début de sommeil : pour chaque séquence Coreset/Addendum, calcule les
-        métadonnées par séquence (dict). Générateur : yield ``("meta", done, total)``
-        après chaque batch pour la progression de la modale de sommeil.
-          - relief_score      : relief de l'EOS enregistré
-          - causal_score      : cosinus(EOS causal prédit, EOS enregistré)
-          - lookahead_score   : cosinus(action lookahead, action enregistrée)
-          - dissonance        : 1 - cosinus(action politique, action enregistrée)
-          - pol_relief_score  : relief de l'EOS du rollout contexte + action politique
-          - latent            : latent intermédiaire (dernière position) de la
-                                passe causale sur toute la séquence
-        """
-        self.world.eval()
-        self.policy.eval()
-        device = self.device
-        ctx_len = self.decision_pos
-        dp, ep = self.decision_pos, self.eos_pos
-
-        def _process(seqs, metas):
-            total = len(seqs)
-            done = 0
-            for i in range(0, len(seqs), batch_size):
-                chunk = seqs[i:i + batch_size]
-                mchunk = metas[i:i + batch_size]
-                if not chunk:
-                    continue
-                B = len(chunk)
-                vals = self._batch_tensors(chunk)                       # [B, L, 25]
-                with torch.inference_mode():
-                    # 1. Passe causale sur toute la séquence
-                    pred_full = self.world(vals, attn_mask=self.mask)
-                    latent_seq = self.latent_norm(self.world.last_latent().detach())  # [B, d]
-                    eos_pred = pred_full[:, ep, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]  # [B, 6]
-                    eos_rec = vals[:, ep, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]        # [B, 6]
-
-                    # 2. Passe causale sur le contexte seul → latent politique
-                    ctx = vals[:, :ctx_len, :].clone()
-                    self.world(ctx, attn_mask=build_salve_mask(ctx_len, device))
-                    latent_ctx = self.latent_norm(self.world.last_latent().detach())
-
-                    # 3. Inférence politique
-                    scalars = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
-                    pol_in = torch.cat([scalars, latent_ctx], dim=1)
-                    pol_action = self.policy(pol_in)                     # [B, 5]
-                    a_rec = self._decode_action_batch(
-                        vals[:, dp: dp + ACTION_TOKENS, :])              # [B, 5]
-
-                    # 4. Passe lookahead → action prédite à la decision_pos
-                    look, sp = self._lookahead_input(vals)
-                    pred_look = self.world(look, attn_mask=self.mask_lookahead,
-                                           is_causal=False, salve_positions=sp)
-                    a_look = self._decode_action_batch(
-                        pred_look[:, dp: dp + ACTION_TOKENS, :])          # [B, 5]
-
-                    # 5. Rollout WM causal après l'action politique → EOS politique
-                    # (KV-cache : bien plus rapide que predict_next_state)
-                    pol_a_toks = self._encode_action_batch(pol_action)    # [B, 3, 25]
-                    base_cache = KVCache(len(self.world.transformer.layers),
-                                         self.world.d_model, B, device)
-                    self.world.cache_forward(ctx, base_cache)
-                    eos_pol, _ = self._rollout_candidate(
-                        ctx, base_cache, pol_action,
-                        ctx[:, -STATE_TOKENS:, :].tolist()[0] if False else ctx[:, -1, :].tolist(),
-                        self.n_imagine, ctx_len, build_salve_mask(ctx_len, device),
-                        use_kv_cache=True)
-                    eos_pol = eos_pol if eos_pol is not None else torch.full(
-                        (B, _EOS_NSLOTS), 0.5, device=device)
-
-                # cosinus
-                def _cos(a, b):
-                    na = a.norm(dim=1).clamp(min=1e-8)
-                    nb = b.norm(dim=1).clamp(min=1e-8)
-                    return (a * b).sum(dim=1) / (na * nb)
-
-                rel = relief_score(eos_rec.to(device))                # [B] — token EOS enregistré
-                pol_rel = relief_score(eos_pol)                       # [B]
-                causal = _cos(eos_pred, eos_rec)                      # [B]
-                look = _cos(a_look, a_rec)                            # [B]
-                diss = 1.0 - _cos(pol_action, a_rec)                  # [B]
-
-                for j in range(B):
-                    m = mchunk[j]
-                    m["relief_score"] = float(rel[j])
-                    m["pol_relief_score"] = float(pol_rel[j])
-                    m["causal_score"] = float(causal[j])
-                    m["lookahead_score"] = float(look[j])
-                    m["dissonance"] = float(diss[j])
-                    m["latent"] = latent_seq[j].detach().cpu().tolist()
-                done += len(chunk)
-                yield len(chunk), total
-
-        total_all = self.buffer.coreset_size + self.buffer.addendum_size
-        done_all = 0
-        for d, t in _process(self.buffer._coreset, self.buffer._coreset_meta):
-            done_all += d
-            yield "meta", done_all, total_all
-            if self._skip_phase:
-                self._skip_phase = False
-                return
-        for d, t in _process(self.buffer._addendum, self.buffer._addendum_meta):
-            done_all += d
-            yield "meta", done_all, total_all
-            if self._skip_phase:
-                self._skip_phase = False
-                return
-
-    def _evict_coreset_excess(self) -> int:
-        """Si le Coreset dépasse sa capacité de m séquences, supprime les m
-        premières du tri (sorted_coreset_indices). Retourne le nombre supprimé."""
-        buf = self.buffer
-        excess = len(buf._coreset) - buf.pool_capacity
-        if excess <= 0:
-            return 0
-        order = self.sorted_coreset_indices()
-        drop = set(order[:excess])
-        buf._coreset = [s for i, s in enumerate(buf._coreset) if i not in drop]
-        buf._coreset_vivacity = [v for i, v in enumerate(buf._coreset_vivacity) if i not in drop]
-        buf._coreset_meta = [m for i, m in enumerate(buf._coreset_meta) if i not in drop]
-        return excess
-
-    def sorted_coreset_indices(self, noise: float = 0.05) -> list[int]:
-        """Ordre de tri du Coreset. Si plateau WM (wm_plateau), tri ascendant par
-        min-flou pondéré des valeurs min-max normalisées de :
-          - déterminisme = (lookahead_score + causal_score) / 2, poids tri_w_det
-          - consonance   = 1 / (1 + dissonance),              poids tri_w_cons
-          - vivacité     = vivacity ** tri_vivacity_pow,       poids tri_w_viv
-        score = min(w_det*det, w_cons*cons, w_viv*viv). Un bruit uniforme
-        [0, noise] est ajouté au critère pour l'aléa.
-        Sans plateau, ordre naturel."""
-        n = self.buffer.coreset_size
-        if not self.wm_plateau or n == 0:
-            return list(range(n))
-        metas = self.buffer._coreset_meta
-        viv = self.buffer._coreset_vivacity
-        det, cons, viv_vals = [], [], []
-        for i in range(n):
-            m = metas[i] if i < len(metas) else {}
-            cs = m.get("causal_score") or 0.0
-            ls = m.get("lookahead_score") or 0.0
-            det.append((cs + ls) / 2.0)
-            d = m.get("dissonance") or 0.0
-            cons.append(1.0 / (1.0 + d))
-            viv_vals.append(viv[i] if i < len(viv) else 1.0)
-
-        def _norm(vals):
-            lo, hi = min(vals), max(vals)
-            if hi - lo < 1e-12:
-                return [0.5] * len(vals)
-            return [(v - lo) / (hi - lo) for v in vals]
-
-        det_n = _norm(det)
-        cons_n = _norm(cons)
-        viv_n = _norm(viv_vals)
-        keys = []
-        for i in range(n):
-            k = min(self.tri_w_det * det_n[i],
-                    self.tri_w_cons * cons_n[i],
-                    self.tri_w_viv * viv_n[i] ** self.tri_vivacity_pow)
-            if noise > 0:
-                k += self.buffer._rng.uniform(0.0, noise)
-            keys.append(k)
-        return sorted(range(n), key=lambda i: keys[i])
+        return loss.item()
 
     def train_wm_phase(self, epochs: int, batch: int,
                        target_loss: float | None = None,
                        source: str = "coreset",
-                       fixed_seq=None,
-                       buffer: "ExperienceBuffer | None" = None,
-                       label: str = "wm",
-                       surprise_factor: float | None = None,
-                       surprise_floor: float = 0.001):
-        """One World Model training phase as a generator yielding
-        ``(label, epoch, loss, lookahead)`` after each epoch.
-
-        1 epoch = tout le dataset (coreset ou addendum) parcouru en batchs de
-        taille ``batch`` sans omission ni remise. Chaque batch subit une passe
-        causale ET une passe lookahead. Coreset : batchs dans l'ordre du tri
-        (sorted_coreset_indices). Addendum : shuffle à chaque epoch.
-        ``fixed_seq`` (a sequence, or a callable) is appended to every batch.
-        Chaque séquence voit son compteur ``learn_count`` incrémenté de 1 par
-        epoch, et sa métadonnée ``surprise`` mise à jour (loss causale du batch).
-        Oubli conditionné par la surprise : à la première epoch sur l'addendum,
-        les séquences neuves (learn_count == 0) sous le seuil de surprise sont
-        supprimées dès cette epoch."""
-        buf = buffer if buffer is not None else self.buffer
-        if source == "addendum":
-            seqs_all, metas_all = buf._addendum, buf._addendum_meta
-        else:
-            seqs_all, metas_all = buf._coreset, buf._coreset_meta
+                       label: str = "wm"):
+        """One WM training phase as a generator yielding ``(label, epoch, loss)``
+        after each batch. 1 epoch = the whole dataset swept in batches without
+        omission or replacement; addendum is shuffled each epoch."""
+        buf = self.buffer
+        seqs_all, metas_all = ((buf._addendum, buf._addendum_meta) if source == "addendum"
+                               else (buf._coreset, buf._coreset_meta))
         n = len(seqs_all)
-        if n == 0 and fixed_seq is None:
+        if n == 0:
             return
         self.world.train()
         self.sleep_wm_epochs = epochs
-        if source == "coreset":
-            order = self.sorted_coreset_indices()
-        else:
-            order = list(range(n))
+        order = list(range(n))
         ep = 0
         while True:
             ep += 1
             self.sleep_wm_step = ep
-            # sleep_wm_epochs reste le quota demandé (total fixe pour la barre
-            # de progression) ; en overtime, step dépasse total et la barre
-            # se cappe à 100%.
             if source == "addendum":
-                self.buffer._rng.shuffle(order)
-            n_batches = max(1, (n + batch - 1) // batch)
-            self.sleep_wm_batches = n_batches
+                buf._rng.shuffle(order)
             self.sleep_wm_n = n
+            self.sleep_wm_batches = max(1, (n + batch - 1) // batch)
             self.sleep_wm_batch = 0
             epoch_losses = []
             skip = False
-            # 1 epoch = tout le dataset en batchs, sans omission ni remise.
-            # Un yield PAR BATCH : la modale progresse batch par batch.
             for start in range(0, n, batch):
                 idxs = order[start:start + batch]
                 self.sleep_wm_batch = start // batch + 1
-                batch_seqs = [seqs_all[i] for i in idxs if i < len(seqs_all)]
-                if fixed_seq is not None:
-                    fs = fixed_seq() if callable(fixed_seq) else fixed_seq
-                    batch_seqs = [fs] + batch_seqs
-                if not batch_seqs:
-                    continue
-                # passe causale puis lookahead sur le même batch
-                loss_c = self._train_wm_batch(batch_seqs, lookahead=False)
-                self._train_wm_batch(batch_seqs, lookahead=True)
+                loss_c = self._train_wm_batch([seqs_all[i] for i in idxs])
                 epoch_losses.append(loss_c)
                 for i in idxs:
                     if i < len(metas_all):
                         metas_all[i]["surprise"] = loss_c
-                yield label, ep, loss_c, True
+                yield label, ep, loss_c
                 if self._skip_phase:
                     self._skip_phase = False
                     skip = True
                     break
-                # oubli surprise : 1ère epoch, addendum, séquences neuves,
-                # uniquement si plateau WM
-                if (source == "addendum" and ep == 1 and self.wm_plateau
-                        and surprise_factor is not None):
-                    base = self.last_wm_coreset_loss
-                    threshold = max(base * surprise_factor, surprise_floor) \
-                        if not math.isnan(base) else surprise_floor
-                    for i in idxs:
-                        if i < len(metas_all) and metas_all[i].get("learn_count", 0) == 0:
-                            s = metas_all[i].get("surprise")
-                            if s is not None and s < threshold:
-                                metas_all[i]["_drop"] = True
             if skip:
-                break
-            # nettoyage des séquences marquées (1ère epoch addendum, plateau WM)
-            if source == "addendum" and ep == 1 and self.wm_plateau:
-                keep = [i for i in range(len(buf._addendum))
-                        if not (i < len(buf._addendum_meta) and buf._addendum_meta[i].get("_drop"))]
-                if len(keep) < len(buf._addendum):
-                    buf._addendum = [buf._addendum[i] for i in keep]
-                    buf._addendum_meta = [buf._addendum_meta[i] for i in keep]
-                    seqs_all, metas_all = buf._addendum, buf._addendum_meta
-                    n = len(seqs_all)
-                    order = list(range(n))
-            # compteur +1 par epoch pour les séquences restantes
+                return
             for m in metas_all:
                 m["learn_count"] = m.get("learn_count", 0) + 1
             loss_val = (sum(epoch_losses) / len(epoch_losses)) if epoch_losses else float("nan")
-
-            quota_done = (ep >= epochs)
-            target_done = (target_loss is None) or (loss_val <= target_loss)
-            if quota_done and target_done:
-                if ep > epochs:
-                    print(f"[{label}] Target loss {target_loss:.4f} reached in overtime at epoch {ep} (loss={loss_val:.5f}).")
+            if ep >= epochs and (target_loss is None or loss_val <= target_loss):
                 break
 
-    def evaluate_sequences_surprise(self, sequences: list[list[list[float]]], batch_size: int = 32) -> list[float]:
-        """Evaluate surprise scores for a list of sequences under the current World Model.
-
-        Surprise score combines:
-          1. Dynamical prediction error (MSE over valid sensor token positions).
-          2. Discrepancy between predicted and actual innate cost/reward over the trajectory.
-          Surprise = dyn_loss * (1.0 + mean_cost_divergence).
-        """
-        if not sequences:
-            return []
+    def evaluate_sequences_surprise(self, sequences, batch_size: int = 32) -> list[float]:
+        """Per-sequence prediction MSE under the current WM (inference only)."""
         self.world.eval()
-        surprises: list[float] = []
-        n_cost = len(_COST_KEYS)
+        out = []
         with torch.inference_mode():
             for i in range(0, len(sequences), batch_size):
-                chunk = sequences[i : i + batch_size]
-                B = len(chunk)
+                chunk = sequences[i:i + batch_size]
+                if not chunk:
+                    continue
                 vals = self._batch_tensors(chunk)
-                pred = self.world(vals, attn_mask=self.mask)
+                pred = self.world(vals, attn_mask=self.mask, is_causal=True,
+                                  salve_positions=self.salve_positions)
                 pred_signals = pred[:, :-1, :]
                 tgt_signals = vals[:, 1:, SIG_OFFSET:]
-                m_b = self.target_valid.unsqueeze(0).expand_as(pred_signals)
+                w = self.target_weight.unsqueeze(0).expand_as(pred_signals)
+                sq = ((pred_signals - tgt_signals) ** 2 * w).sum(dim=(1, 2))
+                wsum = w.sum(dim=(1, 2)).clamp(min=1.0)
+                out.extend((sq / wsum).tolist())
+        return out
 
-                sq = (pred_signals - tgt_signals) ** 2
-                valid_counts = m_b.sum(dim=[1, 2]).clamp(min=1)
-                dyn_loss = (sq * m_b).sum(dim=[1, 2]) / valid_counts  # [B]
-
-                cost_diff_sum = torch.zeros(B, device=self.device)
-                for k in range(1, self.seq_steps + 1):
-                    p_cost = k * SALVE_TOKENS + _COST_IDX - 1
-                    p_conf = k * SALVE_TOKENS + _REWARD_IDX - 1
-
-                    c_pred = pred_signals[:, p_cost, :n_cost]
-                    denorm_pred = torch.where(self._cost_signed,
-                                              (2 * c_pred - 1) * self._cost_scales,
-                                              c_pred * self._cost_scales)
-                    conf_pred = pred_signals[:, p_conf, 0]
-                    conf_phys_pred = (2 * conf_pred - 1) * _CONFORT_SCALE
-                    cost_pred = (denorm_pred * self._cost_w).sum(1) + _CONFORT_W * conf_phys_pred
-
-                    c_tgt = tgt_signals[:, p_cost, :n_cost]
-                    denorm_tgt = torch.where(self._cost_signed,
-                                             (2 * c_tgt - 1) * self._cost_scales,
-                                             c_tgt * self._cost_scales)
-                    conf_tgt = tgt_signals[:, p_conf, 0]
-                    conf_phys_tgt = (2 * conf_tgt - 1) * _CONFORT_SCALE
-                    cost_tgt = (denorm_tgt * self._cost_w).sum(1) + _CONFORT_W * conf_phys_tgt
-
-                    cost_diff_sum += (cost_pred - cost_tgt).abs()
-
-                mean_cost_diff = cost_diff_sum / self.seq_steps
-                seq_surprise = dyn_loss * (1.0 + mean_cost_diff)
-                surprises.extend(seq_surprise.tolist())
-        return surprises
-
-    def compute_saliency_weights(self, sequences: list[list[list[float]]] | None = None,
-                                 batch_size: int = 32,
-                                 floor_pct: float = 0.05) -> torch.Tensor:
-        """Compute sequence feature sensitivity weights backpropagated
-        from the terminal EOS token.
-
-        Uses the World Model's autograd gradients on the terminal EOS
-        prediction (position seq_len - 2, predicting token eos_pos: the
-        time-weighted innate cost aggregate, 6 slots).
-
-        Returns a 1D tensor of shape [D_TOTAL] with mean == 1.0, suitable for weighted RMSE distance.
-        If buffer is empty and no sequences provided, returns uniform ones tensor.
-        """
-        D_TOTAL = (self.seq_steps + 1) * SALVE_TOKENS * N_SIGNAL
-        if sequences is None:
-            sequences = self.buffer.sample(batch_size)
-            if not sequences and self.buffer.coreset_size > 0:
-                sequences = self.buffer.sample_coreset(batch_size)
-            if not sequences and self.buffer.addendum_size > 0:
-                sequences = self.buffer.sample_addendum(batch_size)
-        if not sequences:
-            return torch.ones(D_TOTAL, device=self.device)
-
-        seqs_sample = sequences[:batch_size]
-        self.world.eval()
-
-        vals = self._batch_tensors(seqs_sample).detach().requires_grad_(True)
-        pred = self.world(vals, attn_mask=self.mask)
-
-        # Target: the terminal EOS token prediction (position seq_len - 2
-        # predicts token eos_pos) — the denouement delta, scalarized as the
-        # channel-hierarchy-weighted deviation from neutral (0.5).
-        eos_delta = ((pred[:, self.seq_len - 2, :_EOS_NSLOTS] * self._eos_cw).sum(dim=-1)
-                     - 0.5)
-
-        # Vectorized backward pass across all sample sequences
-        grad_out = torch.autograd.grad(eos_delta.sum(), vals)[0]
-        signal_grads = grad_out[:, :, SIG_OFFSET:]
-        mean_sens = signal_grads.abs().mean(dim=0)
-
-        # Assemble into full sequence layout
-        w_grid = torch.zeros(self.seq_steps + 1, SALVE_TOKENS, N_SIGNAL, device=self.device)
-        w_grid[:self.seq_steps, :, :] = mean_sens[:self.seq_steps * SALVE_TOKENS].view(self.seq_steps, SALVE_TOKENS, N_SIGNAL)
-        w_grid[self.seq_steps, :STATE_TOKENS, :] = mean_sens[self.seq_steps * SALVE_TOKENS : self.seq_steps * SALVE_TOKENS + STATE_TOKENS]
-
-        w_flat = w_grid.view(-1)  # [2816]
-        floor = floor_pct * w_flat.mean().clamp(min=1e-8)
-        w_floored = w_flat + floor
-        w_norm = w_floored / w_floored.mean().clamp(min=1e-8)
-
-        return w_norm.detach()
-
-    def trusted_saliency_weights(self, **kwargs) -> torch.Tensor | None:
-        """EOS-saliency weights, or None when the World Model is not trusted yet.
-
-        The saliency-weighted distance is only meaningful if the World Model has
-        actually converged on the Coreset: gradients of an untrained WM carry no
-        reliable sensitivity information. Returns the saliency weights only when
-        the last World Model training on the Coset (``last_wm_coreset_loss``)
-        exists (not NaN) and is below ``_WM_SALIENCY_MAX_LOSS`` (0.02); otherwise
-        returns None, i.e. the naive uniform RMSE distance is used.
-        """
-        loss = self.last_wm_coreset_loss
-        if math.isnan(loss) or loss >= _WM_SALIENCY_MAX_LOSS:
-            return None
-        return self.compute_saliency_weights(**kwargs)
-
+    # --- vectorized helpers ------------------------------------------------------
     def _salve_cost_batch(self, gen: torch.Tensor) -> torch.Tensor:
-        """Vectorized ``salve_cost`` over a batch of predicted states.
-
-        gen: [B, 13, 25] (or [B, 16, 25]) float tensors. Returns [B] cost —
-        the same weighted innate cost as ``tokenize.salve_cost`` but computed
-        in one tensor op, no per-element Python loop or ``.tolist()`` sync."""
-        # print("gen motivation:",
-        #    gen[0, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5])
-        # print("gen reward:",
-        #     gen[0, _REWARD_IDX, SIG_OFFSET])
+        """Vectorized salve_cost over [B, 13, 25] (or [B, 16, 25])."""
         n = len(_COST_KEYS)
-        c = gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + n]        # [B, 5]
+        c = gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + n]
         denorm = torch.where(self._cost_signed,
                              (2 * c - 1) * self._cost_scales,
-                             c * self._cost_scales)             # [B, 5]
-        confort = gen[:, _REWARD_IDX, SIG_OFFSET]               # [B]
-        confort_phys = (2 * confort - 1) * _CONFORT_SCALE       # [B]
+                             c * self._cost_scales)
+        confort = gen[:, _REWARD_IDX, SIG_OFFSET]
+        confort_phys = (2 * confort - 1) * _CONFORT_SCALE
         return (denorm * self._cost_w).sum(1) + _CONFORT_W * confort_phys
 
     def _policy_scalars_batch(self, state_tokens: torch.Tensor) -> torch.Tensor:
-        """Vectorized ``policy_scalars``: extract the 51 sensory + cost
-        scalars (tokens 0..11) from a batch of state tokens. state_tokens:
-        [B, 13, 25] → [B, 51], one gather op, no per-element loop or
-        ``.tolist()``."""
+        """[B, 13, 25] -> [B, 51] policy scalars (tokens 0..11)."""
         B = state_tokens.shape[0]
-        sigs = state_tokens[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]   # [B,13,16]
-        flat = sigs.reshape(B, STATE_TOKENS * N_SIGNAL)                # [B,208]
-        return flat.index_select(1, self._pol_idx)                    # [B,47]
+        sigs = state_tokens[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]
+        flat = sigs.reshape(B, STATE_TOKENS * N_SIGNAL)
+        return flat.index_select(1, self._pol_idx)
 
     def _encode_action_batch(self, action: torch.Tensor) -> torch.Tensor:
-        """Vectorized normalized action [B, 5] -> [B, 3, 25].
-        
-        Model action space:
-            signed   -> [-1, +1]
-            unsigned -> [0, 1]
-
-        Token signal space:
-            [0, 1]
-        """
+        """Action [B, 5] in model space (signed [-1,1], unsigned [0,1]) ->
+        action tokens [B, 3, 25] in token signal space [0,1]."""
         if action.dim() == 1:
             action = action.unsqueeze(0)
-
         B = action.shape[0]
-
-        # Convert signed model outputs [-1,1] to token range [0,1].
-        # Unsigned dimensions [0,1] are unchanged.
-        norm = torch.where(
-            self._act_signed,
-            (action + 1.0) / 2.0,
-            action,
-        )
-
+        norm = torch.where(self._act_signed, (action + 1.0) / 2.0, action)
         toks = self._act_tmpl.unsqueeze(0).expand(B, -1, -1).clone()
-        toks[:, self._act_tok, SIG_OFFSET + self._act_slot] = norm
-
+        flat = toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]
+        flat = flat.scatter(1, (self._act_tok * N_SIGNAL + self._act_slot).unsqueeze(0).expand(B, -1),
+                            norm)
+        toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = flat
         return toks
 
     def _decode_action_batch(self, act_toks: torch.Tensor) -> torch.Tensor:
-        """Vectorized action token decoding: [B, 3, 25] -> [B, 5] in model action space.
-        Signed consignes: [-1, +1]
-        Unsigned consignes: [0, 1]
+        """Action tokens [B, 3, 25] -> action [B, 5] in model space."""
+        B = act_toks.shape[0]
+        flat = act_toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL].reshape(B, ACTION_TOKENS * N_SIGNAL)
+        idx = (self._act_tok * N_SIGNAL + self._act_slot)
+        vals = flat.index_select(1, idx)                       # [B, 5] in [0,1]
+        return torch.where(self._act_signed, 2.0 * vals - 1.0, vals)
+
+    # --- WM inference: dénouement sampling + generation --------------------------
+    @torch.inference_mode()
+    def predict_denouement(self, ctx: torch.Tensor) -> torch.Tensor:
+        """Mean dénouement predicted from the context alone: forward over
+        [B, ctx_len, 25], read the 6 EOS slots at the last row. Returns [B, 6]."""
+        L = ctx.shape[1]
+        pred = self.world(ctx, attn_mask=build_salve_mask(L, ctx.device),
+                          is_causal=True,
+                          salve_positions=self.salve_positions[:L])
+        return pred[:, -1, :_EOS_NSLOTS].clamp(0.0, 1.0)
+
+    @torch.inference_mode()
+    def sample_denouements(self, ctx: torch.Tensor, k: int | None = None,
+                           temperature: float | None = None,
+                           top_p: float | None = None,
+                           eos_observed: torch.Tensor | None = None
+                           ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Échantillonnage du dénouement depuis le contexte (REFONTE.md) :
+
+        - le WM prédit la moyenne conditionnelle µ (vecteur continu, 6 slots) ;
+        - on tire K vecteurs v ~ N(µ, T²) (température T), top-K/top-p sur les
+          tirages (densité gaussienne) ;
+        - chaque tirage est noté f(probable, favorable) = log p(v) + w_fav * relief(v) ;
+        - le meilleur est élu (pas nécessairement le plus probable).
+
+        Règle de l'observé : si ``eos_observed`` est fourni et que son relief
+        atteint ``eos_satisfying``, on reste sur l'observé (p = 1).
+
+        Returns (eos_elu [B, 6], p_elu [B]) — p_elu = softmax(log p) du tirage élu.
         """
-        if act_toks.dim() == 2:
-            act_toks = act_toks.unsqueeze(0)
-        norm = act_toks[:, self._act_tok, SIG_OFFSET + self._act_slot]
-        return torch.where(self._act_signed, 2.0 * norm - 1.0, norm)
+        B = ctx.shape[0]
+        device = ctx.device
+        K = k or self.eos_top_k
+        T = temperature if temperature is not None else self.eos_temperature
+        mu = self.predict_denouement(ctx)                       # [B, 6]
+        eps = torch.randn(B, K, _EOS_NSLOTS, device=device)
+        v = (mu.unsqueeze(1) + T * eps).clamp(0.0, 1.0)          # [B, K, 6]
+        logp = (-0.5 * ((v - mu.unsqueeze(1)) / T) ** 2).sum(dim=-1) \
+            - _EOS_NSLOTS * math.log(T * math.sqrt(2.0 * math.pi))   # [B, K]
+        # top-p : plus petit préfixe des tirages triés par logp dont la masse
+        # softmax cumulée atteint top_p
+        if top_p is not None and 0.0 < top_p < 1.0:
+            p_sort, order = torch.sort(logp, dim=1, descending=True)
+            cum = torch.softmax(p_sort, dim=1).cumsum(dim=1)
+            keep = cum <= top_p
+            keep[:, 0] = True                                   # au moins le plus probable
+            logp = logp.scatter(1, order, torch.where(keep, p_sort, torch.full_like(p_sort, float("-inf"))))
+        relief = relief_score(v, p=self.eos_max_p)              # [B, K]
+        f = logp + self.eos_w_fav * relief
+        elu = f.argmax(dim=1)                                   # [B]
+        b_idx = torch.arange(B, device=device)
+        eos_elu = v[b_idx, elu]                                 # [B, 6]
+        p_elu = torch.softmax(logp, dim=1)[b_idx, elu]          # [B]
+        if eos_observed is not None and self.eos_satisfying is not None:
+            rel_obs = relief_score(eos_observed, p=self.eos_max_p)
+            use_obs = rel_obs >= self.eos_satisfying
+            eos_elu = torch.where(use_obs.unsqueeze(1), eos_observed, eos_elu)
+            p_elu = torch.where(use_obs, torch.ones_like(p_elu), p_elu)
+        return eos_elu, p_elu
 
-    def _random_action_batch(self, B: int, device: torch.device) -> torch.Tensor:
-        action = torch.rand(
-            B,
-            self._act_scales.numel(),
-            device=device,
-        )
+    @torch.inference_mode()
+    def generate_from_denouement(self, ctx: torch.Tensor,
+                                 eos_vec: torch.Tensor) -> dict:
+        """Génération auto-régressive depuis ``[contexte, dénouement élu]`` :
+        déroule la conséquence inversée (``conseq_len`` tokens d'état, du plus
+        tardif au plus précoce) jusqu'à l'action de décision (3 derniers
+        tokens de la séquence). Masque strictement causal, positions explicites.
 
-        action[:, self._act_signed] = (
-            2.0 * action[:, self._act_signed] - 1.0
-        )
-
-        return action
-
-    def _explore_action_batch(self, base_action: torch.Tensor, sigma: float) -> torch.Tensor:
-        """Generate exploratory action candidates perturbed around base_action.
-
-        base_action: [B, 5]
-        sigma: standard deviation of Gaussian perturbation
-        Returns: [B, 5] valid clamped actions (signed dims in [-1, 1], unsigned in [0, 1])
-        """
-        noise = torch.randn_like(base_action) * sigma
-        return torch.clamp(base_action + noise, self._act_min, self._act_max)
-
-    def _amplify_extremes(self, action: torch.Tensor) -> torch.Tensor:
-        """Amplify hindsight actions toward extremes, but only for values
-        already near the extremes (bold recovery bias). Values below the
-        threshold are left unchanged, preventing a positive feedback loop
-        that would push moderate actions toward extremes over successive
-        sleep cycles.
-
-        Signed dims (theta): |v| >= threshold → amplified toward ±1.
-        Unsigned dims (d):   v >= threshold → amplified toward 1.
-        factor=1.0 = no-op."""
-        f = self.eos_force_amplify
-        if f == 1.0:
-            return action
-        thr = self.eos_force_amplify_threshold
-        out = action.clone()
-        signed = self._act_signed
-        # Signed dims: amplify |v| toward 1 only when |v| >= threshold
-        s = action[:, signed]
-        abs_s = s.abs()
-        near = abs_s >= thr
-        amplified_s = torch.sign(s) * torch.clamp(abs_s * f, max=1.0)
-        out[:, signed] = torch.where(near, amplified_s, s)
-        # Unsigned dims: amplify v toward 1 only when v >= threshold
-        u = action[:, ~signed]
-        near_u = u >= thr
-        amplified_u = torch.clamp(u * f, max=1.0)
-        out[:, ~signed] = torch.where(near_u, amplified_u, u)
-        return out
-
-    # --- sleep: policy training via real context + imagined rollout ----------
-    def _gen_state_cached(self, cache) -> torch.Tensor:
-        """Generate the 13 state tokens continuing a populated ``cache``.
-
-        Mirrors ``WorldModel.predict_next_state`` on the same token stream,
-        with the rollout's intero zero-padding applied at the feedback
-        boundary: the raw intero token is returned for cost evaluation while
-        a zeroed copy enters the cache. The intero token is the last state
-        token, so the zeroing only conditions the next salve's generation —
-        exactly like the non-cached rollout context.
-        """
-        wm = self.world
-        B = cache.k[0].shape[0]
-        device = cache.k[0].device
-        preds = []
-        pred = cache.last_pred
-        for i in range(STATE_TOKENS):
-            sig = pred.clamp(0.0, 1.0) * wm.state_valid_mask[i].to(device)
-            tok = wm.state_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
-            tok[:, SIG_OFFSET:] = sig
-            feed = tok
-            if i == _INTERO_IDX:
-                feed = tok.clone()
-                feed[:, SIG_OFFSET:] = 0.0
-            out = wm.cache_forward(feed.unsqueeze(1), cache)
-            preds.append(tok)
-            pred = out[:, 0, :]
-        return torch.stack(preds, dim=1)
-
-    def _imagine_candidate(self, ctx, base_cache, action, past_a2, past_a3,
-                           s_dec_toks, n_imagine, ctx_len, ctx_mask,
-                           use_kv_cache, dream_cand_trajs,
-                           candidate_idx) -> torch.Tensor:
-        """Evaluate one candidate action over the 2 imagined futures under
-        Bellman optimism, filling ``dream_cand_trajs[candidate_idx]`` with
-        the per-regime trajectories. Returns the optimistic cost [B].
-
-        ``use_kv_cache`` switches the rollouts from full-context recomputation
-        to persistent per-branch KV caches (cloned where the futures
-        diverge); both paths are numerically equivalent.
-        """
-        action_toks = self._encode_action_batch(action)
-
-        # Step 0: candidate acts on decision state -> predicts first imagined state
-        if use_kv_cache:
-            cand_cache = base_cache.clone()
-            with torch.inference_mode():
-                self.world.cache_forward(action_toks, cand_cache)
-                s5 = self._gen_state_cached(cand_cache)
-        else:
-            cand_ctx_0 = torch.cat([ctx, action_toks], dim=1)
-            with torch.inference_mode():
-                s5 = self.world.predict_next_state(cand_ctx_0)
-        c0 = self._salve_cost_batch(s5)
-        s5_zeroed = s5.clone()
-        s5_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-        if use_kv_cache:
-            hist = torch.cat([ctx, action_toks, s5_zeroed], dim=1)
-        else:
-            ctx_s5 = torch.cat([cand_ctx_0, s5_zeroed], dim=1)
-
-        if n_imagine <= 1:
-            return c0
-
-        cand_a = action[0].tolist()
-        c0_val = c0[0].item()
-        s5_toks = s5[0].tolist()
-        w0 = self._eos_w[0] if len(self._eos_w) > 0 else (1.0 / n_imagine)
-
-        # Future 1: Kalman / inertia extrapolation
-        v = 0.7 * (action - past_a3) + 0.3 * (past_a3 - past_a2)
-        v = torch.clamp(v, -self._kalman_max_v, self._kalman_max_v)
-        cur_a = action.clone()
-        cost_kalman = w0 * c0
-        cur_cache = cand_cache.clone() if use_kv_cache else None
-        cur_ctx = None if use_kv_cache else ctx_s5
-        cur_hist = hist if use_kv_cache else None
-        cur_state_toks = s5_toks
-        cur_cost_val = c0_val
-        f1_steps = [DreamStep(state_tokens=s_dec_toks, action=cand_a, label=f"s{self.n_ctx}+cand")]
-        for k in range(1, n_imagine):
-            cur_a = torch.clamp(cur_a + v, self._act_min, self._act_max)
-            v = v * 0.8
-            next_a_toks = self._encode_action_batch(cur_a)
-            with torch.inference_mode():
-                if use_kv_cache:
-                    self.world.cache_forward(next_a_toks, cur_cache)
-                    gen = self._gen_state_cached(cur_cache)
-                else:
-                    cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
-                    gen = self.world.predict_next_state(cand_ctx)
-            gen_zeroed = gen.clone()
-            gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-            sc = self._salve_cost_batch(gen)
-            wk = self._eos_w[k] if k < len(self._eos_w) else (1.0 / n_imagine)
-            cost_kalman = cost_kalman + wk * sc
-            f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=cur_a[0].tolist(), step_cost=cur_cost_val, label=f"s{self.n_ctx+k}"))
-            if use_kv_cache:
-                cur_hist = torch.cat([cur_hist, next_a_toks, gen_zeroed], dim=1)
+        Returns dict with ``conseq`` [B, conseq_len, 25], ``action`` [B, 3, 25],
+        ``full`` [B, seq_len, 25]."""
+        B = ctx.shape[0]
+        device = ctx.device
+        eos_toks = self._eos_tmpl.unsqueeze(0).expand(B, -1).clone()
+        eos_toks[:, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS] = eos_vec
+        curr = torch.cat([ctx, eos_toks.unsqueeze(1)], dim=1)   # [B, ctx_len+1, 25]
+        n_gen = self.conseq_len + ACTION_TOKENS
+        gen = []
+        for t in range(n_gen):
+            L = curr.shape[1]
+            out = self.world(curr, attn_mask=build_salve_mask(L, device),
+                             is_causal=True,
+                             salve_positions=self.salve_positions[:L])
+            sig = out[:, -1, :].clamp(0.0, 1.0)
+            q = self.ctx_len + 1 + t                             # token en cours de génération
+            if q < self.action_pos:
+                tidx = (q - self.conseq_start) % STATE_TOKENS
+                tmpl = self.world.state_template[tidx].to(device)
+                vm = self.world.state_valid_mask[tidx].to(device)
             else:
-                cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
-            cur_state_toks = gen[0].tolist()
-            cur_cost_val = sc[0].item()
-        f1_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{self.n_ctx+n_imagine}"))
-        dream_cand_trajs[candidate_idx][0] = {"steps": f1_steps, "cost": cost_kalman[0].item()}
+                i = q - self.action_pos
+                tmpl = self.world.action_template[i].to(device)
+                vm = self.world.action_valid_mask[i].to(device)
+            sig = sig * vm
+            tok = tmpl.unsqueeze(0).expand(B, -1).clone()
+            tok[:, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = sig
+            gen.append(tok)
+            curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
+        gen = torch.stack(gen, dim=1)                            # [B, n_gen, 25]
+        return {
+            "conseq": gen[:, :self.conseq_len, :],
+            "action": gen[:, self.conseq_len:, :],
+            "full": torch.cat([ctx, eos_toks.unsqueeze(1), gen], dim=1),
+        }
 
-        # Future 2: Policy closed-loop reaction
-        cur_state = s5
-        cost_pol = w0 * c0
-        cur_cache = cand_cache.clone() if use_kv_cache else None
-        cur_ctx = None if use_kv_cache else ctx_s5
-        cur_hist = hist if use_kv_cache else None
-        cur_state_toks = s5_toks
-        cur_cost_val = c0_val
-        f2_steps = [DreamStep(state_tokens=s_dec_toks, action=cand_a, label=f"s{self.n_ctx}+cand")]
-        for k in range(1, n_imagine):
-            with torch.inference_mode():
-                slide_src = cur_hist if use_kv_cache else cur_ctx
-                slide_ctx = slide_src[:, -ctx_len:]
-                self.world(slide_ctx, attn_mask=ctx_mask)
-                next_latent = self.latent_norm(self.world.last_latent().detach())
-                next_scalars = self._policy_scalars_batch(cur_state)
-                next_pol_in = torch.cat([next_scalars, next_latent], dim=1)
-                next_action = self.policy(next_pol_in)
-                next_a_toks = self._encode_action_batch(next_action)
-                if use_kv_cache:
-                    self.world.cache_forward(next_a_toks, cur_cache)
-                    gen = self._gen_state_cached(cur_cache)
-                else:
-                    cand_ctx = torch.cat([cur_ctx, next_a_toks], dim=1)
-                    gen = self.world.predict_next_state(cand_ctx)
-            gen_zeroed = gen.clone()
-            gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-            sc = self._salve_cost_batch(gen)
-            wk = self._eos_w[k] if k < len(self._eos_w) else (1.0 / n_imagine)
-            cost_pol = cost_pol + wk * sc
-            f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=next_action[0].tolist(), step_cost=cur_cost_val, label=f"s{self.n_ctx+k}"))
-            if use_kv_cache:
-                cur_hist = torch.cat([cur_hist, next_a_toks, gen_zeroed], dim=1)
-            else:
-                cur_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
-            cur_state = gen
-            cur_state_toks = gen[0].tolist()
-            cur_cost_val = sc[0].item()
-        f2_steps.append(DreamStep(state_tokens=cur_state_toks, action=None, step_cost=cur_cost_val, label=f"s{self.n_ctx+n_imagine}"))
-        dream_cand_trajs[candidate_idx][1] = {"steps": f2_steps, "cost": cost_pol[0].item()}
+    @torch.inference_mode()
+    def rollout_from_sequence(self, seq: list) -> dict:
+        """Diagnostic: depuis le contexte d'une séquence enregistrée, échantillonner
+        + élire un dénouement (règle de l'observé appliquée), puis générer la
+        conséquence inversée et l'action de décision."""
+        vals = self._batch_tensors([seq])
+        ctx = vals[:, :self.ctx_len, :]
+        eos_obs = vals[:, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]
+        eos_elu, p_elu = self.sample_denouements(ctx, eos_observed=eos_obs)
+        gen = self.generate_from_denouement(ctx, eos_elu)
+        return {
+            "eos_observed": eos_obs[0].tolist(),
+            "eos_elu": eos_elu[0].tolist(),
+            "p_elu": float(p_elu[0]),
+            "relief_observed": float(relief_score(eos_obs, p=self.eos_max_p)[0]),
+            "relief_elu": float(relief_score(eos_elu, p=self.eos_max_p)[0]),
+            "action": self._decode_action_batch(gen["action"])[0].tolist(),
+            "action_recorded": self._decode_action_batch(
+                vals[:, self.action_pos:self.action_pos + ACTION_TOKENS, :])[0].tolist(),
+            "gen": gen,
+        }
 
-        # Bellman optimism: optimistic minimum across the 2 futures
-        return torch.minimum(cost_kalman, cost_pol)
+    # --- policy training ---------------------------------------------------------
+    def train_policy(self, steps: int = 32, batch: int = 32):
+        """Policy training by imitation of the WM-generated decision action.
 
-    def train_policy(self, steps: int = 16, batch: int = 32,
-                     n_imagine: int | None = None,
-                     prioritize_relief: bool = True,
-                     use_kv_cache: bool = True,
-                     eos_lookahead: bool = True):
-        """Policy training by supervised imitation of the WM's hindsight action.
+        Per batch: latent = WM over the context part (the policy's input latent
+        is produced by the WM on the context alone); a dénouement is sampled
+        and elected; the WM generates the decision action from
+        [contexte, dénouement élu]; the policy loss toward that action is
+        weighted linearly by the elected dénouement's probability,
+        ``loss *= p.detach()`` per sequence.
 
-        ``eos_lookahead=True`` (default) — efficient hindsight supervision: the
-        policy's own action is rolled out to get the imagined denouement delta
-        (EOS); its deviation from neutral is forced eps-proportionally more
-        favorable; the WM's lookahead mode generates the action associated with
-        that outcome; the generated a4 is unconditionally the supervised
-        target (short-term trust — a causal completion by the current policy
-        cannot confirm or refute the suggestion; the verification rollout is
-        Dream Theater display only). ~3 rollout-equivalents per batch
-        instead of the legacy 6.
-
-        ``eos_lookahead=False`` — legacy stochastic-candidate machinery,
-        kept alive as a fallback. Also selected automatically when the
-        imagination horizon cannot reach the terminal salve
-        (n_imagine < self.n_imagine).
-
-        Generator: yields (label, value) after each step."""
-        if n_imagine is None:
-            n_imagine = self.n_imagine
+        Generator: yields ("pol", loss) after each step."""
         if len(self.buffer) < 1:
             return
         self.world.eval()
         self.policy.train()
+        self.sleep_pol_steps = steps
         losses = []
-        use_lookahead = eos_lookahead and n_imagine >= self.n_imagine
-        if eos_lookahead and not use_lookahead:
-            print(f"[sleep:policy] n_imagine={n_imagine} cannot reach the terminal salve "
-                  f"(needs {self.n_imagine}) — falling back to the candidate machinery.")
-        if use_lookahead:
-            for step in range(steps):
-                updated, loss = self._policy_step_lookahead(
-                    batch, n_imagine, use_kv_cache, step, steps)
-                losses.append(loss)   # 0.0 when the batch was fully rejected
-                yield "pol", loss
-                if self._skip_phase:
-                    self._skip_phase = False
-                    break
-        else:
-            self.last_pol_stats = None
-            for lbl, val in self._train_policy_candidates(
-                    steps, batch, n_imagine,
-                    prioritize_relief, use_kv_cache, step_offset=0):
-                losses.append(val)
-                yield lbl, val
-                if self._skip_phase:
-                    self._skip_phase = False
-                    break
+        for step in range(steps):
+            self.sleep_pol_step = step + 1
+            seqs = self.buffer.sample(batch)
+            if not seqs:
+                break
+            loss = self._policy_step(seqs, step, steps)
+            losses.append(loss)
+            yield "pol", loss
+            if self._skip_phase:
+                self._skip_phase = False
+                break
         self.last_pol_loss = sum(losses) / len(losses) if losses else float("nan")
 
-    # --- sleep: hindsight (EOS-lookahead) policy supervision ------------------
-    def _dream_context_steps(self, ctx: torch.Tensor) -> list[DreamStep]:
-        """Build the real-context storyboard row [s0+a0 ... s_{n_ctx}] for the Dream Theater."""
-        n_ctx = self.n_ctx
-        steps = []
-        for s_i in range(n_ctx):
-            s_tokens = ctx[0, s_i * SALVE_TOKENS: s_i * SALVE_TOKENS + STATE_TOKENS].tolist()
-            a_vals = self._decode_action_batch(
-                ctx[0:1, s_i * SALVE_TOKENS + STATE_TOKENS: (s_i + 1) * SALVE_TOKENS])[0].tolist()
-            steps.append(DreamStep(state_tokens=s_tokens, action=a_vals,
-                                   label=f"s{s_i}+a{s_i}"))
-        steps.append(DreamStep(
-            state_tokens=ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist(),
-            action=None, label=f"s{n_ctx} (decision)"))
-        return steps
-
-    def _build_eos_token(self, eos_vals: torch.Tensor) -> torch.Tensor:
-        """Terminal EOS token [B, 25] from normalized cost-aggregate slots in
-        [0, 1] (higher = better, 0.5 = neutre): [effort, douleur, courbature, instabilite,
-        vertige], slot 5 inconfort (lower = better)."""
-        B = eos_vals.shape[0]
-        tok = self._eos_tmpl.unsqueeze(0).expand(B, -1).clone()
-        n = min(_EOS_NSLOTS, eos_vals.shape[1])
-        tok[:, SIG_OFFSET:SIG_OFFSET + n] = eos_vals[:, :n]
-        return tok
-
-    def _rollout_candidate(self, ctx, base_cache, action, s_dec_toks, n_imagine,
-                           ctx_len, ctx_mask, use_kv_cache):
-        """Single-regime imagined rollout: ``action`` acts on s_{n_ctx}, then the
-        policy reacts in closed loop to each imagined state for n_imagine - 1 more steps.
-
-        Returns (predicted terminal EOS [B, _EOS_NSLOTS] or None, dream
-        steps). The predicted EOS is the DENOUEMENT DELTA: the time-weighted
-        aggregate of the imagined salves' innate cost channels minus the
-        decision-window baseline (weighted towards s_{n_ctx}) read from the
-        real context (s0..s_{n_ctx})."""
-        action_toks = self._encode_action_batch(action)
-        dream_steps = [DreamStep(state_tokens=s_dec_toks, action=action[0].tolist(),
-                                 label=f"s{self.n_ctx}+cand")]
-        eos_pred = None
-        # decision state (s_{n_ctx}) cost levels from the real context
-        p_dec = self.n_ctx * SALVE_TOKENS
-        c_dec = torch.zeros(ctx.shape[0], _EOS_NSLOTS, device=ctx.device)
-        c_dec[:, :5] = ctx[:, p_dec + _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-        c_dec[:, 5] = -ctx[:, p_dec + _REWARD_IDX, SIG_OFFSET]   # inconfort = -confort
-        eos_series = [c_dec]
-        if use_kv_cache:
-            cache = base_cache.clone()
-            with torch.inference_mode():
-                self.world.cache_forward(action_toks, cache)
-                s = self._gen_state_cached(cache)
-        else:
-            cand_ctx = torch.cat([ctx, action_toks], dim=1)
-            with torch.inference_mode():
-                s = self.world.predict_next_state(cand_ctx)
-        c0 = self._salve_cost_batch(s)
-        c_gen = torch.zeros(s.shape[0], _EOS_NSLOTS, device=s.device)
-        c_gen[:, :5] = s[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-        c_gen[:, 5] = -s[:, _REWARD_IDX, SIG_OFFSET]            # inconfort = -confort
-        eos_series.append(c_gen)
-
-        def _eos_finalize():
-            # progrès par canal : f = P - poids_chemin*A (voir _eos_progres)
-            c = torch.stack(eos_series, dim=1)                  # [B, L, 6]
-            P = c[:, 0] - c[:, -1]
-            diff = c[:, 1:] - c[:, -1:]
-            A = (diff * self._eos_decay_pow[None, :, None]).sum(dim=1)
-            r = P - self.eos_poids_chemin * A
-            return 0.5 + 0.5 * r / (1.0 + r.abs())
-
-        s_zeroed = s.clone()
-        s_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-        if use_kv_cache:
-            hist = torch.cat([ctx, action_toks, s_zeroed], dim=1)
-        else:
-            cand_ctx = torch.cat([cand_ctx, s_zeroed], dim=1)
-        if n_imagine == 1:
-            eos_pred = _eos_finalize()
-        cur_state = s
-        cur_state_toks = s[0].tolist()
-        cur_cost_val = c0[0].item()
-        for k in range(1, n_imagine):
-            with torch.inference_mode():
-                slide_src = hist if use_kv_cache else cand_ctx
-                slide_ctx = slide_src[:, -ctx_len:]
-                self.world(slide_ctx, attn_mask=ctx_mask)
-                next_latent = self.latent_norm(self.world.last_latent().detach())
-                next_scalars = self._policy_scalars_batch(cur_state)
-                next_pol_in = torch.cat([next_scalars, next_latent], dim=1)
-                next_action = self.policy(next_pol_in)
-                next_a_toks = self._encode_action_batch(next_action)
-                if use_kv_cache:
-                    self.world.cache_forward(next_a_toks, cache)
-                    gen = self._gen_state_cached(cache)
-                else:
-                    cand_ctx = torch.cat([cand_ctx, next_a_toks], dim=1)
-                    gen = self.world.predict_next_state(cand_ctx)
-            gen_zeroed = gen.clone()
-            gen_zeroed[:, _INTERO_IDX, SIG_OFFSET:] = 0.0
-            sc = self._salve_cost_batch(gen)
-            wk = self._eos_w[k] if k < len(self._eos_w) else (1.0 / n_imagine)
-            dream_steps.append(DreamStep(state_tokens=cur_state_toks,
-                                         action=next_action[0].tolist(),
-                                         step_cost=cur_cost_val, label=f"s{self.n_ctx + k}"))
-            if use_kv_cache:
-                hist = torch.cat([hist, next_a_toks, gen_zeroed], dim=1)
-            else:
-                cand_ctx = torch.cat([cand_ctx, gen_zeroed], dim=1)
-            c_g = torch.zeros(gen.shape[0], _EOS_NSLOTS, device=gen.device)
-            c_g[:, :5] = gen[:, _COST_IDX, SIG_OFFSET:SIG_OFFSET + 5]
-            c_g[:, 5] = -gen[:, _REWARD_IDX, SIG_OFFSET]
-            eos_series.append(c_g)
-            if k + 1 == self.n_imagine:
-                eos_pred = _eos_finalize()
-            cur_state = gen
-            cur_state_toks = gen[0].tolist()
-            cur_cost_val = sc[0].item()
-        dream_steps.append(DreamStep(state_tokens=cur_state_toks, action=None,
-                                      step_cost=cur_cost_val, label=f"s{self.n_ctx + n_imagine}"))
-        return eos_pred, dream_steps
-
-    def _lookahead_generate(self, ctx, base_cache, eos_forced, use_kv_cache):
-        """Generate the hindsight action conditioned on the forced terminal EOS.
-
-        The EOS token stays in the running input (last position) while each
-        of the 3 consigne tokens is generated, and only the 3 a4-predicting
-        rows (decision_pos..decision_pos+2) attend it — the same compact mask
-        as training (build_lookahead_gen_mask), so generation matches what
-        the WM was trained on. The KV-cache path is deliberately not used:
-        a cache built from the bare context cannot give the a4 rows EOS
-        attention at any layer.
-        """
-        B, ctx_len, _ = ctx.shape
-        device = ctx.device
-        wm = self.world
-        assert ctx_len == self.decision_pos, f"hindsight generation expects the {self.decision_pos}-token context"
-        n_dec = self.decision_pos // SALVE_TOKENS
-        eos_tok = self._build_eos_token(eos_forced)                    # [B, 25]
-        toks = []
-        with torch.inference_mode():
-            curr = ctx
-            curr_sp = torch.arange(ctx_len, device=device) // SALVE_TOKENS
-            for i in range(ACTION_TOKENS):
-                x = torch.cat([curr, eos_tok.unsqueeze(1)], dim=1)     # [B, L+1, 25]
-                L1 = x.shape[1]
-                sp = torch.cat([curr_sp, torch.tensor([self.seq_steps], device=device)])
-                mask = build_lookahead_gen_mask(L1 - 1, device, self.decision_pos)
-                out = wm(x, attn_mask=mask, is_causal=False, salve_positions=sp)
-                sig = out[:, self.decision_pos - 1 + i, :].clamp(0.0, 1.0) * wm.action_valid_mask[i].to(device)
-                tok = wm.action_template[i].to(device).unsqueeze(0).expand(B, -1).clone()
-                tok[:, SIG_OFFSET:] = sig
-                toks.append(tok)
-                curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
-                curr_sp = torch.cat([curr_sp, torch.tensor([n_dec], device=device)])
-        return torch.stack(toks, dim=1)                                # [B, 3, 25]
-
-    def relief_score(self, eos: torch.Tensor) -> torch.Tensor:
-        """Score de soulagement d'un token EOS [B, 6] — délègue à la fonction
-        module-level relief_score."""
-        return relief_score(eos)
-
-    def _policy_step_lookahead(self, batch, n_imagine, use_kv_cache,
-                                step_idx, total_steps):
-        """One policy step under hindsight supervision (see ``train_policy``).
-
-        Baseline rollout of the policy action -> (eos_pi, forcing anchor);
-        additive EOS forcing (neutrality floor + fixed random eps); hindsight
-        generation of a4 — unconditionally the supervised target (short-term
-        trust: a causal completion by the current policy cannot confirm or
-        refute the suggestion). The generated action's completion is imagined
-        for sample 0 only, as Dream Theater display. Returns (updated, loss)."""
-        sequences = self.buffer.sample_for_policy(batch)
-        if not sequences:
-            return True, 0.0
+    def _policy_step(self, sequences, step_idx: int, total_steps: int) -> float:
         B = len(sequences)
         device = self.device
-        n_ctx = self.n_ctx
-        ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
         vals = self._batch_tensors(sequences)
-        ctx = vals[:, :self.decision_pos, :].clone()
-        s_dec_toks = ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist()
-        ctx_mask = build_salve_mask(ctx_len, device)
-
-        # 1. real context -> latent + deterministic policy baseline action
-        base_cache = None
+        ctx = vals[:, :self.ctx_len, :].clone()
+        eos_obs = vals[:, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]
         with torch.inference_mode():
-            if use_kv_cache:
-                base_cache = KVCache(len(self.world.transformer.layers),
-                                      self.world.d_model, B, device)
-                self.world.cache_forward(ctx, base_cache)
-            else:
-                self.world(ctx, attn_mask=ctx_mask)
-            latent = self.latent_norm(self.world.last_latent().detach())
-        cur_scalars = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
-        pol_in = torch.cat([cur_scalars, latent], dim=1)
-        with torch.inference_mode():
-            policy_action = self.policy(pol_in)                     # [B, 5]
+            self.world(ctx, attn_mask=build_salve_mask(self.ctx_len, device),
+                       is_causal=True,
+                       salve_positions=self.salve_positions[:self.ctx_len])
+            latent_inf = self.latent_norm(self.world.last_latent().detach())
+            scalars_inf = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
+            pol_in_inf = torch.cat([scalars_inf, latent_inf], dim=1)
+            pol_action = self.policy(pol_in_inf)                 # [B, 5]
+            eos_elu_inf, p_elu_inf = self.sample_denouements(ctx, eos_observed=eos_obs)
+            gen_action_inf = self.generate_from_denouement(ctx, eos_elu_inf)["action"]
+        # clone hors du bloc inference_mode : tensors normaux, utilisables en autograd
+        latent = latent_inf.clone()
+        scalars = scalars_inf.clone()
+        pol_in = torch.cat([scalars, latent], dim=1)
+        eos_elu = eos_elu_inf.clone()
+        a_star = self._decode_action_batch(gen_action_inf.clone())   # [B, 5]
+        pred = self.policy(pol_in)
+        per_seq = ((pred - a_star) ** 2).mean(dim=1)             # [B]
+        w = p_elu_inf.clone().detach()
+        loss = (per_seq * w).sum() / w.sum().clamp(min=1e-8)
+        self.opt_pol.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.opt_pol.step()
+        self.last_pol_stats = {"accepted": B, "total": B}
+        self.last_dream_record = self._build_dream_record(
+            sequences[0], ctx[:1], pol_action[:1], a_star[:1],
+            eos_obs[:1], eos_elu[:1], float(p_elu_inf[0]), loss.item(),
+            step_idx, total_steps)
+        return loss.item()
 
-        # 2-4. Shared hindsight lookahead pipeline — the verification rollout
-        #      is skipped here: it serves nothing (unconditional distillation)
-        #      and is computed for sample 0 only below, for the Dream Theater.
-        # En training policy, la base du forçage reste eos_pi (le rollout
-        # baseline existe) ; eos_real n'est utilisé qu'en diagnostic WM-only
-        # (wm_manager / rollout_lookahead_from_sequence).
-        hl = self._hindsight_lookahead_pipeline(
-            ctx, policy_action, s_dec_toks, n_imagine,
-            ctx_len, ctx_mask, base_cache=base_cache,
-            use_kv_cache=use_kv_cache, verify=False)
-        eos_pi, steps_pi = hl["eos_pi"], hl["steps_pi"]
-        eos_forced = hl["eos_forced"]
-        gen_action = hl["gen_action"]
-
-        # display-only completion of the generated action, for sample 0 only
-        # (the Dream Theater record) — the rest of the batch needs no imagined
-        # sequence
-        with torch.inference_mode():
-            if use_kv_cache:
-                base_cache_0 = KVCache(len(self.world.transformer.layers),
-                                       self.world.d_model, 1, device)
-                self.world.cache_forward(ctx[:1], base_cache_0)
-            else:
-                base_cache_0 = None
-            eos_gen, steps_gen = self._rollout_candidate(
-                ctx[:1], base_cache_0, gen_action[:1], s_dec_toks,
-                n_imagine, ctx_len, ctx_mask, use_kv_cache)
-
-        # 5. Short-term trust in the insight: the generated a4 is always the
-        #    supervised target. The causal verification cannot confirm
-        #    reachability — its completion is the policy's own current
-        #    behavior, so the outcome gate was a coin flip (measured ~50% on
-        #    every phase); it is dropped until the WM's outcome-conditioned
-        #    completion can serve as verification.
-        accepted = torch.ones(B, dtype=torch.bool, device=device)
-        n_accepted = int(accepted.sum().item())
-        self.last_pol_stats = {"accepted": n_accepted, "total": B}
-
-        # 6. supervised update toward the accepted hindsight actions only
-        if n_accepted > 0:
-            pred_action = self.policy(pol_in)
-            loss = torch.nn.functional.mse_loss(pred_action[accepted],
-                                                 gen_action[accepted])
-            self.opt_pol.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-            self.opt_pol.step()
-            loss_val = loss.item()
-            updated = True
-        else:
-            loss_val = 0.0
-            updated = False
-
-        # 7. Dream Theater record (sample 0): lived sequence, WM hindsight
-        #    completion, and the baseline-vs-hindsight decision
-        acc0 = bool(accepted[0].item())
-        context_steps = self._dream_context_steps(ctx)
-        seq0 = sequences[0]
-        lived_actions = self._decode_action_batch(torch.tensor(
-            [salve[STATE_TOKENS:SALVE_TOKENS] for salve in seq0[:-1]],
-            dtype=torch.float32, device=device))                  # [len(seq0)-1, 5]
-        lived_steps = [DreamStep(
-            state_tokens=[list(tok) for tok in salve[:STATE_TOKENS]],
-            action=lived_actions[k].tolist() if k < len(seq0) - 1 else None,
-            step_cost=salve_cost(salve), label=f"s{k}")
-            for k, salve in enumerate(seq0)]
-        predicted_steps = context_steps[:self.n_ctx] + steps_gen
-        self.last_dream_record = DreamRecord(
+    def _build_dream_record(self, seq, ctx, pol_action, a_star, eos_obs, eos_elu,
+                            p_elu, loss_val, step_idx, total_steps) -> DreamRecord:
+        """Minimal Dream Theater record for the refonte policy step: lived
+        sequence (rebuilt temporal window), context steps, and the WM-generated
+        decision action under the elected dénouement."""
+        device = self.device
+        n_ctx = self.n_ctx
+        context_steps = []
+        for i in range(n_ctx):
+            s_toks = ctx[0, i * SALVE_TOKENS: i * SALVE_TOKENS + STATE_TOKENS].tolist()
+            a_vals = self._decode_action_batch(
+                ctx[0:1, i * SALVE_TOKENS + STATE_TOKENS:(i + 1) * SALVE_TOKENS])[0].tolist()
+            context_steps.append(DreamStep(state_tokens=s_toks, action=a_vals,
+                                           label=f"s{i}+a{i}"))
+        context_steps.append(DreamStep(
+            state_tokens=ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist(),
+            action=None, label=f"s{n_ctx} (decision)"))
+        window = sequence_to_window(seq, n_ctx=n_ctx, seq_steps=self.seq_steps)
+        lived_steps = []
+        for k, salve in enumerate(window):
+            a_vals = (self._decode_action_batch(torch.tensor(
+                [salve[STATE_TOKENS:SALVE_TOKENS]], dtype=torch.float32,
+                device=device))[0].tolist()
+                if any(any(v != 0.0 for v in tok[SIG_OFFSET:]) for tok in salve[STATE_TOKENS:])
+                else None)
+            lived_steps.append(DreamStep(
+                state_tokens=[list(t) for t in salve[:STATE_TOKENS]],
+                action=a_vals, step_cost=salve_cost(salve), label=f"s{k}"))
+        real_action = self._decode_action_batch(torch.tensor(
+            [seq[self.action_pos:self.action_pos + ACTION_TOKENS]],
+            dtype=torch.float32, device=device))[0].tolist()
+        predicted_steps = context_steps[:n_ctx] + [
+            DreamStep(state_tokens=[list(t) for t in salve[:STATE_TOKENS]],
+                      action=None, step_cost=salve_cost(salve), label=f"s{k} (imaginé)")
+            for k, salve in enumerate(window[n_ctx + 1:], start=n_ctx + 1)]
+        predicted_steps.append(DreamStep(
+            state_tokens=context_steps[-1].state_tokens,
+            action=a_star[0].tolist(), label="a* (décision générée)"))
+        return DreamRecord(
             step_idx=step_idx,
             total_steps=total_steps,
             loss=loss_val,
             facing=1,
             context_steps=context_steps,
-            candidate_actions=[policy_action[0].tolist(), gen_action[0].tolist()],
-            real_action=lived_actions[self.n_ctx].tolist(),
+            candidate_actions=[pol_action[0].tolist(), a_star[0].tolist()],
+            real_action=real_action,
             trajectories=[
                 DreamTrajectory(candidate_idx=0, regime_idx=0, regime_name="Policy",
-                                steps=steps_pi,
-                                is_best_future=False, is_winner=False,
-                                eos_pred=eos_pi[0].tolist() if eos_pi is not None else None),
-                DreamTrajectory(candidate_idx=1, regime_idx=0, regime_name="Policy",
-                                steps=steps_gen,
-                                is_best_future=True, is_winner=acc0,
-                                eos_pred=eos_gen[0].tolist() if eos_gen is not None else None),
+                                steps=[], is_best_future=False, is_winner=False,
+                                eos_pred=None),
+                DreamTrajectory(candidate_idx=1, regime_idx=0, regime_name="Dénouement élu",
+                                steps=predicted_steps[n_ctx:], is_best_future=True,
+                                is_winner=True,
+                                eos_pred=float(relief_score(eos_elu, p=self.eos_max_p)[0])),
             ],
-            best_candidate_idx=1 if acc0 else -1,
+            best_candidate_idx=1,
             best_future_indices=[0, 0],
-            candidate_names=["0: POLICY", "1: HINDSIGHT"],
-            eos_forced=eos_forced[0].tolist(),
+            candidate_names=["0: POLICY", "1: DÉNOUEMENT ÉLU"],
+            eos_forced=eos_elu[0].tolist(),
             lived_steps=lived_steps,
             predicted_steps=predicted_steps,
-            eos_realized=vals[0, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS].tolist(),
+            eos_realized=eos_obs[0].tolist(),
         )
-        return updated, loss_val
 
-    def _hindsight_lookahead_pipeline(self, ctx: torch.Tensor,
-                                      base_action: torch.Tensor,
-                                      s_dec_toks: list[list[float]],
-                                      n_imagine: int,
-                                      ctx_len: int,
-                                      ctx_mask: torch.Tensor,
-                                      base_cache = None,
-                                      force_amp: torch.Tensor | float | None = None,
-                                      use_kv_cache: bool = False,
-                                      verify: bool = True,
-                                      eos_base: torch.Tensor | None = None) -> dict:
-        """Core hindsight lookahead pipeline (shared between policy training and diagnostics/theater):
-        1. Baseline rollout of base_action -> (eos_pi, steps_pi)
-        2. Additive EOS forcing (neutrality floor, then fixed force_amp) -> eos_forced
-        3. Hindsight action generation under forced EOS -> (gen_toks, gen_action)
-        4. Causal verification rollout -> (eos_gen, steps_gen), display only —
-           skipped entirely when ``verify=False`` (eos_gen/steps_gen are None).
-        """
-        B = ctx.shape[0]
-        device = ctx.device
-
-        # 1. baseline rollout -> imagined terminal EOS
-        eos_pi, steps_pi = self._rollout_candidate(
-            ctx, base_cache, base_action, s_dec_toks, n_imagine,
-            ctx_len, ctx_mask, use_kv_cache)
-
-        # 2. additive forcing toward a more favorable denouement: base = EOS réel
-        #    si fourni (wm_manager / diagnostic), sinon eos_pi (policy training).
-        #    Slots 0..4 (coûts) : PLUS HAUT = mieux (slot>0.5 = coûts qui baissent,
-        #    car slot = 0.5 + 0.5*(c[n_ctx]-c[-1]-poids*A)/(1+|...|)). On pousse
-        #    vers 1.0. Slot 5 (inconfort = -confort) : PLUS BAS = mieux, on pousse
-        #    vers 0.0. Floor neutre à 0.5 avant de pousser.
-        if force_amp is None:
-            lo, hi = self.eos_force_amp_lo, self.eos_force_amp_hi
-            force_val = torch.rand(B, _EOS_NSLOTS, device=device) * (hi - lo) + lo
-        elif isinstance(force_amp, (float, int)):
-            force_val = torch.full((B, _EOS_NSLOTS), float(force_amp), device=device)
-        else:
-            force_val = force_amp
-        base = eos_base if eos_base is not None else eos_pi
-        eos_forced = base.clone()
-        eos_base_c = torch.maximum(base[:, :5], torch.tensor(0.5, device=device))
-        eos_forced[:, :5] = (eos_base_c + force_val[:, :5]).clamp(0.0, 1.0)
-        eos_base_r = torch.minimum(base[:, 5], torch.tensor(0.5, device=device))
-        eos_forced[:, 5] = (eos_base_r - force_val[:, 5]).clamp(0.0, 1.0)
-
-        # 3. hindsight generation of action under the forced EOS
-        with torch.inference_mode():
-            gen_toks = self._lookahead_generate(ctx, base_cache, eos_forced, use_kv_cache)
-            gen_action = self._decode_action_batch(gen_toks)        # [B, 5]
-
-        # 3b. amplify hindsight action toward extremes (bold recovery bias)
-        gen_action = self._amplify_extremes(gen_action)
-
-        # 4. causal verification rollout — display only (Dream Theater);
-        #    skipped when the caller needs neither the completion nor its
-        #    imagined denouement
-        eos_gen = None
-        steps_gen = None
-        if verify:
-            eos_gen, steps_gen = self._rollout_candidate(
-                ctx, base_cache, gen_action, s_dec_toks, n_imagine,
-                ctx_len, ctx_mask, use_kv_cache)
-
-        return {
-            "eos_pi": eos_pi,
-            "steps_pi": steps_pi,
-            "eos_forced": eos_forced,
-            "gen_toks": gen_toks,
-            "gen_action": gen_action,
-            "eos_gen": eos_gen,
-            "steps_gen": steps_gen,
-        }
-
-    def rollout_lookahead_from_sequence(self, seq: list[list[list[float]]],
-                                        force_amp: float | None = None) -> dict:
-        """Roll out counterfactual hindsight trajectory from sequence context s0..s4:
-        1. Baseline rollout with recorded a4 -> eos_pi
-        2. Reinforced EOS -> eos_better
-        3. Hindsight action a4* generated by World Model conditioned on [ctx, eos_better]
-        4. Verification rollout of a4* and closed-loop policy reactions -> steps_gen
-        """
-        device = self.device
-        vals = self._batch_tensors([seq])
-        n_ctx = self.n_ctx
-        ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
-        ctx = vals[:, :self.decision_pos, :].clone()
-        s_dec_toks = ctx[0, n_ctx * SALVE_TOKENS: n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist()
-        ctx_mask = build_salve_mask(ctx_len, device)
-
-        rec_a_toks = torch.tensor(seq[n_ctx][STATE_TOKENS:SALVE_TOKENS],
-                                  dtype=torch.float32, device=device).unsqueeze(0)
-        recorded_a4 = self._decode_action_batch(rec_a_toks)
-
-        if force_amp is None:
-            # forçage drastique par défaut (diagnostic / wm_manager) : slots
-            # coûts forcés à 0 (min(réel, 0.5) - 0.5 <= 0), confort à 1
-            force_amp = 0.5
-
-        # base du forçage = EOS réel de la séquence (disponible au batch time)
-        eos_real = vals[:, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]
-
-        hl = self._hindsight_lookahead_pipeline(
-            ctx, recorded_a4, s_dec_toks, self.n_imagine,
-            ctx_len, ctx_mask, base_cache=None,
-            force_amp=force_amp, use_kv_cache=False, eos_base=eos_real)
-        hl["recorded_a4"] = recorded_a4
-        hl["eos_better"] = hl["eos_forced"]
-        return hl
-
-    # --- sleep: legacy policy training via candidate rollouts (fallback) ----
-    def _train_policy_candidates(self, steps: int = 16, batch: int = 32,
-                                 n_imagine: int | None = None,
-                                 prioritize_relief: bool = True,
-                                 use_kv_cache: bool = True,
-                                 step_offset: int = 0):
-        """Legacy stochastic-candidate machinery: 3 candidates (policy,
-        recorded demonstration, Gaussian noise sigma 0.30) x 2 imagined
-        regimes (Kalman inertia, policy closed-loop) under
-        Bellman optimism — 6 rollouts per sample. Kept alive as the fallback
-        of the EOS-lookahead supervision.
-        Generator: yields (label, value) after each step."""
-        if n_imagine is None:
-            n_imagine = self.n_imagine
-        n_ctx = self.n_ctx
-        losses = []
-        for step in range(steps):
-            sequences = (self.buffer.sample_for_policy(batch)
-                         if prioritize_relief else self.buffer.sample(batch))
-            if not sequences:
-                break
-
-            B = len(sequences)
-            device = self.device
-
-            # build real context: [s0, a0, s1, ..., a_{n_ctx-1}, s_{n_ctx}]
-            ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
-            vals = self._batch_tensors(sequences)
-            ctx = vals[:, :ctx_len, :].clone()
-            real_actions = self._decode_action_batch(
-                vals[:, n_ctx * SALVE_TOKENS + STATE_TOKENS : (n_ctx + 1) * SALVE_TOKENS, :])
-
-            # 1. world model forward on real context → intermediate latent
-            ctx_mask = build_salve_mask(ctx_len, device)
-            base_cache = None
-            with torch.inference_mode():
-                if use_kv_cache:
-                    base_cache = KVCache(len(self.world.transformer.layers),
-                                         self.world.d_model, B, device)
-                    self.world.cache_forward(ctx, base_cache)
-                else:
-                    self.world(ctx, attn_mask=ctx_mask)
-                latent = self.latent_norm(self.world.last_latent().detach())
-
-            # 2. policy input
-            cur_scalars = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
-
-            pol_in = torch.cat([cur_scalars, latent], dim=1)
-
-            # 3. generate 3 candidate actions:
-            #    candidate 0 = deterministic action from current policy
-            #    candidate 1 = recorded demonstrated action from dataset
-            #    candidate 2 = exploration noise around policy action (sigma = 0.30)
-            with torch.inference_mode():
-                policy_action = self.policy(pol_in)
-                cand_noise = self._explore_action_batch(policy_action, sigma=0.30)
-
-            candidates = torch.stack(
-                [
-                    policy_action,
-                    real_actions,
-                    cand_noise,
-                ],
-                dim=1,
-            )  # [B, 3, 5]
-
-            # Decode past actions from the context for trajectory extrapolation:
-            p_a_prev2 = (n_ctx - 2) * SALVE_TOKENS + STATE_TOKENS
-            p_a_prev1 = (n_ctx - 1) * SALVE_TOKENS + STATE_TOKENS
-            past_a2 = self._decode_action_batch(ctx[:, p_a_prev2 : p_a_prev2 + ACTION_TOKENS, :])
-            past_a3 = self._decode_action_batch(ctx[:, p_a_prev1 : p_a_prev1 + ACTION_TOKENS, :])
-
-            # 4. evaluate every candidate with 2 futures under Bellman optimism
-            candidate_costs = []
-            dream_cand_trajs = [{} for _ in range(3)]
-            s_dec_toks = ctx[0, n_ctx * SALVE_TOKENS : n_ctx * SALVE_TOKENS + STATE_TOKENS].tolist()
-
-            for candidate_idx in range(3):
-                cand_cost = self._imagine_candidate(
-                    ctx, base_cache, candidates[:, candidate_idx, :],
-                    past_a2, past_a3, s_dec_toks, n_imagine,
-                    ctx_len, ctx_mask, use_kv_cache,
-                    dream_cand_trajs, candidate_idx)
-                candidate_costs.append(cand_cost)
-
-            # [B, 3]
-            candidate_costs = torch.stack(candidate_costs, dim=1)
-
-            # 5. Select the best action
-            cost_baseline = candidate_costs[:, 0:1]  # [B, 1]
-            margin = _EXPLORE_MARGIN_PCT * cost_baseline.abs().clamp(min=1.0)  # [B, 1]
-            adjusted_costs = candidate_costs.clone()
-            adjusted_costs[:, 1:] += margin
-            best_idx = adjusted_costs.argmin(dim=1)
-            batch_idx = torch.arange(B, device=device)
-            best_action = candidates[batch_idx, best_idx].detach()  # [B, 5]
-
-            # 6. Supervised learning
-            #    The action selected by the WM becomes the target.
-            #    Re-run the policy without no_grad so that loss propagates.
-            pred_action = self.policy(pol_in)
-            loss = torch.nn.functional.mse_loss(pred_action, best_action)
-
-            self.opt_pol.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-            self.opt_pol.step()
-
-            # Build DreamRecord for visualization (sample 0)
-            if B > 0 and n_imagine > 1:
-                context_steps = []
-                for s_i in range(n_ctx):
-                    s_tokens = ctx[0, s_i * 16 : s_i * 16 + 13].tolist()
-                    a_vals = self._decode_action_batch(ctx[0:1, s_i * 16 + 13 : (s_i + 1) * 16])[0].tolist()
-                    context_steps.append(DreamStep(
-                        state_tokens=s_tokens,
-                        action=a_vals,
-                        label=f"s{s_i}+a{s_i}"
-                    ))
-                context_steps.append(DreamStep(
-                    state_tokens=s_dec_toks,
-                    action=None,
-                    label=f"s{n_ctx} (decision)"
-                ))
-
-                all_trajs = []
-                best_futures_per_cand = []
-                win_cand = int(best_idx[0].item())
-                for c_idx in range(3):
-                    c_costs = [dream_cand_trajs[c_idx][f]["cost"] for f in range(2)]
-                    b_f_idx = int(torch.tensor(c_costs).argmin().item())
-                    best_futures_per_cand.append(b_f_idx)
-                    for f_idx in range(2):
-                        traj_info = dream_cand_trajs[c_idx][f_idx]
-                        is_b = (f_idx == b_f_idx)
-                        is_w = (c_idx == win_cand and is_b)
-                        all_trajs.append(DreamTrajectory(
-                            candidate_idx=c_idx,
-                            regime_idx=f_idx,
-                            regime_name=REGIME_NAMES[f_idx],
-                            steps=traj_info["steps"],
-                            total_cost=traj_info["cost"],
-                            is_best_future=is_b,
-                            is_winner=is_w,
-                        ))
-
-                self.last_dream_record = DreamRecord(
-                    step_idx=step + step_offset,
-                    total_steps=step_offset + steps,
-                    loss=loss.item(),
-                    facing=1,
-                    context_steps=context_steps,
-                    candidate_actions=[candidates[0, c].tolist() for c in range(3)],
-                    trajectories=all_trajs,
-                    best_candidate_idx=win_cand,
-                    best_future_indices=best_futures_per_cand,
-                )
-
-            losses.append(loss.item())
-            yield "pol", loss.item()
-
-    # --- sleep entry point ---------------------------------------------------
+    # --- sleep cycle -------------------------------------------------------------
     def sleep_cycle(self, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
-              wm_batch: int = 64,
-              pol_steps: int = 64, pol_batch: int = 32,
-              pol_n_imagine: int | None = None, clear_buffer: bool = True,
-              prune_pct: float = 0.33, surprise_factor: float = 0.5,
-              prune_min_fill: float = 0.75, prune_beta: float = 2.0,
-              dedup_eps: float = 0.08, surprise_floor: float = 0.001,
-              wm_target_loss: float | None = 0.01,
-              wm_coreset_target_loss: float | None = None,
-              use_kv_cache: bool = True,
-              pol_eos_lookahead: bool = True):
-        """One full sleep cycle with Coreset / Addendum and active forgetting.
+                    wm_batch: int = 64, pol_steps: int = 32, pol_batch: int = 32,
+                    wm_target_loss: float | None = 0.01,
+                    clear_buffer: bool = True):
+        """One full sleep cycle (refonte v1 — dataset optimization set aside):
 
-        Phases:
-          1. Consolidate wake session journal into Addendum (added_wake).
-          2. Prune ~33% of Coreset into Addendum as candidates for active forgetting.
-          3. Phase 1: Train World Model on the pruned Coreset (yielding 'wm_coreset')
-             until quota is validated AND loss <= wm_target_loss. Causal passes
-             alternate with lookahead passes (1 in _WM_LOOKAHEAD_PERIOD): the
-             lookahead pass trains the inversion only — the gap between the
-             estimated a_{n_ctx} and the observed one, the decision position
-             attending the realized terminal EOS.
-          4. Filter Addendum: evaluate surprise under updated WM (dynamics + cost divergence).
-             Discard familiar sequences; retain surprising sequences.
-          5. Phase 2: Train World Model on the surviving Addendum (yielding 'wm_addendum')
-             until quota is validated AND loss <= wm_target_loss (same alternation).
-          6. Policy training via WM hindsight supervision (yielding 'pol').
-          7. Consolidation: commit Addendum into Coreset, refresh wake latent, yield 'done'.
+          1. extract wake journal windows into the Addendum (recorded sequences) ;
+          2. WM training on the Coreset (yielding 'wm_coreset') ;
+          3. WM training on the Addendum (yielding 'wm_addendum') ;
+          4. policy training by imitation of the WM-generated decision action
+             (yielding 'pol') ;
+          5. commit the Addendum into the Coreset, yield 'done'.
         """
-        if pol_n_imagine is None:
-            pol_n_imagine = self.n_imagine
-        if wm_coreset_target_loss is not None:
-            wm_target_loss = wm_coreset_target_loss
         self.mode = "sleep"
         self.last_dream_record = None
-
-        # Preserve WM loss before sleep to compute the post-sleep ratio
         self.wm_loss_before_sleep = self.last_wm_loss
-
-        # Coreset avant sommeil
         coreset_before = self.buffer.coreset_size
 
-        # 1. Extraction des nouvelles expériences de la session de veille
         n_wake = self.buffer.extract_addendum()
-
-        # 2. Souvenirs remis en jeu (oubli actif) : aucun pruning tant que le
-        # Coreset n'a pas atteint prune_min_fill de sa capacité ; au-delà, on
-        # repasse exactement à ce seuil (n = taille - 75% capacité).
-        n_pruned = 0
-        prune_floor = int(prune_min_fill * self.buffer.pool_capacity)
-        if prune_pct > 0.0 and self.buffer.coreset_size > prune_floor:
-            n_pruned = self.buffer.prune_coreset_n(self.buffer.coreset_size - prune_floor,
-                                                  beta=prune_beta)
-
-        addendum_initial = self.buffer.addendum_size
-
-        # Métadonnées par séquence (passes causale / lookahead / politique)
-        # calculées AVANT la dedup : la distance cosinus des latents EOS est
-        # utilisée par la dedup. Étape à part entière de la modale de sommeil.
-        for _, meta_done, meta_total in self._compute_sequence_metadata():
-            yield "meta", {"done": meta_done, "total": meta_total}
-
-        # 3. Déduplication géométrique :
-        # 3a. Intra-Addendum
-        # La distance cosinus des latents n'est utilisée que si le WM est jugé
-        # fiable (même condition que la salience) ; sinon distance euclidienne pure.
-        saliency_weights = self.trusted_saliency_weights()
-        latent_w = 1.0 if saliency_weights is not None else 0.0
-        n_intra_dropped = self.buffer.deduplicate_addendum(eps=dedup_eps, weights=saliency_weights,
-                                                           latent_weight=latent_w)
-        if n_intra_dropped > 0:
-            print(f"[sleep:intra-addendum] {n_intra_dropped} redundant duplicates eliminated from Addendum.")
-
-        # 3b. Addendum vs Coreset
-        cross_res = self.buffer.deduplicate_against_coreset(eps=dedup_eps, weights=saliency_weights,
-                                                            latent_weight=latent_w)
-        n_cross_dropped = cross_res["dropped"]
-        n_cross_refreshed = cross_res["refreshed"]
-        if n_cross_dropped > 0:
-            print(f"[sleep:cross-coreset] {n_cross_dropped} Coreset duplicates eliminated from Addendum ({n_cross_refreshed} refreshed).")
-
         self.sleep_cycle_stats = {
             "coreset_before": coreset_before,
             "wake": n_wake,
-            "pruned": n_pruned,
-            "addendum_initial": addendum_initial,
-            "dedup_intra": n_intra_dropped,
-            "dedup_coreset": n_cross_dropped,
-            "refreshed": n_cross_refreshed,
-            "filter_dropped": None,
-            "filter_kept": None,
             "coreset_after": None,
         }
 
-        yield "prune", {
-            "pruned": n_pruned,
-            "coreset": self.buffer.coreset_size,
-            "addendum": self.buffer.addendum_size,
-            "coreset_before": coreset_before,
-            "wake": n_wake,
-            "dedup_intra": n_intra_dropped,
-            "dedup_coreset": n_cross_dropped,
-            "refreshed": n_cross_refreshed,
-        }
-
-        # 3. Epoch allocation between Coreset and Addendum
-        has_coreset = (self.buffer.coreset_size > 0)
-        has_addendum = (self.buffer.addendum_size > 0)
-
+        has_coreset = self.buffer.coreset_size > 0
+        has_addendum = self.buffer.addendum_size > 0
         if not has_coreset and not has_addendum:
             self.mode = "wake"
-            yield "done", {"wm_loss": float("nan"), "pol_loss": float("nan")}
+            yield "done", {"wm_loss": float("nan"), "pol_loss": float("nan"),
+                           "coreset_size": self.buffer.coreset_size}
             return
 
-        # 3. Target epoch quota for Coreset and Addendum
-        epochs_core = wm_coreset_epoch if has_coreset else 0
-        epochs_add = wm_addendum_epoch if has_addendum else 0
-
-        # 4. Phase 1: Train World Model on Coreset
-        core_losses = []
-        lookahead_losses = []
-        if epochs_core > 0 or (has_coreset and wm_target_loss is not None):
-            for _, ep, loss_val, lookahead in self.train_wm_phase(
-                    epochs_core, wm_batch, wm_target_loss,
+        core_losses, add_losses = [], []
+        if has_coreset and wm_coreset_epoch > 0:
+            for _, ep, loss_val in self.train_wm_phase(
+                    wm_coreset_epoch, wm_batch, wm_target_loss,
                     source="coreset", label="wm_coreset"):
                 core_losses.append(loss_val)
-                if lookahead:
-                    lookahead_losses.append(loss_val)
                 yield "wm_coreset", loss_val
-        recent_losses = core_losses[-min(len(core_losses), 5):]
-        self.last_wm_coreset_loss = (sum(recent_losses) / len(recent_losses)) if recent_losses else float("nan")
+        self.last_wm_coreset_loss = (sum(core_losses[-5:]) / len(core_losses[-5:])
+                                     if core_losses else float("nan"))
 
-        # 5. Filter Addendum using the updated WM
-        n_initial = self.buffer.addendum_size
-        n_kept = n_initial
-        n_dropped = 0
-        wake_kept = 0
-        wake_dropped = 0
-        core_kept = 0
-        core_dropped = 0
-        mean_kept = 0.0
-        mean_drop = 0.0
-        pct_drop = 0.0
-        threshold = 0.0
-
-        if self.buffer.addendum_size > 0:
-            if has_coreset and not math.isnan(self.last_wm_coreset_loss):
-                threshold = max(self.last_wm_coreset_loss * surprise_factor, surprise_floor)
-                surprises = self.evaluate_sequences_surprise(self.buffer._addendum)
-                surviving = []
-                surviving_meta = []
-                kept_surprises = []
-                dropped_surprises = []
-
-                for i, (seq, s) in enumerate(zip(self.buffer._addendum, surprises)):
-                    m = self.buffer._addendum_meta[i] if i < len(self.buffer._addendum_meta) else self.buffer._default_meta()
-                    origin = m.get("origin", "wake")
-                    if s >= threshold:
-                        surviving.append(seq)
-                        surviving_meta.append(m)
-                        kept_surprises.append(s)
-                        if origin == "coreset":
-                            core_kept += 1
-                        else:
-                            wake_kept += 1
-                    else:
-                        dropped_surprises.append(s)
-                        if origin == "coreset":
-                            core_dropped += 1
-                        else:
-                            wake_dropped += 1
-
-                n_kept = len(surviving)
-                n_dropped = n_initial - n_kept
-                pct_drop = (n_dropped / n_initial * 100.0) if n_initial > 0 else 0.0
-                mean_kept = (sum(kept_surprises) / len(kept_surprises)) if kept_surprises else 0.0
-                mean_drop = (sum(dropped_surprises) / len(dropped_surprises)) if dropped_surprises else 0.0
-
-                self.buffer.filter_addendum(surviving, surviving_meta)
-
-                # Console log (Option 2)
-                print("\n" + "=" * 62)
-                print(f"[sleep:filtrage addendum] Seuil de surprise: {threshold:.5f}")
-                print(f"  Total addendum: {n_initial} | Retirées: {n_dropped} ({pct_drop:.1f}%) | Retenues: {n_kept}")
-                if n_pruned > 0:
-                    print(f"  - 33% Coreset (oubli actif) : {core_dropped}/{n_pruned} oubliées ({core_kept} réinjectées)")
-                    print(f"  - Veille brute              : {wake_dropped}/{wake_dropped + wake_kept} éliminées ({wake_kept} retenues)")
-                print(f"  - Surprise moyenne : rejetées={mean_drop:.5f} | retenues={mean_kept:.5f}")
-                print("=" * 62 + "\n")
-            else:
-                # Cold start: keep everything in Addendum
-                n_kept = n_initial
-                n_dropped = 0
-                pct_drop = 0.0
-                print(f"[sleep:addendum] Démarrage initial: {n_initial} séquences conservées (pas de filtrage initial).")
-
-        self.last_filter_stats = {
-            "initial": n_initial,
-            "kept": n_kept,
-            "dropped": n_dropped,
-            "pct_dropped": pct_drop,
-            "wake_kept": wake_kept,
-            "wake_dropped": wake_dropped,
-            "core_kept": core_kept,
-            "core_dropped": core_dropped,
-            "mean_kept_surprise": mean_kept,
-            "mean_dropped_surprise": mean_drop,
-            "threshold": threshold,
-        }
-        if hasattr(self, "sleep_cycle_stats"):
-            self.sleep_cycle_stats["filter_dropped"] = n_dropped
-            self.sleep_cycle_stats["filter_kept"] = n_kept
-            expected_final = min(self.buffer.pool_capacity, self.buffer.coreset_size + n_kept)
-            self.sleep_cycle_stats["coreset_after"] = expected_final
-        yield "filter", self.last_filter_stats
-
-        # 6. Phase 2: Train World Model on surviving Addendum
-        add_losses = []
-        if self.buffer.addendum_size > 0 and (epochs_add > 0 or wm_target_loss is not None):
-            for _, ep, loss_val, lookahead in self.train_wm_phase(
-                    epochs_add, wm_batch, wm_target_loss,
-                    source="addendum", label="wm_addendum",
-                    surprise_factor=surprise_factor, surprise_floor=surprise_floor):
+        if has_addendum and wm_addendum_epoch > 0:
+            for _, ep, loss_val in self.train_wm_phase(
+                    wm_addendum_epoch, wm_batch, wm_target_loss,
+                    source="addendum", label="wm_addendum"):
                 add_losses.append(loss_val)
-                if lookahead:
-                    lookahead_losses.append(loss_val)
                 yield "wm_addendum", loss_val
-        recent_add_losses = add_losses[-min(len(add_losses), 5):]
-        self.last_wm_addendum_loss = (sum(recent_add_losses) / len(recent_add_losses)) if recent_add_losses else float("nan")
+        self.last_wm_addendum_loss = (sum(add_losses[-5:]) / len(add_losses[-5:])
+                                      if add_losses else float("nan"))
 
-        all_wm_losses = core_losses + add_losses
-        self.last_wm_loss = (sum(all_wm_losses) / len(all_wm_losses)) if all_wm_losses else float("nan")
-        self.last_wm_lookahead_loss = (sum(lookahead_losses) / len(lookahead_losses)) \
-            if lookahead_losses else float("nan")
-
-        # Post-sleep WM loss ratio: > 0.95 means plateau
+        all_losses = core_losses + add_losses
+        self.last_wm_loss = (sum(all_losses) / len(all_losses)) if all_losses else float("nan")
         if not math.isnan(self.wm_loss_before_sleep) and self.wm_loss_before_sleep > 0:
             self.wm_loss_ratio = self.last_wm_loss / self.wm_loss_before_sleep
         else:
             self.wm_loss_ratio = float("nan")
         self.wm_plateau = (not math.isnan(self.wm_loss_ratio)) and self.wm_loss_ratio > 0.95
 
-        # 7. Train Policy (hindsight supervision, candidate fallback)
-        for label, value in self.train_policy(pol_steps, pol_batch,
-                                              n_imagine=pol_n_imagine,
-                                              use_kv_cache=use_kv_cache,
-                                              eos_lookahead=pol_eos_lookahead):
+        for label, value in self.train_policy(pol_steps, pol_batch):
             yield label, value
 
-        # 8. Consolidate surviving Addendum into Coreset with memory decay.
-        saliency_weights = self.trusted_saliency_weights()
-        cons_stats = self.buffer.consolidate_addendum_into_coreset(
-            eps=dedup_eps, decay=0.01, dedup_intra=False, weights=saliency_weights,
-            evict=False
-        )
-        n_evicted = self._evict_coreset_excess()
-        cons_stats["evicted"] = n_evicted
-        cons_stats["refreshed"] = n_cross_refreshed + cons_stats.get("refreshed", 0)
-        cons_stats["dedup_cross_dropped"] = n_cross_dropped
-        cons_stats["dedup_intra_dropped"] = n_intra_dropped
-        if hasattr(self, "sleep_cycle_stats"):
-            self.sleep_cycle_stats["coreset_after"] = self.buffer.coreset_size
-            self.sleep_cycle_stats["added"] = cons_stats["added"]
-            self.sleep_cycle_stats["evicted"] = cons_stats["evicted"]
-
-        # Resume recording after sleep and restart the static-salve
-        # detection from scratch (the world model changed under us).
+        n_committed = self.buffer.commit_addendum()
+        self.sleep_cycle_stats["coreset_after"] = self.buffer.coreset_size
         self._recording = True
         self._static_ticks = 0
         self._last_salve = None
         self.mode = "wake"
 
-        print("\n" + "=" * 62)
-        print("[sleep:cycle summary] :")
-        print(f"  - Coreset before sleep          : {coreset_before}")
-        print(f"  - New experiences               : +{n_wake}")
-        print(f"  - Memories revisited (pruned)   : +{n_pruned}")
-        print(f"  - Raw addendum                  : {addendum_initial}")
-        print(f"  - Intra-addendum duplicates     : -{n_intra_dropped}")
-        print(f"  - Addendum/coreset duplicates   : -{n_cross_dropped} ({n_cross_refreshed} refreshed)")
-        print(f"  - Familiar sequences dropped    : -{n_dropped}")
-        if not math.isnan(self.last_wm_lookahead_loss):
-            print(f"  - WM lookahead loss (EOS-cond.): {self.last_wm_lookahead_loss:.5f}")
-        print(f"  - Coreset after sleep           : {self.buffer.coreset_size} (+{cons_stats['added']} added, -{cons_stats['evicted']} evicted)")
-        print("=" * 62 + "\n")
-
         stats = {
             "wm_loss": self.last_wm_loss,
             "wm_coreset_loss": self.last_wm_coreset_loss,
             "wm_addendum_loss": self.last_wm_addendum_loss,
-            "wm_lookahead_loss": self.last_wm_lookahead_loss,
-            "filter": self.last_filter_stats,
-            "consolidation": cons_stats,
-            "cycle": getattr(self, "sleep_cycle_stats", {}),
             "pol_loss": self.last_pol_loss,
             "coreset_size": self.buffer.coreset_size,
+            "committed": n_committed,
+            "cycle": self.sleep_cycle_stats,
         }
         yield "done", stats
 
-    # --- persistence ---------------------------------------------------------
+    # --- persistence -------------------------------------------------------------
     def state_dict(self):
         return {
             "world": self.world.state_dict(),
             "policy": self.policy.state_dict(),
+            "latent_norm": self.latent_norm.state_dict(),
         }
 
     def load_state_dict(self, sd):
-        if "world" in sd:
-            self.world.load_state_dict(sd["world"])
-        if "policy" in sd:
-            self.policy.load_state_dict(sd["policy"])
+        self.world.load_state_dict(sd["world"])
+        self.policy.load_state_dict(sd["policy"])
+        self.latent_norm.load_state_dict(sd["latent_norm"])
 
     def save_checkpoint(self, wm_path: str, pol_path: str, buf_path: str | None = None) -> None:
-        """Save world model, policy, and optionally the experience buffer to disk."""
-        torch.save({
-            "world": self.world.state_dict(),
-            "opt_wm": self.opt_wm.state_dict(),
-            "wm_loss_ratio": self.wm_loss_ratio,
-            "wm_plateau": self.wm_plateau,
-        }, wm_path)
-        torch.save({
-            "policy": self.policy.state_dict(),
-            "latent_norm": self.latent_norm.state_dict(),
-            "opt_pol": self.opt_pol.state_dict(),
-        }, pol_path)
-        if buf_path:
+        torch.save({"world": self.world.state_dict(),
+                    "opt_wm": self.opt_wm.state_dict()}, wm_path)
+        torch.save({"policy": self.policy.state_dict(),
+                    "latent_norm": self.latent_norm.state_dict(),
+                    "opt_pol": self.opt_pol.state_dict()}, pol_path)
+        if buf_path is not None:
             self.buffer.save(buf_path)
 
     def load_checkpoint(self, wm_path: str, pol_path: str, buf_path: str | None = None) -> None:
-        """Load world model, policy, and optionally the experience buffer from disk.
-        Each is loaded independently — a mismatch in one does not affect the others."""
-        if os.path.exists(wm_path):
-            sd = torch.load(wm_path, map_location=self.device, weights_only=True)
-            if "world" in sd:
-                self.world.load_state_dict(sd["world"])
-            if "opt_wm" in sd:
-                self.opt_wm.load_state_dict(sd["opt_wm"])
-            if "wm_loss_ratio" in sd:
-                self.wm_loss_ratio = sd["wm_loss_ratio"]
-            if "wm_plateau" in sd:
-                self.wm_plateau = sd["wm_plateau"]
-        if os.path.exists(pol_path):
-            sd = torch.load(pol_path, map_location=self.device, weights_only=True)
-            if "policy" in sd:
-                p_sd = sd["policy"]
-                if "net.0.weight" in p_sd:
-                    cur_in = self.policy.net[0].in_features
-                    ckpt_in = p_sd["net.0.weight"].shape[1]
-                    if ckpt_in == cur_in - 6:
-                        # Adapt 45 phys + latent to 51 (45 phys + 6 cost/reward) + latent :
-                        # insert neutral (0.5) columns for the cost/reward slots
-                        w = p_sd["net.0.weight"]
-                        pad = torch.full((w.shape[0], 6), 0.5, dtype=w.dtype, device=w.device)
-                        p_sd["net.0.weight"] = torch.cat([w[:, :45], pad, w[:, 45:]], dim=1)
-                    elif ckpt_in == cur_in + 2:
-                        # legacy: drop the 2 intero columns
-                        w = p_sd["net.0.weight"]
-                        p_sd["net.0.weight"] = torch.cat([w[:, :45], w[:, 47:]], dim=1)
-                try:
-                    self.policy.load_state_dict(p_sd)
-                except Exception as e:
-                    print(f"[warning] Policy load: {e}")
-            if "latent_norm" in sd:
-                try:
-                    self.latent_norm.load_state_dict(sd["latent_norm"])
-                except Exception:
-                    pass
-            if "opt_pol" in sd:
-                try:
-                    self.opt_pol.load_state_dict(sd["opt_pol"])
-                except Exception:
-                    pass
-        if buf_path and os.path.exists(buf_path):
+        if not os.path.exists(wm_path) or not os.path.exists(pol_path):
+            raise FileNotFoundError("missing WM or policy checkpoint — run with --reset")
+        wm = torch.load(wm_path, weights_only=False)
+        self.world.load_state_dict(wm["world"])
+        if "opt_wm" in wm:
+            self.opt_wm.load_state_dict(wm["opt_wm"])
+        pol = torch.load(pol_path, weights_only=False)
+        self.policy.load_state_dict(pol["policy"])
+        self.latent_norm.load_state_dict(pol["latent_norm"])
+        if "opt_pol" in pol:
+            self.opt_pol.load_state_dict(pol["opt_pol"])
+        if buf_path is not None and os.path.exists(buf_path):
             self.buffer.load(buf_path)
-            if self.buffer._coreset and len(self.buffer._coreset[0]) != self.buffer.seq_len:
-                print(f"[warning] Checkpoint buffer sequences have length {len(self.buffer._coreset[0])}, but brain requires {self.buffer.seq_len} salves ({self.seq_steps} steps). Discarding mismatched checkpoint buffer.")
-                self.buffer.clear()

@@ -330,15 +330,7 @@ def run(headless: bool = False, steps: int = 0,
                                                 wm_addendum_epoch=wm_addendum_epoch,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
-                                                wm_target_loss=wm_target_loss,
-                                                prune_pct=prune_pct,
-                                                surprise_factor=surprise_factor,
-                                                prune_min_fill=prune_min_fill,
-                                                prune_beta=prune_beta,
-                                                dedup_eps=dedup_eps,
-                                                surprise_floor=surprise_floor,
-                                                use_kv_cache=use_kv_cache,
-                                                pol_eos_lookahead=pol_eos_lookahead)
+                                                wm_target_loss=wm_target_loss)
                         status = "sleeping..."
                     else:
                         status = "need a complete sequence to sleep"
@@ -400,15 +392,7 @@ def run(headless: bool = False, steps: int = 0,
                                                 wm_addendum_epoch=wm_addendum_epoch,
                                                 wm_batch=wm_batch,
                                                 pol_steps=pol_steps,
-                                                wm_target_loss=wm_target_loss,
-                                                prune_pct=prune_pct,
-                                                surprise_factor=surprise_factor,
-                                                prune_min_fill=prune_min_fill,
-                                                prune_beta=prune_beta,
-                                                dedup_eps=dedup_eps,
-                                                surprise_floor=surprise_floor,
-                                                use_kv_cache=use_kv_cache,
-                                                pol_eos_lookahead=pol_eos_lookahead)
+                                                wm_target_loss=wm_target_loss)
                         status = "sleeping..."
                     else:
                         status = "need a complete sequence to sleep"
