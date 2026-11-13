@@ -207,7 +207,7 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Manager — refonte")
-    width, height = 1120, 664
+    width, height = 1120, 600
     screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
