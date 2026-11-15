@@ -34,7 +34,7 @@ _BUF_CKPT = os.path.join(_CKPT_DIR, "buf_ckpt.pt")
 def run(device: str | None = None,
         pol_steps: int = 32,
         wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
-        wm_target_loss: float = 0.01,
+        wm_target_loss: float = 0.004,
         prune_pct: float = 0.33, surprise_factor: float = 0.5,
         prune_min_fill: float = 0.75, prune_beta: float = 2.0,
         dedup_eps: float = 0.08, surprise_floor: float = 0.001,
@@ -109,7 +109,7 @@ def run(device: str | None = None,
         pygame.quit()
         return
 
-    dream_theater = DreamTheater(R.WIDTH, R.HEIGHT)
+    dream_theater = DreamTheater(R.WIDTH, R.HEIGHT, max_history=pol_steps)
     dream_theater.coreset_size = brain.buffer.coreset_size
     dream_theater.addendum_size = len(brain.buffer) - brain.buffer.coreset_size
     sleep_gen = None       # active sleep generator (None when not sleeping)
@@ -154,13 +154,13 @@ def run(device: str | None = None,
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
                     phase = "wm"
                     if label == "wm_addendum":
-                        status = f"learning addendum {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning addendum {wm_step}/{wm_total} (loss {value:.3g})"
                         phase = "wm"
                     elif label == "wm_coreset":
-                        status = f"learning coreset {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning coreset {wm_step}/{wm_total} (loss {value:.3g})"
                         phase = "wm"
                     else:
-                        status = f"learning wm {wm_step}/{wm_total} (loss {value:.2f})"
+                        status = f"learning wm {wm_step}/{wm_total} (loss {value:.3g})"
                         phase = "wm"
                     dream_theater.set_sleep_progress(phase, wm_step, wm_total)
                 elif label == "filter":
@@ -189,7 +189,7 @@ def run(device: str | None = None,
                     f_stats = getattr(brain, "last_filter_stats", None)
                     drop_info = f" [dropped: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
                     status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{drop_info} "
-                              f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
+                              f"wm {stats['wm_loss']:.3g} pol {stats['pol_loss']:.2f}")
             except StopIteration:
                 sleep_gen = None
                 dream_theater.sleep_active = False
@@ -207,7 +207,7 @@ def main() -> None:
     params: dict = {
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
         "accel": False,
-        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_target_loss": 0.01,
+        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_target_loss": 0.004,
         "prune_pct": 0.33, "surprise_factor": 0.5,
         "prune_min_fill": 0.75, "prune_beta": 2.0,
         "dedup_eps": 0.08, "surprise_floor": 0.001,

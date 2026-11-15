@@ -35,8 +35,9 @@ class WMManager(WMTheater):
 
     def __init__(self, brain: Brain, buffer: ExperienceBuffer, wm_path: str = "wm_ckpt.pt",
                  phase_epochs: int = 512, phase_batch: int = 64,
-                 phase_target: float | None = 0.01, **kwargs):
+                 phase_target: float | None = 0.01, ctx_eps: float = 1e-3, **kwargs):
         super().__init__(brain, buffer, **kwargs)
+        self.ctx_eps = ctx_eps
         self.bottom_margin = 24 + 8 + STRIP_H   # footer + strip d'entraînement
         self.wm_path = wm_path
         self.training = False
@@ -48,7 +49,7 @@ class WMManager(WMTheater):
         self.losses: list[tuple[int, float]] = []
         self.epf = 1
         self.saved_flash: float | None = None
-        self.footer_hints = ("Nav: [← / →]  |  [S] Sort  |  [T] Train seq  |  [W] Phase WM  |  "
+        self.footer_hints = ("Nav: [← / →] / glider  |  [F] Ctx-filter  |  [S] Sort  |  [T] Train seq  |  [W] Phase WM  |  "
                              "[Space] 1 epoch  |  [R] Reset  |  [ / ] lr  |  "
                              "[↑/↓] epf  |  [V] Save WM  |  [Esc] Quit")
         self.title_str = "WM MANAGER"
@@ -75,10 +76,12 @@ class WMManager(WMTheater):
         self.phase_gen = self.brain.train_wm_phase(
             self.phase_epochs, self.phase_batch, self.phase_target,
             source="coreset",
-            fixed_seq=lambda: self.buffer._coreset[self.seq_idx],
+            fixed_seq=(lambda: self.buffer._coreset[self.seq_idx]
+                       if self.buffer._coreset else None),
             label="wm_phase")
 
     def update(self) -> None:
+        super().update()   # debounce de la navigation (glider / flèches)
         if self.training:
             for _ in range(self.epf):
                 self.train_one_epoch()
@@ -141,6 +144,23 @@ class WMManager(WMTheater):
             elif ev.key == pygame.K_v:
                 self.save_wm()
                 return True
+            elif ev.key == pygame.K_f:
+                # filtre par similarité de contexte : la séquence courante devient
+                # référence ; re-appui = reset
+                if self.ctx_filter_on:
+                    self.clear_ctx_reference()
+                    print("[ctx-filter] reset — all coreset sequences visible")
+                else:
+                    n = self.set_ctx_reference(self.seq_idx)
+                    print(f"[ctx-filter] ref=idx {self._ref_idx} kept={n}/{self.num_seqs} "
+                          f"eps={self.ctx_eps:g}")
+                    try:
+                        os.makedirs(".tmp", exist_ok=True)
+                        with open(".tmp/ctx_filter.txt", "w") as fh:
+                            fh.write("\n".join(map(str, self._filtered_idx or [])))
+                    except OSError:
+                        pass
+                return True
         return super().handle_event(ev)
 
     # --- drawing ------------------------------------------------------------
@@ -194,20 +214,22 @@ class WMManager(WMTheater):
 
 def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                 pol_path: str = "pol_ckpt.pt", initial_index: int = 0,
-                device: str = "cpu", initial_sort: str = "relief_desc",
+                device: str = "cpu", initial_sort: str = "coreset",
+                ctx_eps: float = 1e-3,
                 d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
                 dim_ff: int = 384, wm_dropout: float = 0.0, pol_hidden: int = 256,
                 lr_wm: float = 3e-4, lr_pol: float = 2e-4, seed: int = 0,
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 10, n_ctx: int = 4,
                 wm_batch: int = 64, wm_coreset_epoch: int = 512,
-                wm_target_loss: float = 0.01,
-                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_max_p: float = 8.0,
+                wm_target_loss: float = 0.004,
+                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
+                eos_max_p: float = 8.0,
                 compile_wm: bool = False, **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Manager — refonte")
-    width, height = 960, 560
+    width, height = 960, 520
     screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
@@ -219,7 +241,8 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                   dropout=wm_dropout, pol_hidden=pol_hidden, lr_wm=lr_wm, lr_pol=lr_pol,
                   seed=seed, buffer_capacity=buffer_capacity,
                   buffer_pool_capacity=buffer_pool_capacity,
-                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin, eos_max_p=eos_max_p)
+                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
+                  eos_poids_arrivee=eos_poids_arrivee, eos_max_p=eos_max_p)
     if os.path.exists(wm_path):
         brain.load_checkpoint(wm_path=wm_path,
                               pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt")
@@ -229,7 +252,8 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
 
     buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
                            seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed,
-                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin)
+                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
+                           eos_poids_arrivee=eos_poids_arrivee)
     if os.path.exists(buffer_path):
         ok = buf.load(buffer_path)
         print(f"Loaded {buf.coreset_size} sequences from {buffer_path}" if ok
@@ -238,7 +262,7 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
         print(f"Warning: Buffer checkpoint {buffer_path} not found.")
 
     manager = WMManager(brain, buf, wm_path=wm_path, width=width, height=height,
-                        initial_sort=initial_sort,
+                        initial_sort=initial_sort, ctx_eps=ctx_eps,
                         phase_epochs=wm_coreset_epoch, phase_batch=wm_batch,
                         phase_target=wm_target_loss)
     manager.set_seq_idx(initial_index)
@@ -249,9 +273,6 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
-            elif ev.type == pygame.VIDEORESIZE:
-                screen = pygame.display.set_mode(
-                    (max(640, ev.w), max(360, ev.h)), flags)
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break
@@ -273,14 +294,14 @@ def main() -> None:
         "buffer_path": "buf_ckpt.pt", "wm_path": "wm_ckpt.pt", "pol_path": "pol_ckpt.pt",
         "initial_index": 0,
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "initial_sort": "relief_desc", "accel": False,
+        "initial_sort": "coreset", "ctx_eps": 1e-3, "accel": False,
         "d_model": 64, "nhead": 4, "wm_layers": 3,
         "dim_ff": 384, "wm_dropout": 0.0, "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4, "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 10, "n_ctx": 4,
-        "wm_batch": 64, "wm_coreset_epoch": 512, "wm_target_loss": 0.01,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
+        "wm_batch": 64, "wm_coreset_epoch": 512, "wm_target_loss": 0.004,
+        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
         "compile_wm": False,
     }
     CFG.apply_toml(params, cfg)
@@ -293,6 +314,8 @@ def main() -> None:
                    choices=["cpu", "cuda", "auto", "cpu-fast"])
     p.add_argument("--sort", type=str, default=argparse.SUPPRESS, dest="initial_sort",
                    choices=["coreset", "relief_desc", "relief_asc", "abs_desc"])
+    p.add_argument("--ctx-eps", type=float, default=argparse.SUPPRESS, dest="ctx_eps",
+                   help="seuil MSE sur les signaux du contexte pour le filtre [F]")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS)
     p.add_argument("--compile", action="store_true", default=argparse.SUPPRESS, dest="compile_wm")
     CFG.merge_cli(params, vars(p.parse_args()))

@@ -60,6 +60,7 @@ TOML_TO_PARAM: dict[str, str] = {
     "training_eos_force_amp_hi": "eos_force_amp_hi",
     "training_eos_decay":        "eos_decay",
     "training_eos_poids_chemin": "eos_poids_chemin",
+    "training_eos_poids_arrivee": "eos_poids_arrivee",
     "training_eos_max_p":        "eos_max_p",
     "training_eos_force_amplify": "eos_force_amplify",
     "training_eos_force_amplify_threshold": "eos_force_amplify_threshold",

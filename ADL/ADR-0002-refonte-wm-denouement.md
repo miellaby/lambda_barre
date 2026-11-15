@@ -21,16 +21,29 @@ unique.
 ### Séquence enregistrée
 
 Une séquence enregistrée est une **liste plate de `seq_len` tokens** dans
-l'ordre : `contexte | dénouement | conséquence inversée | action de décision`.
+l'ordre : `contexte | conséquence rétro-causale | action de décision`.
 
-- **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]` (`ctx_len` tokens) ;
-- **dénouement** : 1 token EOS à `eos_pos = ctx_len`, valeur observée réelle
-  (ground truth), calculé à l'extraction depuis la fenêtre temporelle (le
-  journal de veille reste un flux de salves temporelles) ;
-- **conséquence inversée** : états post-décision seuls, du plus tardif au plus
-  précoce, `s_{seq_steps} .. s_{n_ctx+1}` (`conseq_len = n_imagine × 13`) ;
-- **action de décision** : `a_{n_ctx}` (3 tokens), **dernier token** de la
-  séquence (`action_pos`).
+- **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]` (`ctx_len` tokens,
+  ordre normal ; `s_{n_ctx}` seul, sans action) ;
+- **conséquence rétro-causale** (à partir de `conseq_start = eos_pos =
+  ctx_len`) : unités de 16 tokens pour `k = seq_steps .. n_ctx+1`, du plus
+  tardif au plus précoce — `s_k` avec ses 13 tokens d'état **inversés**
+  (token 12 en premier), puis `a_{k-1}` (3 tokens, ordre interne normal).
+  En remontant, prédire `s_k` mobilise `a_k` et `s_{k+1}` : d'où
+  l'entrelacement `s26, a25, s25, a24, ..., s5, a4` ;
+- **token de dénouement** : le token 12 de la première unité (`s_{seq_steps}`),
+  à `eos_pos = ctx_len` — **premier token après le contexte**, 6 slots,
+  valeur observée réelle (ground truth) calculée à l'extraction depuis la
+  fenêtre temporelle (le journal de veille reste un flux de salves
+  temporelles). C'est le token de dénouement qui est prédit juste après le
+  contexte à l'inférence et qu'on échantillonne pour élire un dénouement ;
+- **action de décision** : `a_{n_ctx}` (3 derniers tokens de la séquence,
+  `action_pos`).
+
+Le dénouement est donc porté par une salve existante (la dernière salve
+temporelle = première unité de la conséquence rétro-causale), comme avant la
+refonte ; il n'y a pas de token isolé en dehors d'une salve. `a_{seq_steps}`
+n'est pas enregistrée.
 
 Le dénouement reste un **vecteur continu** de 6 slots [0,1] (progrès par canal
 `f = P − poids_chemin·A`) : pas de classes, pas de quantification. Les sorties

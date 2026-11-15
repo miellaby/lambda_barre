@@ -37,11 +37,12 @@ JOY_R_CENTRE = (R.WIDTH - 96, 300)
 JOY_WRAP_MARGIN = math.radians(10.0)
 JOY_THETA_MAX = math.pi - JOY_WRAP_MARGIN
 
-# tail slider: horizontal track below the ground line
+# tail slider: vertical track to the right of the left joystick
+# (haut = +TAIL_RANGE, bas = -TAIL_RANGE)
 TAIL_RANGE = math.pi / 2          # +/- 90° from the facing-default tail angle
-TAIL_TRACK_Y = 572
-TAIL_TRACK_X1 = 360
-TAIL_TRACK_X2 = 600
+TAIL_SLIDER_X = JOY_L_CENTRE[0] + JOY_RADIUS + 36
+TAIL_TRACK_Y1 = JOY_L_CENTRE[1] - JOY_RADIUS
+TAIL_TRACK_Y2 = JOY_L_CENTRE[1] + JOY_RADIUS
 TAIL_HANDLE_R = 10
 
 # --- colours -----------------------------------------------------------------
@@ -176,73 +177,74 @@ class Joystick:
                          self.cy + self.radius + 6))
 
 
-class Slider:
-    """Horizontal slider mapping x-position to theta_star in [-range, +range]."""
+class VSlider:
+    """Vertical slider mapping y-position to theta_star in [-range, +range]
+    (haut de la piste = +range, bas = -range). Label au-dessus, angle en dessous."""
 
-    def __init__(self, x1: int, x2: int, y: int, theta: float,
+    def __init__(self, x: int, y1: int, y2: int, theta: float,
                  rng: float, label: str):
-        self.x1 = x1
-        self.x2 = x2
-        self.y = y
+        self.x = x
+        self.y1 = y1
+        self.y2 = y2
         self.theta = theta
         self.rng = rng
         self.label = label
         self.dragging = False
 
-    def _handle_x(self) -> int:
-        t = (self.theta + self.rng) / (2 * self.rng)
-        return int(self.x1 + _clamp(t, 0.0, 1.0) * (self.x2 - self.x1))
+    def _handle_y(self) -> int:
+        frac = (self.theta + self.rng) / (2 * self.rng)
+        return int(self.y2 - _clamp(frac, 0.0, 1.0) * (self.y2 - self.y1))
 
-    def _set_from_x(self, mx: int) -> None:
-        t = (mx - self.x1) / (self.x2 - self.x1)
-        t = _clamp(t, 0.0, 1.0)
-        self.theta = -self.rng + t * 2 * self.rng
+    def _set_from_y(self, my: int) -> None:
+        frac = (self.y2 - my) / (self.y2 - self.y1)
+        frac = _clamp(frac, 0.0, 1.0)
+        self.theta = -self.rng + frac * 2 * self.rng
 
     def hit(self, mx: int, my: int) -> bool:
-        hx = self._handle_x()
+        hy = self._handle_y()
         # grab the handle or anywhere on the track
-        on_handle = math.hypot(mx - hx, my - self.y) <= TAIL_HANDLE_R + 4
-        on_track = (self.x1 - 4 <= mx <= self.x2 + 4
-                    and abs(my - self.y) <= TAIL_HANDLE_R + 6)
+        on_handle = math.hypot(mx - self.x, my - hy) <= TAIL_HANDLE_R + 4
+        on_track = (abs(mx - self.x) <= TAIL_HANDLE_R + 6
+                    and self.y1 - 4 <= my <= self.y2 + 4)
         return on_handle or on_track
 
     def on_down(self, mx: int, my: int) -> bool:
         if self.hit(mx, my):
             self.dragging = True
-            self._set_from_x(mx)
+            self._set_from_y(my)
             return True
         return False
 
     def on_motion(self, mx: int, my: int) -> None:
         if self.dragging:
-            self._set_from_x(mx)
+            self._set_from_y(my)
 
     def on_up(self) -> None:
         self.dragging = False
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
-        # track
-        track_h = 6
-        rect = pygame.Rect(self.x1, self.y - track_h // 2,
-                           self.x2 - self.x1, track_h)
+        # track vertical
+        track_w = 6
+        rect = pygame.Rect(self.x - track_w // 2, self.y1,
+                           track_w, self.y2 - self.y1)
         pygame.draw.rect(screen, SLIDER_FILL_C, rect, border_radius=3)
         pygame.draw.rect(screen, SLIDER_TRACK_C, rect, 1, border_radius=3)
         # centre tick
-        cx = (self.x1 + self.x2) // 2
+        cy = (self.y1 + self.y2) // 2
         pygame.draw.line(screen, SLIDER_TRACK_C,
-                         (cx, self.y - 8), (cx, self.y + 8), 1)
+                         (self.x - 8, cy), (self.x + 8, cy), 1)
         # handle
-        hx = self._handle_x()
-        pygame.draw.circle(screen, SLIDER_HANDLE_C, (hx, self.y), TAIL_HANDLE_R)
+        hy = self._handle_y()
+        pygame.draw.circle(screen, SLIDER_HANDLE_C, (self.x, hy), TAIL_HANDLE_R)
         pygame.draw.circle(screen, SLIDER_HANDLE_RING_C,
-                           (hx, self.y), TAIL_HANDLE_R, 2)
-        # label + readout
+                           (self.x, hy), TAIL_HANDLE_R, 2)
+        # label "T" au-dessus, angle en dessous
         lbl = font.render(self.label, R.FONT_AA, SLIDER_LABEL_C)
-        screen.blit(lbl, (self.x1, self.y - 28))
+        screen.blit(lbl, (self.x - lbl.get_width() // 2, self.y1 - 22))
         deg = math.degrees(self.theta)
         info = f"{deg:+5.0f}°"
         s2 = font.render(info, R.FONT_AA, SLIDER_LABEL_C)
-        screen.blit(s2, (self.x2 - s2.get_width(), self.y - 28))
+        screen.blit(s2, (self.x - s2.get_width() // 2, self.y2 + 6))
 
 
 class Controls:
@@ -255,8 +257,8 @@ class Controls:
         self.joy_r = Joystick(JOY_R_CENTRE, JOY_RADIUS,
             skel.limb_r.theta_star,
             (skel.limb_r.d_star - B.LIMB_MIN) / (B.LIMB_MAX - B.LIMB_MIN), "R")
-        self.tail = Slider(TAIL_TRACK_X1, TAIL_TRACK_X2, TAIL_TRACK_Y,
-            skel.tail_act.theta_star, TAIL_RANGE, "tail")
+        self.tail = VSlider(TAIL_SLIDER_X, TAIL_TRACK_Y1, TAIL_TRACK_Y2,
+            skel.tail_act.theta_star, TAIL_RANGE, "T")
 
     @property
     def _widgets(self):

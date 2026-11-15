@@ -4,15 +4,19 @@
 
 Une séquence est une fenêtre temporelle ordonnée ainsi :
 
-`contexte | dénouement | conséquence inversée | action de décision`
+`contexte | conséquence rétro-causale | action de décision`
 
-- **contexte** : salves d'état preceding la décision.
-- **dénouement** : token enregistré dans le dataset (valeur observée réelle,
-  ground truth), placé juste après le contexte. Il résume l'issue de la
-  trajectoire post-décision.
-- **conséquence inversée** : les états post-décision, du plus tardif au plus
-  précoce.
-- **action de décision** : dernier token de la séquence.
+- **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]`, ordre normal
+  (`s_{n_ctx}` seul, sans action).
+- **conséquence rétro-causale** : unités de 16 tokens pour
+  `k = seq_steps .. n_ctx+1`, du plus tardif au plus précoce — `s_k` avec ses
+  13 tokens d'état **inversés** (token 12 en premier), puis `a_{k-1}`
+  (3 tokens, ordre interne normal) : `s26, a25, s25, a24, ..., s5, a4`.
+- **token de dénouement** : le token 12 de la première unité (`s_{seq_steps}`),
+  premier token après le contexte (`eos_pos = ctx_len`), valeur observée réelle
+  (ground truth) calculée à l'extraction. Il résume l'issue de la trajectoire
+  post-décision et est prédit juste après le contexte à l'inférence.
+- **action de décision** : `a_{n_ctx}`, dernier token de la séquence.
 
 ## Entraînement du transformer
 

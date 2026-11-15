@@ -107,18 +107,44 @@ _SALVE_MASK_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 
 def build_salve_mask(
     L: int,
-    device
+    device,
+    ctx_len: int = 0,
+    boost: float = 0.0,
 ) -> torch.Tensor:
     """Classical (strictly causal) Transformer mask. Cached per (length,
-    device): it is queried on every training step and every rollout pass,
-    and the allocation is pure overhead. Read-only — never mutate."""
-    key = (L, str(device))
+    device, ctx_len, boost): it is queried on every training step and every
+    rollout pass, and the allocation is pure overhead. Read-only — never mutate.
+
+    With ``boost > 0``, returns a float additive mask instead: -inf above the
+    diagonal (causal), plus a gain triangle on the key columns ``[0, ctx_len]``
+    — context columns ``[0, ctx_len)`` ramp linearly from 0 at S0 to ``boost``
+    at S_{n_ctx}, and the dénouement column ``ctx_len`` (eos_pos) gets the SUM
+    of all context-column biases (``1*dénouement = 1*contexte`` in
+    P(action, conséquence | contexte, dénouement)). Softmax weight of key c
+    is multiplied by ~exp(bias). With ``boost == 0``, returns the plain
+    bool causal mask (fast path preserved)."""
+    key = (L, str(device), ctx_len, boost)
     m = _SALVE_MASK_CACHE.get(key)
     if m is None:
-        m = torch.triu(
+        causal = torch.triu(
             torch.ones(L, L, dtype=torch.bool, device=device),
             diagonal=1,
         )
+        if boost > 0.0:
+            m = torch.zeros(L, L, dtype=torch.float32, device=device)
+            m.masked_fill_(causal, float("-inf"))
+            if ctx_len > 0:
+                # colonnes [0, ctx_len] : triangle contexte ; la colonne
+                # dénouement (ctx_len = eos_pos) porte à elle seule la SOMME
+                # des biais du contexte : 1*dénouement = 1*contexte
+                n_cols = min(ctx_len + 1, L)
+                salve_idx = torch.arange(n_cols, device=device) // SALVE_TOKENS
+                ramp = salve_idx.float() / float(max(1, (ctx_len - 1) // SALVE_TOKENS))
+                if ctx_len < n_cols:
+                    ramp[ctx_len] = ramp[:ctx_len].sum()
+                m[:, :n_cols] += boost * ramp.unsqueeze(0)
+        else:
+            m = causal
         _SALVE_MASK_CACHE[key] = m
     return m
 
@@ -286,7 +312,9 @@ class WorldModel(nn.Module):
             causal = True
         else:
             attn_mask = attn_mask.to(device)
-            if is_causal is None:
+            if attn_mask.dtype != torch.bool:
+                causal = False   # masque float additif (ex. boost contexte) : appliqué tel quel
+            elif is_causal is None:
                 causal = bool(torch.equal(attn_mask, build_salve_mask(L, device)))
             else:
                 causal = bool(is_causal)
@@ -316,12 +344,23 @@ class WorldModel(nn.Module):
         return q, k, v
 
     @torch.inference_mode()
-    def cache_forward(self, x: torch.Tensor, cache: KVCache) -> torch.Tensor:
+    def cache_forward(self, x: torch.Tensor, cache: KVCache,
+                      positions: torch.Tensor = None,
+                      ctx_len: int = 0, ctx_boost: float = 0.0) -> torch.Tensor:
         """Process a block of tokens [B, T, 25] through the cached attention
         path, extending ``cache`` in place. Returns the head predictions
         [B, T, 16] for the block — identical to ``forward`` on the
         concatenated stream (subject to float rounding).
-        """
+
+        ``positions`` ([T] long, absolute salve indices) overrides the default
+        ``arange // SALVE_TOKENS`` positional encoding — needed when the stream
+        uses explicit salve positions (refonte rétro-causale).
+
+        ``ctx_len`` / ``ctx_boost`` replicate the additive gain triangle of
+        ``build_salve_mask``: key column c < ``ctx_len`` gets
+        ``ctx_boost * (c // SALVE_TOKENS) / n_ctx``, and the dénouement column
+        ``ctx_len`` gets the sum of all context-column biases (must match the
+        training mask)."""
         if self.training and self.dropout_p > 0:
             raise RuntimeError("cached inference path is only valid without dropout")
         B, T, _ = x.shape
@@ -330,7 +369,10 @@ class WorldModel(nn.Module):
         hd = d // nh
         device = x.device
         h = self.in_proj(x)                                     # [B, T, d]
-        salve_pos = torch.arange(cache.pos, cache.pos + T, device=device) // SALVE_TOKENS
+        if positions is None:
+            salve_pos = torch.arange(cache.pos, cache.pos + T, device=device) // SALVE_TOKENS
+        else:
+            salve_pos = positions.to(device)
         h = h + self._sinusoidal_pe(salve_pos).unsqueeze(0)
         for i, layer in enumerate(self.transformer.layers):
             xn = layer.norm1(h)                                  # [B, T, d]
@@ -342,10 +384,27 @@ class WorldModel(nn.Module):
             Kh = K.view(B, -1, nh, hd).transpose(1, 2)          # [B, nh, P+T, hd]
             Vh = V.view(B, -1, nh, hd).transpose(1, 2)
             P = K.shape[1] - T
+            if ctx_boost > 0.0 and ctx_len > 0:
+                # colonnes [0, ctx_len] : triangle contexte + dénouement (colonne
+                # ctx_len = eos_pos) à gain plein ; ctx_len//16 == n_ctx -> rampe 1.0
+                n_cols = min(ctx_len + 1, P + T)
+                keys = torch.arange(n_cols, device=device)
+                n_ctx_keys = max(1, (ctx_len - 1) // SALVE_TOKENS)
+                bias = ctx_boost * (keys // SALVE_TOKENS).float() / n_ctx_keys   # [n_cols]
+                if ctx_len < n_cols:
+                    # 1*dénouement = 1*contexte : colonne eos = somme des biais contexte
+                    bias[ctx_len] = bias[:ctx_len].sum()
             if T > 1:
                 # New token t attends to all P cached tokens and to new tokens <= t.
                 mask = torch.zeros(T, P + T, device=device)
                 mask[:, P:] = torch.full((T, T), float("-inf"), device=device).triu(diagonal=1)
+                if ctx_boost > 0.0 and ctx_len > 0:
+                    mask[:, :n_cols] += bias.unsqueeze(0)
+                out = F.scaled_dot_product_attention(qh, Kh, Vh, attn_mask=mask)
+            elif ctx_boost > 0.0 and ctx_len > 0:
+                # single token: all P+1 cached keys are past -> allowed; triangle + dénouement
+                mask = torch.zeros(1, P + 1, device=device)
+                mask[:, :n_cols] = bias.unsqueeze(0)
                 out = F.scaled_dot_product_attention(qh, Kh, Vh, attn_mask=mask)
             else:
                 out = F.scaled_dot_product_attention(qh, Kh, Vh)

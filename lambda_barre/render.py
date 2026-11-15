@@ -9,7 +9,7 @@ from . import body as B
 from . import world as W
 
 # screen geometry
-WIDTH, HEIGHT = 960, 560
+WIDTH, HEIGHT = 1024, 560
 GROUND_SCREEN_Y = 540           # world y=0 maps here
 ORIGIN_X = WIDTH // 2           # world x=0 maps here
 

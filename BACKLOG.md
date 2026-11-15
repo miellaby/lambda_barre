@@ -230,3 +230,21 @@ il faut que l'action-décision voit l'EOS, mais aussi le contexte bien évidemme
 - à creuser: amplitude du bruit sur le critère de tri (sorted_coreset_indices noise=0.05)
 - à creuser: vivacity_pow (p) actuellement 1.0, tester > 1
 
+
+---
+
+## 7. Séquences « time-event » (symboliques, sans horloge fixe) — 2026-11-15
+
+### Rationale
+Les séquences actuelles sont cadencées par tick constant (3 Hz) : une salve de 16 tokens par tick, fenêtres de taille fixe. Or un geste (ex. relevement) dure plusieurs secondes et contient plusieurs extrema de consignes (extension + retour du pied = 2 extrema, parfois 3). Le tick sert surtout de bourrage entre deux moments clés du geste.
+
+### Proposition
+- **Unité de séquence = l'extremum de consigne** (déjà enregistré comme extrême local par tick), pas le tick : un token par moment clé du geste, avec le **délai vers la prochaine action en slot de la consigne** — pas d'horloge externe, longueur de séquence variable = complexité du geste (nombre d'extrema).
+- **Label « amorçage »** pour le dénouement : amorçage d'un run d'extrema à la décision (n_ctx) + signe conforme au geste futur enregistré → BON ; sinon NEUTRE. (Ne PAS seuiller la valeur absolue des consignes : ce sont des angles/distances.)
+- **Filtrage dataset** : garder les pôles (amorçage immédiat à n_ctx / vraiment neutre = aucun run + aucune inflexion de coût), lâcher les séquences à action tardive.
+
+### Impact attendu
+Convergence de l'apprentissage WM sur les séquences pertinentes ; le dénouement encode "l'action s'engage maintenant et débouche sur un soulagement".
+
+### Coût
+Réécriture de la géométrie : salves de 16 tokens, fenêtres de taille fixe, masque causal, positions de salve, buffer, théâtre. À faire APRÈS avoir validé le label amorçage dans l'architecture actuelle.

@@ -145,7 +145,8 @@ def run(headless: bool = False, steps: int = 0,
         device: str | None = None, bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
         eos_force_amp_lo: float = 0.1, eos_force_amp_hi: float = 0.5,
-        eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_max_p: float = 8.0,
+        eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
+        eos_max_p: float = 8.0,
         eos_force_amplify: float = 1.0,
         eos_force_amplify_threshold: float = 0.95,
         wm_impact_floor: float = 0.25,
@@ -155,7 +156,7 @@ def run(headless: bool = False, steps: int = 0,
         wm_w_eos: float = 16.0,
         wm_w_a4_lookahead: float = 1.0,
         freeze_physics: bool = False, no_smooth: bool = False,
-        wm_target_loss: float = 0.01,
+        wm_target_loss: float = 0.004,
         prune_pct: float = 0.33, surprise_factor: float = 0.5,
         prune_min_fill: float = 0.75, prune_beta: float = 2.0,
         dedup_eps: float = 0.02, surprise_floor: float = 0.001,
@@ -173,7 +174,7 @@ def run(headless: bool = False, steps: int = 0,
         # Training hyperparameters
         lr_wm: float = 3e-4, lr_pol: float = 2e-4,
         act_std: float = 0.0,
-        act_conseq_shift: int = 2,
+        act_conseq_shift: int = 1,
         tri_w_det: float = 1.0, tri_w_cons: float = 1.0,
         tri_w_viv: float = 1.0, tri_vivacity_pow: float = 1.0,
         wm_batch: int = 64,
@@ -230,7 +231,7 @@ def run(headless: bool = False, steps: int = 0,
                   eos_force_amp_lo=eos_force_amp_lo,
                   eos_force_amp_hi=eos_force_amp_hi,
                   eos_decay=eos_decay,
-                  eos_poids_chemin=eos_poids_chemin,
+                  eos_poids_chemin=eos_poids_chemin, eos_poids_arrivee=eos_poids_arrivee,
                   eos_max_p=eos_max_p,
                   eos_force_amplify=eos_force_amplify,
                   eos_force_amplify_threshold=eos_force_amplify_threshold,
@@ -276,7 +277,7 @@ def run(headless: bool = False, steps: int = 0,
     drag_ball_prev_pos = None
     drag_ball_vel = (0.0, 0.0)
     sleep_gen = None       # active sleep generator (None when not sleeping)
-    dream_theater = DreamTheater(R.WIDTH, R.HEIGHT)
+    dream_theater = DreamTheater(R.WIDTH, R.HEIGHT, max_history=pol_steps)
     dream_theater.coreset_size = brain.buffer.coreset_size
     dream_theater.addendum_size = len(brain.buffer) - brain.buffer.coreset_size
     show_dream = False     # manual inspection of last dream trajectory
@@ -369,7 +370,7 @@ def run(headless: bool = False, steps: int = 0,
                     status = "overlays on" if show_overlays else "overlays off"
                 elif ev.key == pygame.K_b:
                     auto = not auto
-                    # brain-on : k forcé à 0 ; brain-off : décalage (a_n ; s_{n-k})
+                    # brain-on : k forcé à 0 ; brain-off : décalage (s_{n-k} ; a_n)
                     brain.act_conseq_shift = 0 if auto else act_conseq_shift
                     # brain.clear_history() # toggling brain on/off doesn't justify clearing history
                     status = "BRAIN on" if auto else f"BRAIN off (manual, k={act_conseq_shift})"
@@ -682,7 +683,7 @@ def main() -> None:
         "bootstrap_dataset": 0,
         "pol_steps": 32, "wm_coreset_epoch": 5, "wm_addendum_epoch": 5, "wm_batch": 64,
         "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
+        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
         "eos_force_amplify": 1.0,
         "eos_force_amplify_threshold": 0.95,
         "wm_impact_floor": 0.25,
@@ -692,7 +693,7 @@ def main() -> None:
         "wm_w_eos": 16.0,
         "wm_w_a4_lookahead": 1.0,
         "freeze_physics": False, "no_smooth": False,
-        "wm_target_loss": 0.01,
+        "wm_target_loss": 0.004,
         "prune_pct": 0.33, "surprise_factor": 0.5,
         "prune_min_fill": 0.75, "prune_beta": 2.0,
         "dedup_eps": 0.02, "surprise_floor": 0.001,
@@ -705,7 +706,7 @@ def main() -> None:
         "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4,
         "act_std": 0.0,
-        "act_conseq_shift": 2,
+        "act_conseq_shift": 1,
         "tri_w_det": 1.0, "tri_w_cons": 1.0, "tri_w_viv": 1.0, "tri_vivacity_pow": 1.0,
         "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
@@ -765,7 +766,7 @@ def main() -> None:
     p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
                    help="action sampling std during wake")
     p.add_argument("--act-conseq-shift", type=int, default=argparse.SUPPRESS,
-                   help="brain-off action/consequence shift k: recorded pair is (a_n ; s_{n-k}), default 2")
+                   help="brain-off action/consequence shift k: recorded pair is (s_{n-k} ; a_n), default 1")
     p.add_argument("--tri-w-det", type=float, default=argparse.SUPPRESS,
                    help="poids du déterminisme dans le min-flou de tri du coreset (plateau WM)")
     p.add_argument("--tri-w-cons", type=float, default=argparse.SUPPRESS,

@@ -35,7 +35,7 @@ import torch
 
 from . import models as M
 from .dream import DreamStep, DreamTrajectory, DreamRecord
-from .models import build_salve_mask
+from .models import build_salve_mask, KVCache
 from .tokenize import (STATE_TOKENS, ACTION_TOKENS, SALVE_TOKENS, DENSE_DIM,
                        N_SIGNAL, _N_SIGNALS, N_POLICY_STATE, SIG_OFFSET,
                        _M_INTERO, _EOS_CHANNEL_W,
@@ -56,14 +56,17 @@ _N_CTX = N_CTX  # backward-compatible alias
 def compute_seq_layout(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_N_CTX) -> dict:
     """Géométrie de la séquence enregistrée (REFONTE.md) :
 
-        contexte | dénouement | conséquence inversée | action de décision
+        contexte | conséquence rétro-causale | action de décision
 
-    - contexte : ``[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]`` (``ctx_len`` tokens) ;
-    - dénouement : 1 token EOS à la position ``eos_pos = ctx_len`` ;
-    - conséquence inversée : les états post-décision du plus tardif au plus
-      précoce, ``s_{seq_steps} .. s_{n_ctx+1}`` (``n_imagine`` salves de 13
-      tokens, ``conseq_len`` tokens) ;
-    - action de décision : ``a_{n_ctx}`` (3 tokens) en fin de séquence.
+    - contexte : ``[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]`` (``ctx_len`` tokens,
+      ordre normal) ;
+    - conséquence rétro-causale, à partir de ``conseq_start = eos_pos = ctx_len`` :
+      unités de ``SALVE_TOKENS`` tokens pour ``k = seq_steps .. n_ctx+1`` —
+      ``s_k`` avec ses 13 tokens d'état **inversés** (token 12 en premier), puis
+      ``a_{k-1}`` (3 tokens, ordre interne normal). Le token 12 de la première
+      unité (``s_{seq_steps}``) est le **token de dénouement** : ``eos_pos`` ;
+    - action de décision : ``a_{n_ctx}`` (3 derniers tokens de la séquence,
+      ``action_pos``).
 
     ``decision_pos`` reste ``ctx_len`` : c'est la fin du contexte (dernier
     token = s_{n_ctx}) ; l'action de décision siège à ``action_pos``.
@@ -71,9 +74,9 @@ def compute_seq_layout(seq_steps: int = DEFAULT_SEQ_STEPS, n_ctx: int = DEFAULT_
     assert n_ctx < seq_steps, f"n_ctx ({n_ctx}) must be strictly less than seq_steps ({seq_steps})"
     ctx_len = n_ctx * SALVE_TOKENS + STATE_TOKENS
     eos_pos = ctx_len
+    conseq_start = eos_pos
     n_imagine = seq_steps - n_ctx
-    conseq_start = eos_pos + 1
-    conseq_len = n_imagine * STATE_TOKENS
+    conseq_len = (n_imagine - 1) * SALVE_TOKENS + STATE_TOKENS
     action_pos = conseq_start + conseq_len
     seq_len = action_pos + ACTION_TOKENS
     return {
@@ -94,8 +97,11 @@ def compute_salve_positions(seq_steps: int = DEFAULT_SEQ_STEPS,
                             n_ctx: int = DEFAULT_N_CTX) -> list[int]:
     """Position temporelle (indice de salve) de chaque token de la séquence
     enregistrée, pour l'encodage positionnel sinusoïdal keyed by salve :
-    contexte 0..n_ctx, EOS à ``seq_steps``, conséquence inversée
-    ``seq_steps..n_ctx+1`` (décroissant), action de décision à ``n_ctx``."""
+    contexte 0..n_ctx, puis conséquence rétro-causale — unité ``j``
+    (``k = seq_steps - j``) : les 13 tokens inversés de ``s_k`` à la position
+    ``k`` (dont le token de dénouement, ``eos_pos``, à ``seq_steps``), puis
+    ``a_{k-1}`` à la position ``k-1`` ; action de décision ``a_{n_ctx}`` à
+    ``n_ctx``."""
     layout = compute_seq_layout(seq_steps, n_ctx)
     sp = [0] * layout["seq_len"]
     for i in range(n_ctx):
@@ -103,10 +109,13 @@ def compute_salve_positions(seq_steps: int = DEFAULT_SEQ_STEPS,
             sp[i * SALVE_TOKENS + t] = i
     for t in range(STATE_TOKENS):
         sp[n_ctx * SALVE_TOKENS + t] = n_ctx
-    sp[layout["eos_pos"]] = seq_steps
     for j, k in enumerate(range(seq_steps, n_ctx, -1)):
+        base = layout["conseq_start"] + j * SALVE_TOKENS
         for t in range(STATE_TOKENS):
-            sp[layout["conseq_start"] + j * STATE_TOKENS + t] = k
+            sp[base + t] = k
+        if j < layout["n_imagine"] - 1:
+            for t in range(ACTION_TOKENS):
+                sp[base + STATE_TOKENS + t] = k - 1
     for t in range(ACTION_TOKENS):
         sp[layout["action_pos"] + t] = n_ctx
     return sp
@@ -118,9 +127,16 @@ def build_target_tables(seq_steps: int = DEFAULT_SEQ_STEPS,
     (la ligne p prédit le token p+1) :
 
     - poids 0 sur le contexte (tokens 0..ctx_len-1) : prompt, pas appris ;
-    - poids 1.0 sur tous les tokens à partir du dénouement (inclus) ;
-    - ``valid`` = slots de signal valides du token cible (EOS : 6 slots,
-      états : _N_SIGNALS[tidx], actions : _N_SIGNALS[13..15]).
+    - dénouement (EOS) : poids total ``ctx_len`` — autant que tout le contexte
+      en langage naturel (un poids par token de prompt) ;
+    - trajectoire (conséquence) et décision (``action_pos..+3``) : poids total
+      1.0 chacun, per-slot ``1 / nb_slots_valides_du_groupe`` ;
+    - ``valid`` = slots de signal valides du token cible : token de dénouement
+      (``eos_pos``) : 6 slots ; décision ``a_{n_ctx}`` (``action_pos..+3``) :
+      tokens 13..15 ; conséquence rétro-causale (à partir de ``conseq_start``) :
+      unité de 16 tokens (``s_k`` inversée puis ``a_{k-1}``), le token d'état à
+      l'offset ``off`` est le token ``STATE_TOKENS-1-off``, l'action à
+      l'offset ``13+i`` est le token ``STATE_TOKENS+i``.
     """
     layout = compute_seq_layout(seq_steps, n_ctx)
     seq_len = layout["seq_len"]
@@ -137,11 +153,23 @@ def build_target_tables(seq_steps: int = DEFAULT_SEQ_STEPS,
         elif q < ctx_len:
             n = _N_SIGNALS[q % SALVE_TOKENS]
         elif q < action_pos:
-            n = _N_SIGNALS[(q - conseq_start) % STATE_TOKENS]
+            off = (q - conseq_start) % SALVE_TOKENS
+            tidx = STATE_TOKENS - 1 - off if off < STATE_TOKENS else off
+            n = _N_SIGNALS[tidx]
         else:
             n = _N_SIGNALS[STATE_TOKENS + (q - action_pos)]
         valid[p, :n] = True
         weight[p, :n] = 0.0 if q < ctx_len else 1.0
+    # Le modèle apprend P(action, conséquence | contexte, dénouement) :
+    # contexte et dénouement sont des variables de conditionnement qui valent
+    # chacune "1" — le groupe EOS pèse donc 1.0, comme la trajectoire
+    # (conséquence) et la décision (action). Per-slot : 1 / nb_slots_valides.
+    groups = (slice(eos_pos - 1, eos_pos),                 # dénouement
+              slice(eos_pos, action_pos - 1),              # trajectoire
+              slice(action_pos - 1, seq_len - 1))          # décision (dernière action)
+    for rows in groups:
+        n = int(valid[rows].sum().item())
+        weight[rows] = valid[rows].float() / n
     return valid, weight
 
 
@@ -150,6 +178,8 @@ _EOS_CANAL = (0.0, 0.0, 1.0, 0.0)
 _EOS_NSLOTS = 6
 _EOS_DECAY = 0.9          # décroissance temporelle de l'écart au but dans l'EOS
 _EOS_POIDS_CHEMIN = 0.1   # poids du coût du chemin dans le progrès par canal
+_EOS_POIDS_ARRIVEE = 2.0  # poids de l'arrivée précoce au niveau final c[fin]
+_EOS_ARRIVEE_TAU = 0.1    # température de la sigmoïde "sous le niveau final"
 _EOS_MAX_P = 8.0          # exposant du max flou agrégeant les canaux (relief_score)
 _EOS_CHANNEL_W_T = (torch.tensor(_EOS_CHANNEL_W, dtype=torch.float32)
                     / sum(_EOS_CHANNEL_W))                   # sums to 1
@@ -163,11 +193,23 @@ _EOS_TEMPLATE = torch.tensor(
 
 def _eos_slots_of_window(window: list, n_ctx: int = DEFAULT_N_CTX,
                          decay: float = _EOS_DECAY,
-                         poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[float]:
+                         poids_chemin: float = _EOS_POIDS_CHEMIN,
+                         poids_arrivee: float = _EOS_POIDS_ARRIVEE) -> list[float]:
     """Les 6 slots du token dénouement d'une fenêtre temporelle de salves
     (seq_steps+1 salves de 16 tokens) : progrès par canal
-    f = P - poids_chemin*A, P = c[s_{n_ctx}] - c[fin], A = Σ_k decay^k (c[s_{n_ctx+1+k}] - c[fin]).
-    Slot 5 = inconfort (-confort). 0.5 = neutre."""
+    r = P - poids_chemin*A + poids_arrivee*max(0,P)*early,
+    P = c[s_{n_ctx}] - c[fin],
+    A = Σ_k decay^k · max(0, c[k] - line(k))  où line(k) est la droite
+    c[s_{n_ctx}] -> c[fin] : seul l'excès AU-DESSUS de la trajectoire attendue
+    (détour) est pénalisé — un pic qui suit la droite (poussée vers le
+    relevement, seq 12) ne l'est pas, un geste parasite tardif (seq 106) si.
+    early = Σ_k w_k·σ((c[fin]-c[k])/tau) / Σ_k w_k, w_k = decay^(k-n_ctx-1),
+    k après la décision : fraction douce du temps passé sous le niveau
+    final — arriver tôt à c[fin] est un bonus, proportionnel au progrès P
+    (un canal sans progrès ne gagne rien). Forme fermée, pas de seuil.
+    Slot 5 = inconfort (-confort). 0.5 = neutre. Squash en tanh (et non
+    r/(1+|r|)) : dérivée 1 en 0, ~0.42 à r=1 — les différences de progrès
+    restent visibles au lieu d'être écrasées autour de 0.5."""
     L = len(window)
     if L <= n_ctx + 1:
         return [0.5] * _EOS_NSLOTS
@@ -179,11 +221,25 @@ def _eos_slots_of_window(window: list, n_ctx: int = DEFAULT_N_CTX,
             c.append(row)
         P = [c[n_ctx][j] - c[-1][j] for j in range(_EOS_NSLOTS)]
         out = []
+        n_fut = L - 1 - n_ctx
         for j in range(_EOS_NSLOTS):
-            diffs = [(c[k][j] - c[-1][j]) * decay ** (k - n_ctx - 1) for k in range(n_ctx + 1, L)]
-            A = sum(diffs)
-            r = P[j] - poids_chemin * A
-            out.append(0.5 + 0.5 * r / (1.0 + abs(r)))
+            # détour = excès au-dessus de la droite décision -> fin
+            c0, c1 = c[n_ctx][j], c[-1][j]
+            A = 0.0
+            for k in range(n_ctx + 1, L):
+                line = c0 + (c1 - c0) * (k - n_ctx) / n_fut
+                A += max(0.0, c[k][j] - line) * decay ** (k - n_ctx - 1)
+            # arrivée précoce au niveau final, forme fermée : fraction douce
+            # du temps (pondéré decay) passé SOUS c[fin], via sigmoïde
+            # s(k) = σ((c1 - c[k])/tau) — pas de seuil/argmax procédural
+            acc, wsum = 0.0, 0.0
+            for k in range(n_ctx + 1, L):
+                w = decay ** (k - n_ctx - 1)
+                acc += w / (1.0 + math.exp(-(c1 - c[k][j]) / _EOS_ARRIVEE_TAU))
+                wsum += w
+            early = acc / wsum if wsum > 0.0 else 0.0
+            r = P[j] - poids_chemin * A + poids_arrivee * max(0.0, P[j]) * early
+            out.append(0.5 + 0.5 * math.tanh(r))
         return out
     except (IndexError, TypeError):
         return [0.5] * _EOS_NSLOTS
@@ -200,35 +256,45 @@ def eos_token_from_slots(slots) -> list[float]:
 
 def build_sequence(window: list, n_ctx: int = DEFAULT_N_CTX,
                    decay: float = _EOS_DECAY,
-                   poids_chemin: float = _EOS_POIDS_CHEMIN) -> list[list[float]]:
+                   poids_chemin: float = _EOS_POIDS_CHEMIN,
+                   poids_arrivee: float = _EOS_POIDS_ARRIVEE) -> list[list[float]]:
     """Réordonne une fenêtre temporelle de ``seq_steps+1`` salves en séquence
     enregistrée (liste plate de ``seq_len`` tokens) :
 
-        contexte | dénouement | conséquence inversée | action de décision
+        contexte | conséquence rétro-causale (incluant l'action de décision)
 
-    - contexte : salves complètes ``s_i+a_i`` (i < n_ctx) puis ``s_{n_ctx}`` seul ;
-    - dénouement : 1 token calculé depuis la fenêtre (ground truth) ;
-    - conséquence inversée : états seuls ``s_{seq_steps} .. s_{n_ctx+1}`` ;
-    - action de décision : ``a_{n_ctx}`` (3 tokens), dernier token de la séquence.
+    - contexte : salves complètes ``s_i+a_i`` (i < n_ctx) puis ``s_{n_ctx}`` seul,
+      ordre normal ;
+    - conséquence rétro-causale, pour ``k = seq_steps .. n_ctx+1`` : ``s_k``
+      avec ses 13 tokens d'état **inversés** (token 12 en premier), puis
+      ``a_{k-1}`` (3 tokens, ordre interne normal). Pour ``k = seq_steps``, le
+      token 12 est remplacé par le **token de dénouement** calculé depuis la
+      fenêtre (ground truth) — premier token de la séquence après le contexte.
     """
     seq_steps = len(window) - 1
     seq: list[list[float]] = []
     for i in range(n_ctx):
         seq.extend(window[i])                              # s_i + a_i
     seq.extend(state_tokens(window[n_ctx]))                # s_{n_ctx}
-    seq.append(eos_token_from_slots(
-        _eos_slots_of_window(window, n_ctx=n_ctx, decay=decay, poids_chemin=poids_chemin)))
-    for k in range(seq_steps, n_ctx, -1):                  # conséquence inversée
-        seq.extend(state_tokens(window[k]))
-    seq.extend(action_tokens(window[n_ctx]))               # a_{n_ctx}
+    eos = eos_token_from_slots(
+        _eos_slots_of_window(window, n_ctx=n_ctx, decay=decay, poids_chemin=poids_chemin,
+                             poids_arrivee=poids_arrivee))
+    for k in range(seq_steps, n_ctx, -1):                  # conséquence rétro-causale
+        s_toks = state_tokens(window[k])
+        if k == seq_steps:
+            seq.append(eos)                                # token de dénouement (token 12 de s26)
+            seq.extend(s_toks[:STATE_TOKENS - 1][::-1])    # tokens 11..0 inversés
+        else:
+            seq.extend(s_toks[::-1])                       # tokens 12..0 inversés
+        seq.extend(action_tokens(window[k - 1]))           # a_{k-1} ; dernier = a_{n_ctx}
     return seq
 
 
 def sequence_to_window(seq: list, n_ctx: int = DEFAULT_N_CTX,
                        seq_steps: int = DEFAULT_SEQ_STEPS) -> list[list[list[float]]]:
     """Inverse de ``build_sequence`` (pour l'affichage) : reconstruit la fenêtre
-    temporelle de ``seq_steps+1`` salves. Les actions a_{n_ctx+1..} ne sont pas
-    dans la séquence enregistrée : elles sont laissées à zéro."""
+    temporelle de ``seq_steps+1`` salves. ``a_{seq_steps}`` n'est pas dans la
+    séquence enregistrée : laissée à zéro."""
     layout = compute_seq_layout(seq_steps, n_ctx)
     ctx_len = layout["ctx_len"]
     conseq_start = layout["conseq_start"]
@@ -240,10 +306,19 @@ def sequence_to_window(seq: list, n_ctx: int = DEFAULT_N_CTX,
     a_dec = [list(t) for t in seq[action_pos:action_pos + ACTION_TOKENS]]
     window.append(s_dec + a_dec)
     for k in range(n_ctx + 1, seq_steps + 1):              # s_{n_ctx+1} .. s_{seq_steps}
-        j = seq_steps - k                                  # position dans la conséquence inversée
-        s = [list(t) for t in seq[conseq_start + j * STATE_TOKENS:
-                                  conseq_start + (j + 1) * STATE_TOKENS]]
-        window.append(s + [[0.0] * DENSE_DIM] * ACTION_TOKENS)
+        j = seq_steps - k                                  # unité de la conséquence (k = seq_steps - j)
+        base = conseq_start + j * SALVE_TOKENS
+        s = [list(t) for t in seq[base:base + STATE_TOKENS][::-1]]   # ré-inverser s_k
+        if k == seq_steps:
+            # le token 12 de s_{seq_steps} a été remplacé par le token de
+            # dénouement à l'enregistrement : intero remis à zéro
+            s[_INTERO_IDX][SIG_OFFSET:] = [0.0] * N_SIGNAL
+        if k < seq_steps:
+            ab = conseq_start + (j - 1) * SALVE_TOKENS + STATE_TOKENS
+            a = [list(t) for t in seq[ab:ab + ACTION_TOKENS]]        # a_k dans l'unité de k+1
+        else:
+            a = [[0.0] * DENSE_DIM] * ACTION_TOKENS
+        window.append(s + a)
     return window
 
 
@@ -328,7 +403,8 @@ class ExperienceBuffer:
     def __init__(self, seq_len: int = DEFAULT_SEQ_STEPS + 1, capacity: int = 1000,
                  pool_capacity: int = 1000, seed: int = 0,
                  n_ctx: int | None = None,
-                 eos_decay: float = _EOS_DECAY, eos_poids_chemin: float = _EOS_POIDS_CHEMIN):
+                 eos_decay: float = _EOS_DECAY, eos_poids_chemin: float = _EOS_POIDS_CHEMIN,
+                 eos_poids_arrivee: float = _EOS_POIDS_ARRIVEE):
         self.seq_len = seq_len                      # salves per temporal window
         self.capacity = capacity
         self.pool_capacity = pool_capacity
@@ -339,6 +415,7 @@ class ExperienceBuffer:
             self.n_ctx = n_ctx
         self.eos_decay = eos_decay
         self.eos_poids_chemin = eos_poids_chemin
+        self.eos_poids_arrivee = eos_poids_arrivee
         self._segments: deque[list[list[float]]] = deque()
         self._current: list[list[float]] = []
         self._coreset: list[list[list[float]]] = []
@@ -423,7 +500,8 @@ class ExperienceBuffer:
                 window = seg[offset:offset + self.seq_len]
                 self._addendum.append(build_sequence(
                     window, n_ctx=self.n_ctx, decay=self.eos_decay,
-                    poids_chemin=self.eos_poids_chemin))
+                    poids_chemin=self.eos_poids_chemin,
+                    poids_arrivee=self.eos_poids_arrivee))
                 self._addendum_meta.append(self._default_meta("wake"))
                 added += 1
         self._segments.clear()
@@ -550,7 +628,8 @@ class ExperienceBuffer:
             seg = valid_segs[seg_i]
             out.append(build_sequence(seg[offset:offset + self.seq_len],
                                       n_ctx=self.n_ctx, decay=self.eos_decay,
-                                      poids_chemin=self.eos_poids_chemin))
+                                      poids_chemin=self.eos_poids_chemin,
+                                      poids_arrivee=self.eos_poids_arrivee))
         return out
 
 
@@ -575,13 +654,17 @@ class Brain:
                  buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                  eos_decay: float = _EOS_DECAY,
                  eos_poids_chemin: float = _EOS_POIDS_CHEMIN,
+                 eos_poids_arrivee: float = _EOS_POIDS_ARRIVEE,
                  eos_max_p: float = _EOS_MAX_P,
                  # inférence du dénouement : échantillonnage + élection
-                 eos_temperature: float = 0.05,
-                 eos_top_k: int = 8,
-                 eos_top_p: float = 0.9,
+                 # K grand : les top_n plus probables de K tirages convergent
+                 # vers µ (avec K=8 ils restaient à ±0.4 de µ)
+                 eos_temperature: float = 0.3,
+                 eos_top_k: int = 64,
+                 eos_top_n: int = 3,
                  eos_w_fav: float = 1.0,
-                 eos_satisfying: float = 0.0,
+                 ctx_attn_boost: float = math.log(2.0),
+                 wm_impact_floor: float = 0.25,
                  **_legacy):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
@@ -610,24 +693,33 @@ class Brain:
             lr=lr_pol)
         self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
                                        eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
+                                       eos_poids_arrivee=eos_poids_arrivee,
                                        capacity=buffer_capacity,
                                        pool_capacity=buffer_pool_capacity)
         # Positions temporelles (PE sinusoïdal) et tables de loss du layout.
         self.salve_positions = torch.tensor(
             compute_salve_positions(seq_steps, n_ctx), dtype=torch.long, device=self.device)
-        self.mask = build_salve_mask(self.seq_len, self.device)
+        # Biais additif sur les clés du contexte dans le masque d'attention
+        # (ln 2 -> poids d'attention du contexte x2), appliqué en entraînement
+        # (self.mask) et en génération (cache_forward) pour rester cohérent.
+        self.ctx_attn_boost = ctx_attn_boost
+        self.wm_impact_floor = wm_impact_floor
+        self.mask = build_salve_mask(self.seq_len, self.device,
+                                     ctx_len=layout["ctx_len"], boost=ctx_attn_boost)
         t_valid, t_weight = build_target_tables(seq_steps, n_ctx)
         self.target_valid = t_valid.to(self.device)
         self.target_weight = t_weight.to(self.device)
         self._eos_tmpl = _EOS_TEMPLATE.to(self.device)
         self.eos_decay = eos_decay
         self.eos_poids_chemin = eos_poids_chemin
+        self.eos_poids_arrivee = eos_poids_arrivee
         self.eos_max_p = eos_max_p
         self.eos_temperature = eos_temperature
         self.eos_top_k = eos_top_k
-        self.eos_top_p = eos_top_p
+        self.eos_top_n = eos_top_n
         self.eos_w_fav = eos_w_fav
-        self.eos_satisfying = eos_satisfying
+        # (eos_satisfying supprimé : l'observé gagne désormais par comparaison
+        #  directe relief(obs) > relief(élu), sans seuil)
         n_im = max(1, self.seq_steps - self.n_ctx)
         self._eos_decay_pow = torch.tensor([eos_decay ** k for k in range(n_im)],
                                            dtype=torch.float32, device=self.device)
@@ -672,9 +764,11 @@ class Brain:
         self._static_threshold = 6
         self._static_tol = 1e-4
         # Décalage action/conséquence en mode brain-off : la paire enregistrée
-        # est (a_{n-k} ; s_n) — action retardée, état courant. 0 = brain-on.
+        # est (s_{n-k} ; a_n) — l'état est lu k crans en arrière dans
+        # _wake_history (l'historique qui alimente déjà le WM), l'action
+        # courante est gardée : s_i appairé à a_{i+k} (k=1 → s_i/a_{i+1}),
+        # pour annuler la latence de réaction de l'utilisateur. 0 = brain-on.
         self.act_conseq_shift = 0
-        self._act_hist: list[list[list[float]]] = []
 
     # --- live loop -----------------------------------------------------------
     def _sync_device(self) -> None:
@@ -742,16 +836,17 @@ class Brain:
 
     def record(self, salve) -> bool:
         """Journal one temporal salve into the experience buffer (with the
-        brain-off action/consequence shift k when act_conseq_shift > 0)."""
+        brain-off action/consequence shift k when act_conseq_shift > 0:
+        recorded pair (s_{n-k}, a_n) — state read k ticks back in
+        _wake_history, current action kept; called from record_tick, so
+        _wake_history[-1] is the current salve)."""
         if hasattr(salve, "tolist"):
             salve = salve.tolist()
-        if self.act_conseq_shift > 0:
-            self._act_hist.append(action_tokens(salve))
-            if len(self._act_hist) > self.act_conseq_shift + 1:
-                self._act_hist.pop(0)
-            if len(self._act_hist) > self.act_conseq_shift:
-                shifted = self._act_hist[-self.act_conseq_shift - 1]
-                salve = [list(t) for t in state_tokens(salve)] + [list(t) for t in shifted]
+        k = self.act_conseq_shift
+        if k > 0 and len(self._wake_history) > k:
+            s_old = self._wake_history[-k - 1][0]
+            a_cur = self._wake_history[-1][1]
+            salve = [list(t) for t in s_old] + [list(t) for t in a_cur]
         if self._last_salve is None:
             moved = True
         else:
@@ -809,43 +904,83 @@ class Brain:
     def _batch_tensors(self, sequences) -> torch.Tensor:
         """Stack recorded sequences (flat token lists) into [B, seq_len, 25].
         Zeroes the interoception slots of every state salve (the carrier of the
-        outcome signal stays masked from the WM inputs)."""
+        outcome signal stays masked from the WM inputs) — except the token de
+        dénouement at ``eos_pos``, which stays visible as a WM input (teacher
+        forcing of the rétro-causal consequence)."""
         B = len(sequences)
         vals = torch.zeros(B, self.seq_len, DENSE_DIM, device=self.device)
         for b, seq in enumerate(sequences):
             assert len(seq) == self.seq_len, \
                 f"recorded sequence has {len(seq)} tokens, expected {self.seq_len}"
             vals[b] = torch.tensor(seq, dtype=torch.float32, device=self.device)
-        # intero slots: contexte (salves 0..n_ctx) + conséquence inversée
+        # intero slots: contexte (salves 0..n_ctx) + conséquence rétro-causale
+        # (offset 0 de chaque unité = token 12 inversé), sauf eos_pos (unité 0)
         intero_pos = [k * SALVE_TOKENS + _INTERO_IDX for k in range(self.n_ctx + 1)]
-        intero_pos += [self.conseq_start + j * STATE_TOKENS + _INTERO_IDX
-                       for j in range(self.n_imagine)]
+        intero_pos += [self.conseq_start + j * SALVE_TOKENS
+                       for j in range(1, self.n_imagine)]
         vals[:, intero_pos, SIG_OFFSET:] = 0.0
         return vals
 
     # --- WM training -----------------------------------------------------------
-    def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+    def _wm_masked_mse(self, pred: torch.Tensor, vals: torch.Tensor,
+                       seq_weights: torch.Tensor | None = None) -> torch.Tensor:
         """Masked MSE over valid signal slots. The target table weights 0 the
-        context rows (prompt) and 1.0 every row from the dénouement on."""
+        context rows (prompt) and 1.0 every row from the dénouement on.
+        ``seq_weights`` (optionnel) pondère chaque séquence du batch — utilisé
+        pour l'impact-proportional training : poids = max(|relief(seq)|, floor)."""
         pred_signals = pred[:, :-1, :]                   # [B, L-1, 16]
         tgt_signals = vals[:, 1:, SIG_OFFSET:]           # [B, L-1, 16]
         w = self.target_weight.unsqueeze(0).expand_as(pred_signals)
         sq = (pred_signals - tgt_signals) ** 2
         sqm = (sq * w).sum(dim=(1, 2))                   # [B]
         wsum = w.sum(dim=(1, 2)).clamp(min=1.0)          # [B]
-        return (sqm / wsum).mean()
+        per_seq = sqm / wsum                             # [B]
+        if seq_weights is None:
+            return per_seq.mean()
+        sw = seq_weights.to(per_seq.device)
+        return (per_seq * sw).sum() / sw.sum().clamp(min=1e-8)
 
-    def _wm_loss_impl(self, vals: torch.Tensor) -> torch.Tensor:
+    def _wm_loss_impl(self, vals: torch.Tensor,
+                      seq_weights: torch.Tensor | None = None) -> torch.Tensor:
         """One forward, one loss: causal mask + salve positions over the whole
-        recorded sequence, MSE on all tokens from the dénouement on."""
+        recorded sequence, MSE on all tokens from the dénouement on. Le token
+        dénouement reste inconditionnellement dans l'entrée (teacher forcing) :
+        la conséquence est conditionnée par contexte ET dénouement."""
         pred = self.world(vals, attn_mask=self.mask, is_causal=True,
                           salve_positions=self.salve_positions)
-        return self._wm_masked_mse(pred, vals)
+        return self._wm_masked_mse(pred, vals, seq_weights)
+
+    def _seq_effort(self, seq: list, k: int) -> float:
+        """Coût 'effort' (canal 0 du token Coûts) de la salve k d'une séquence
+        enregistrée — contexte (ordre normal) ou conséquence rétro-causale
+        (état inversé : unité j, offset STATE_TOKENS-1-_COST_IDX)."""
+        if k <= self.n_ctx:
+            tok = seq[k * SALVE_TOKENS + _COST_IDX]
+        else:
+            j = self.seq_steps - k
+            off = STATE_TOKENS - 1 - _COST_IDX
+            tok = seq[self.conseq_start + j * SALVE_TOKENS + off]
+        return tok[SIG_OFFSET]
+
+    def _seq_impact(self, seq: list) -> float:
+        """Impact d'une séquence enregistrée (ADR-0001 enrichi) :
+        |relief| × amorçage, avec amorçage = max(0.5, effort[S{n_ctx+1}] −
+        effort[S{n_ctx}]) — le pic d'effort juste après la décision dit que
+        l'action s'engage maintenant ; plancher wm_impact_floor."""
+        rel = abs(float(relief_score(seq, eos_pos=self.eos_pos)))
+        d_effort = self._seq_effort(seq, self.n_ctx + 1) - self._seq_effort(seq, self.n_ctx)
+        amorcage = max(0.5, d_effort)
+        return max(rel * amorcage, self.wm_impact_floor)
 
     def _train_wm_batch(self, sequences) -> float:
-        """One WM optimization step on a batch of recorded sequences."""
+        """One WM optimization step on a batch of recorded sequences.
+        Impact-proportional training : chaque séquence est pondérée par
+        ``_seq_impact`` — fort soulagement ET action amorcée à la décision
+        pèsent plus que les séquences tardives ou neutres."""
         vals = self._batch_tensors(sequences)
-        loss = self._wm_loss(vals)
+        impacts = [self._seq_impact(s) for s in sequences]
+        seq_w = torch.tensor(impacts, dtype=torch.float32, device=self.device)
+        loss = self._wm_loss(vals, seq_w)
         self.opt_wm.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
@@ -881,14 +1016,17 @@ class Brain:
             self.sleep_wm_batch = 0
             epoch_losses = []
             skip = False
-            for start in range(0, n, batch):
+            for start in range(0, max(n, 1), batch):
                 idxs = order[start:start + batch]
                 self.sleep_wm_batch = start // batch + 1
                 batch_seqs = [seqs_all[i] for i in idxs]
                 if fixed_seq is not None:
                     fs = fixed_seq() if callable(fixed_seq) else fixed_seq
-                    batch_seqs = [fs] + batch_seqs
+                    if fs is not None:
+                        batch_seqs = [fs] + batch_seqs
                 if not batch_seqs:
+                    if n == 0:
+                        return  # source vide et fixed_seq None : rien à entraîner
                     continue
                 loss_c = self._train_wm_batch(batch_seqs)
                 epoch_losses.append(loss_c)
@@ -983,19 +1121,21 @@ class Brain:
     @torch.inference_mode()
     def sample_denouements(self, ctx: torch.Tensor, k: int | None = None,
                            temperature: float | None = None,
-                           top_p: float | None = None,
+                           top_n: int | None = None,
                            eos_observed: torch.Tensor | None = None
                            ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Échantillonnage du dénouement depuis le contexte (REFONTE.md) :
+        """Échantillonnage du dénouement depuis le contexte, en 2 étapes :
 
         - le WM prédit la moyenne conditionnelle µ (vecteur continu, 6 slots) ;
-        - on tire K vecteurs v ~ N(µ, T²) (température T), top-K/top-p sur les
-          tirages (densité gaussienne) ;
-        - chaque tirage est noté f(probable, favorable) = log p(v) + w_fav * relief(v) ;
-        - le meilleur est élu (pas nécessairement le plus probable).
+        - on tire K vecteurs v ~ N(µ, T²) (température T) ;
+        - étape 1 : on ne garde que les ``top_n`` tirages les plus probables
+          (top-n absolu par logp, pas une masse cumulée — avec K faible un
+          top-p à 0.9 garderait tout) ;
+        - étape 2 : parmi ce noyau, on élit celui de meilleur relief.
 
-        Règle de l'observé : si ``eos_observed`` est fourni et que son relief
-        atteint ``eos_satisfying``, on reste sur l'observé (p = 1).
+        Règle de l'observé : si ``eos_observed`` est fourni, il remplace l'élu
+        uniquement quand son relief dépasse strictement celui de l'élu (p = 1
+        dans ce cas) — pas de seuil arbitraire.
 
         Returns (eos_elu [B, 6], p_elu [B]) — p_elu = softmax(log p) du tirage élu.
         """
@@ -1008,23 +1148,27 @@ class Brain:
         v = (mu.unsqueeze(1) + T * eps).clamp(0.0, 1.0)          # [B, K, 6]
         logp = (-0.5 * ((v - mu.unsqueeze(1)) / T) ** 2).sum(dim=-1) \
             - _EOS_NSLOTS * math.log(T * math.sqrt(2.0 * math.pi))   # [B, K]
-        # top-p : plus petit préfixe des tirages triés par logp dont la masse
-        # softmax cumulée atteint top_p
-        if top_p is not None and 0.0 < top_p < 1.0:
-            p_sort, order = torch.sort(logp, dim=1, descending=True)
-            cum = torch.softmax(p_sort, dim=1).cumsum(dim=1)
-            keep = cum <= top_p
-            keep[:, 0] = True                                   # au moins le plus probable
-            logp = logp.scatter(1, order, torch.where(keep, p_sort, torch.full_like(p_sort, float("-inf"))))
+        # étape 1 — top-n absolu : les n tirages de plus haut logp
+        # (argsort en coordonnées originales, on garde les n_keep premiers)
+        eligible = torch.ones(B, K, dtype=torch.bool, device=device)
+        n_keep = top_n if top_n is not None else self.eos_top_n
+        n_keep = max(1, min(int(n_keep), K))
+        if n_keep < K:
+            order = torch.argsort(logp, dim=1, descending=True)   # [B, K]
+            eligible = torch.zeros(B, K, dtype=torch.bool, device=device)
+            eligible.scatter_(1, order[:, :n_keep], True)
+            logp = torch.where(eligible, logp, torch.full_like(logp, float("-inf")))
         relief = relief_score(v, p=self.eos_max_p)              # [B, K]
-        f = logp + self.eos_w_fav * relief
-        elu = f.argmax(dim=1)                                   # [B]
+        # étape 2 — élection par meilleur relief, UNIQUEMENT dans le noyau top-n
+        # (sinon l'élu peut être un tirage de probabilité ~0, irréaliste)
+        elu = torch.where(eligible, relief, torch.full_like(relief, float("-inf"))).argmax(dim=1)
         b_idx = torch.arange(B, device=device)
         eos_elu = v[b_idx, elu]                                 # [B, 6]
         p_elu = torch.softmax(logp, dim=1)[b_idx, elu]          # [B]
-        if eos_observed is not None and self.eos_satisfying is not None:
+        if eos_observed is not None:
+            # l'observé ne gagne que s'il soulage strictement plus que l'élu tiré
             rel_obs = relief_score(eos_observed, p=self.eos_max_p)
-            use_obs = rel_obs >= self.eos_satisfying
+            use_obs = rel_obs > relief[b_idx, elu]
             eos_elu = torch.where(use_obs.unsqueeze(1), eos_observed, eos_elu)
             p_elu = torch.where(use_obs, torch.ones_like(p_elu), p_elu)
         return eos_elu, p_elu
@@ -1032,10 +1176,11 @@ class Brain:
     @torch.inference_mode()
     def generate_from_denouement(self, ctx: torch.Tensor,
                                  eos_vec: torch.Tensor) -> dict:
-        """Génération auto-régressive depuis ``[contexte, dénouement élu]`` :
-        déroule la conséquence inversée (``conseq_len`` tokens d'état, du plus
-        tardif au plus précoce) jusqu'à l'action de décision (3 derniers
-        tokens de la séquence). Masque strictement causal, positions explicites.
+        """Génération auto-régressive depuis ``[contexte, token de dénouement]`` :
+        déroule la conséquence rétro-causale (unités de 16 tokens ``s_k``
+        inversée + ``a_{k-1}``, de ``k=seq_steps`` à ``k=n_ctx+1``) jusqu'à
+        l'action de décision (3 derniers tokens de la séquence). Masque
+        strictement causal (KV-cache), positions explicites.
 
         Returns dict with ``conseq`` [B, conseq_len, 25], ``action`` [B, 3, 25],
         ``full`` [B, seq_len, 25]."""
@@ -1043,20 +1188,28 @@ class Brain:
         device = ctx.device
         eos_toks = self._eos_tmpl.unsqueeze(0).expand(B, -1).clone()
         eos_toks[:, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS] = eos_vec
-        curr = torch.cat([ctx, eos_toks.unsqueeze(1)], dim=1)   # [B, ctx_len+1, 25]
-        n_gen = self.conseq_len + ACTION_TOKENS
+        n_gen = self.seq_len - 1 - self.ctx_len                  # tokens après le dénouement forcé
+        # masque strictement causal : la génération passe par le KV-cache
+        # (prompt [ctx, dénouement] en un bloc, puis un token à la fois)
+        cache = KVCache(len(self.world.transformer.layers), self.world.d_model, B, device)
+        prompt = torch.cat([ctx, eos_toks.unsqueeze(1)], dim=1)  # [B, ctx_len+1, 25]
+        out = self.world.cache_forward(prompt, cache,
+                                       positions=self.salve_positions[:prompt.shape[1]],
+                                       ctx_len=self.ctx_len, ctx_boost=self.ctx_attn_boost)
         gen = []
         for t in range(n_gen):
-            L = curr.shape[1]
-            out = self.world(curr, attn_mask=build_salve_mask(L, device),
-                             is_causal=True,
-                             salve_positions=self.salve_positions[:L])
-            sig = out[:, -1, :].clamp(0.0, 1.0)
+            sig = out[:, -1, :].clamp(0.0, 1.0)                  # prédit le token q
             q = self.ctx_len + 1 + t                             # token en cours de génération
             if q < self.action_pos:
-                tidx = (q - self.conseq_start) % STATE_TOKENS
-                tmpl = self.world.state_template[tidx].to(device)
-                vm = self.world.state_valid_mask[tidx].to(device)
+                off = (q - self.conseq_start) % SALVE_TOKENS
+                if off < STATE_TOKENS:
+                    tidx = STATE_TOKENS - 1 - off                # s_k inversée
+                    tmpl = self.world.state_template[tidx].to(device)
+                    vm = self.world.state_valid_mask[tidx].to(device)
+                else:
+                    i = off - STATE_TOKENS                       # a_{k-1}
+                    tmpl = self.world.action_template[i].to(device)
+                    vm = self.world.action_valid_mask[i].to(device)
             else:
                 i = q - self.action_pos
                 tmpl = self.world.action_template[i].to(device)
@@ -1064,18 +1217,23 @@ class Brain:
             sig = sig * vm
             tok = tmpl.unsqueeze(0).expand(B, -1).clone()
             tok[:, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = sig
-            # cohérence entraînement/génération : le token intero des états de
-            # la conséquence est masqué (à 0) dans les entrées du WM
-            if self.conseq_start <= q < self.action_pos \
-                    and (q - self.conseq_start) % STATE_TOKENS == _INTERO_IDX:
+            # cohérence entraînement/génération : le token intero des états
+            # générés de la conséquence est masqué (à 0) dans les entrées du WM
+            # (offset 0 de l'unité = token 12 inversé ; l'unité 0 = eos_pos est
+            # dans le prompt, jamais regénérée)
+            if self.conseq_start < q < self.action_pos \
+                    and (q - self.conseq_start) % SALVE_TOKENS == 0:
                 tok[:, SIG_OFFSET:] = 0.0
             gen.append(tok)
-            curr = torch.cat([curr, tok.unsqueeze(1)], dim=1)
-        gen = torch.stack(gen, dim=1)                            # [B, n_gen, 25]
+            out = self.world.cache_forward(tok.unsqueeze(1), cache,
+                                           positions=self.salve_positions[q:q + 1],
+                                           ctx_len=self.ctx_len, ctx_boost=self.ctx_attn_boost)
+        gen = torch.stack(gen, dim=1)                            # [B, n_gen, 25], tokens ctx_len+1..seq_len-1
+        gen_c = torch.cat([eos_toks.unsqueeze(1), gen], dim=1)   # [B, conseq_len+3, 25], depuis eos_pos
         return {
-            "conseq": gen[:, :self.conseq_len, :],
-            "action": gen[:, self.conseq_len:, :],
-            "full": torch.cat([ctx, eos_toks.unsqueeze(1), gen], dim=1),
+            "conseq": gen_c[:, :self.conseq_len, :],             # inclut le token de dénouement en position 0
+            "action": gen_c[:, self.conseq_len:, :],             # a_{n_ctx}, 3 derniers tokens
+            "full": torch.cat([ctx, gen_c], dim=1),              # [B, seq_len, 25]
         }
 
     @torch.inference_mode()
@@ -1155,7 +1313,11 @@ class Brain:
         a_star = self._decode_action_batch(gen_action_inf.clone())   # [B, 5]
         pred = self.policy(pol_in)
         per_seq = ((pred - a_star) ** 2).mean(dim=1)             # [B]
-        w = p_elu_inf.clone().detach()
+        # RL offline par régression pondérée : poids = confiance de l'élu (p_elu)
+        # x return (relief du dénouement élu, cappé à 0 — on n'imite pas les
+        # trajectoires à return négatif)
+        relief_elu = relief_score(eos_elu, p=self.eos_max_p).detach()   # [B]
+        w = p_elu_inf.clone().detach() * torch.relu(relief_elu)
         loss = (per_seq * w).sum() / w.sum().clamp(min=1e-8)
         self.opt_pol.zero_grad()
         loss.backward()
@@ -1235,7 +1397,7 @@ class Brain:
     # --- sleep cycle -------------------------------------------------------------
     def sleep_cycle(self, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
                     wm_batch: int = 64, pol_steps: int = 32, pol_batch: int = 32,
-                    wm_target_loss: float | None = 0.01,
+                    wm_target_loss: float | None = 0.004,
                     clear_buffer: bool = True):
         """One full sleep cycle (refonte v1 — dataset optimization set aside):
 

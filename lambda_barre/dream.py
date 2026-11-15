@@ -1,11 +1,11 @@
 """Dream Theater: Visualizer for sleep policy training.
 
 Replaces the physics world during sleep with a storyboard of thumbnails (vignettes):
-- Context row: s0+a0, s1+a1, s2+a2, s3+a3, s4 (decision state)
+- Context row: s0+a0 .. s{n_ctx-1}+a{n_ctx-1}, s{n_ctx} (decision state)
 - Future rows: the imagined trajectories of each candidate action
   (hindsight supervision: policy baseline vs EOS-lookahead generation;
   legacy fallback: 3 candidates × 2 future action regimes)
-  Each row shows s4+a_candidate followed by imagined future steps (s5+a5, s6+a6, ...).
+  Each row shows s{n_ctx}+a_candidate followed by imagined future steps.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 import pygame
 
 from . import body as B
-from .tokenize import _BY_KEY, _denormalize, SIG_OFFSET, _EOS_CHANNEL_W
+from .tokenize import (_BY_KEY, _denormalize, SIG_OFFSET, _EOS_CHANNEL_W,
+                      _COST_IDX, _REWARD_IDX, _COST_KEYS)
 
 
 def _eos_scalar(vals: list[float]) -> float:
@@ -53,7 +54,7 @@ class DreamStep:
     action: list[float] | None        # [tf, df, tb, db, tq]
     step_cost: float = 0.0
     label: str = ""
-    eos_slots: list[float] | None = None  # vignette étoile du dénouement (6 slots)
+    eos_slots: list[float] | None = None  # vignette bargraph signé du dénouement (6 slots)
 
 
 @dataclass
@@ -74,7 +75,7 @@ class DreamRecord:
     total_steps: int                  # Total policy steps
     loss: float                       # Policy loss
     facing: int                       # Skeleton facing (+1 or -1)
-    context_steps: list[DreamStep]    # [s0+a0, s1+a1, s2+a2, s3+a3, s4]
+    context_steps: list[DreamStep]    # [s0+a0 .. s{n_ctx-1}+a, s{n_ctx}]
     candidate_actions: list[list[float]] # candidate actions [n_candidates, 5]
     trajectories: list[DreamTrajectory] # n_candidates * n_regimes trajectories
     best_candidate_idx: int           # Selected candidate index (-1: none accepted)
@@ -83,9 +84,9 @@ class DreamRecord:
         "0: POLICY", "1: REPLAY (DEMO)", "2: NOISE 30%"])
     eos_forced: list[float] | None = None  # hindsight forcing target (denouement delta, 0.5 = neutre)
     lived_steps: list[DreamStep] | None = None        # full lived sequence s0..s10 with actions and per-salve costs
-    predicted_steps: list[DreamStep] | None = None     # real s0..s3 + hindsight a4 + imagined s5..s10
+    predicted_steps: list[DreamStep] | None = None     # real s0..s{n_ctx-1} + hindsight a_dec + imagined futur
     eos_realized: list[float] | None = None           # realized denouement delta of the lived sequence
-    real_action: list[float] | None = None            # recorded a4 of the lived sequence (decision row)
+    real_action: list[float] | None = None            # recorded a_{n_ctx} of the lived sequence (decision row)
 
 
 def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
@@ -134,42 +135,85 @@ def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
     }
 
 
-def draw_eos_star(surface: pygame.Surface, rect: pygame.Rect, slots: list[float],
+def draw_eos_bars(surface: pygame.Surface, rect: pygame.Rect, slots: list[float],
                   font_small: pygame.font.Font,
                   color: tuple[int, int, int] = (255, 210, 70),
                   label: str = "EOS") -> None:
-    """Vignette étoile (radar) d'un dénouement : un rayon par slot de coût
-    (6 canaux), polygone reliant les bouts des rayons. 0.5 = neutre (hexagone
-    de référence gris)."""
+    """Vignette bargraph signé d'un dénouement : une barre par slot (6 canaux),
+    ligne zéro horizontale à 0.5 (neutre) au milieu de la zone de tracé ;
+    barre au-dessus en `color` si slot > 0.5 (positif), en-dessous en rouge
+    si slot < 0.5 (négatif)."""
     bx, by, bw, bh = rect.x, rect.y, rect.width, rect.height
     pygame.draw.rect(surface, CARD_BG, rect, border_radius=4)
     pygame.draw.rect(surface, CARD_BORDER, rect, 1, border_radius=4)
-    cx, cy = bx + bw // 2, by + bh // 2 + 3
-    R = max(6, min(bw, bh) // 2 - 13)
-    n = len(slots)
-
-    def ray(i: int, frac: float) -> tuple[float, float]:
-        a = -math.pi / 2 + 2 * math.pi * i / n
-        r = max(0.0, min(1.0, frac)) * R
-        return (cx + r * math.cos(a), cy + r * math.sin(a))
-
-    # axes + hexagone de référence à 0.5 (neutre)
-    for i in range(n):
-        pygame.draw.line(surface, (60, 66, 82), (cx, cy), ray(i, 1.0), 1)
-    pygame.draw.polygon(surface, (45, 52, 68), [ray(i, 0.5) for i in range(n)], 1)
-    # polygone des slots (rempli translucide + contour)
-    pts = [ray(i, v) for i, v in enumerate(slots)]
-    if n >= 3:
-        tmp = pygame.Surface((bw, bh), pygame.SRCALPHA)
-        pygame.draw.polygon(tmp, (*color, 70),
-                            [(px - bx, py - by) for px, py in pts])
-        surface.blit(tmp, (bx, by))
-        pygame.draw.polygon(surface, color, pts, 1)
-        for i in range(n):
-            pygame.draw.circle(surface, color, (int(pts[i][0]), int(pts[i][1])), 1)
     if label:
         s = font_small.render(label, FONT_AA, TEXT_MUTED)
         surface.blit(s, (bx + 4, by + 2))
+    n = len(slots)
+    top = by + 12
+    plot_h = max(4, bh - 12 - 4)
+    mid = top + plot_h // 2                       # ligne neutre 0.5
+    pygame.draw.line(surface, (90, 96, 112), (bx + 3, mid), (bx + bw - 3, mid), 1)
+    gap = 2
+    bar_w = max(1, (bw - 6 - gap * (n - 1)) // n)
+    neg_color = (220, 90, 90)
+    for i, v in enumerate(slots):
+        x = bx + 3 + i * (bar_w + gap)
+        h = (max(0.0, min(1.0, v)) - 0.5) * plot_h  # signé, pleine échelle = ±0.5
+        c = color if h >= 0.0 else neg_color
+        if h >= 0.0:
+            pygame.draw.rect(surface, c, (x, int(mid - h), bar_w, max(1, int(h))))
+        else:
+            pygame.draw.rect(surface, c, (x, mid, bar_w, max(1, int(-h))))
+
+
+_EOS_SLOT_NAMES = _COST_KEYS + ("inconfort",)
+_ACT_NAMES = ("avant θ", "avant d", "arrière θ", "arrière d", "queue θ")
+
+
+def step_popover_lines(step: DreamStep) -> list[str]:
+    """Lignes du popover d'une vignette : pour une salve (s+a), les coûts
+    instantanés et l'action ; pour un dénouement, le détail des 6 slots."""
+    lines = [step.label] if step.label else []
+    if step.eos_slots is not None:
+        lines.append(f"dénouement (0.5 = neutre), relief {_eos_scalar(step.eos_slots):+.3f}")
+        for name, v in zip(_EOS_SLOT_NAMES, step.eos_slots):
+            sign = '+' if v > 0.5 else ('-' if v < 0.5 else '=')
+            lines.append(f"  {name:<10} {v:.3f} {sign}")
+    elif step.state_tokens:
+        toks = step.state_tokens
+        if len(toks) > _COST_IDX:
+            for j, k in enumerate(_COST_KEYS):
+                lines.append(f"  {k:<10} {_denormalize(toks[_COST_IDX][SIG_OFFSET + j], _BY_KEY[k]):.3f}")
+            if len(toks) > _REWARD_IDX:
+                lines.append(f"  {'confort':<10} {_denormalize(toks[_REWARD_IDX][SIG_OFFSET], _BY_KEY['confort']):+.3f}")
+        if step.step_cost:
+            lines.append(f"  coût salve  {step.step_cost:.3f}")
+        if step.action is not None:
+            lines.append("action:")
+            for name, v in zip(_ACT_NAMES, step.action):
+                lines.append(f"  {name:<10} {v:+.3f}")
+    return lines
+
+
+def draw_popover(screen: pygame.Surface, font: pygame.font.Font,
+                  mouse: tuple[int, int], lines: list[str]) -> None:
+    """Encadré flottant près de la souris (clampé dans l'écran) affichant
+    ``lines`` — utilisé au survol des vignettes."""
+    if not lines:
+        return
+    pad = 6
+    line_h = font.get_height() + 2
+    w = max(font.render(t, FONT_AA, TEXT_WHITE).get_width() for t in lines) + 2 * pad
+    h = line_h * len(lines) + 2 * pad
+    x = min(mouse[0] + 14, screen.get_width() - w - 4)
+    y = min(mouse[1] + 14, screen.get_height() - h - 4)
+    rect = pygame.Rect(max(2, x), max(2, y), w, h)
+    pygame.draw.rect(screen, (18, 21, 30), rect, border_radius=4)
+    pygame.draw.rect(screen, TEXT_ACCENT, rect, 1, border_radius=4)
+    for i, t in enumerate(lines):
+        s = font.render(t, FONT_AA, TEXT_WHITE if i == 0 else TEXT_MUTED)
+        screen.blit(s, (rect.x + pad, rect.y + pad + i * line_h))
 
 
 def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
@@ -178,9 +222,9 @@ def draw_thumbnail(surface: pygame.Surface, rect: pygame.Rect, step: DreamStep,
                    is_best: bool = False, is_winner: bool = False,
                    highlight_label: str = "") -> None:
     """Render a single vignette/thumbnail of a state + action target (or an
-    EOS star when ``step.eos_slots`` is set)."""
+    EOS bargraph when ``step.eos_slots`` is set)."""
     if step.eos_slots is not None:
-        draw_eos_star(surface, rect, step.eos_slots, font_small,
+        draw_eos_bars(surface, rect, step.eos_slots, font_small,
                       color=cand_color or (255, 210, 70),
                       label=step.label or highlight_label or "EOS")
         return
@@ -349,9 +393,9 @@ class DreamTheater:
     Hindsight (EOS-lookahead) policy steps are recorded in a per-cycle history
     and shown one at a time, storyboard style:
       - SEQ: the full s0..s10 window as experienced (ground truth),
-      - WM: real s0..s3, the hindsight-generated a4 on s4, and the
+      - WM: real s0..s{n_ctx-1}, the hindsight-generated a_dec on s{n_ctx}, and the
         imagined s5..s10 it causes (completion toward the forced EOS),
-      - DECISION: side by side, what the policy infers on s4 vs what the WM
+      - DECISION: side by side, what the policy infers on s{n_ctx} vs what the WM
         recommends (cost, imagined EOS, accepted/rejected).
     A step browser (< PREV / NEXT > / LIVE, or arrow keys) navigates the
     history of the current sleep cycle; LIVE keeps following the newest step.
@@ -359,11 +403,12 @@ class DreamTheater:
     Legacy fallback records (stochastic candidates) keep the original
     candidate x regime storyboard with tab filtering and scrolling."""
 
-    MAX_HISTORY = 128
-
-    def __init__(self, width: int = 960, height: int = 600):
+    def __init__(self, width: int = 960, height: int = 600, max_history: int = 512):
         self.width = width
         self.height = height
+        # Browser history cap: one record per policy step, cleared at each
+        # sleep cycle (clear()) — pass pol_steps so the whole cycle is browsable.
+        self.max_history = max_history
         self.record: DreamRecord | None = None
         self.history: list[DreamRecord] = []
         self.hist_idx = 0
@@ -375,6 +420,8 @@ class DreamTheater:
         self.step_once = False
         self.tab_names = ["All (6 Rows)", "0: Policy", "1: Replay", "2: Noise 30%"]
         self._btn_rects: dict[str, pygame.Rect] = {}
+        self.mouse_pos = (0, 0)                     # survol des vignettes (popover)
+        self._thumbs: list[tuple[pygame.Rect, "DreamStep"]] = []
 
         # Sleep cycle progress tracking (fed by dream_theater.py / main.py)
         self.sleep_active = False
@@ -400,7 +447,7 @@ class DreamTheater:
         if self.history and self.history[-1] is record:
             return                      # re-displaying the same step (dream viewer)
         self.history.append(record)
-        if len(self.history) > self.MAX_HISTORY:
+        if len(self.history) > self.max_history:
             del self.history[0]
         if self.follow:
             self.hist_idx = len(self.history) - 1
@@ -444,6 +491,9 @@ class DreamTheater:
     def handle_event(self, ev: pygame.event.Event) -> bool:
         """Handle mouse wheel, keys, browser buttons, and tab selection.
         Returns True if handled."""
+        if ev.type == pygame.MOUSEMOTION:
+            self.mouse_pos = ev.pos
+            return False
         if ev.type == pygame.MOUSEWHEEL:
             self.target_scroll_y = min(0, self.target_scroll_y + ev.y * 40)
             return True
@@ -505,6 +555,7 @@ class DreamTheater:
         policy step of the current sleep cycle, or the World Model training
         screen while no policy step is available yet."""
         screen.fill(DREAM_BG)
+        self._thumbs.clear()
 
         if not self.history:
             self._draw_wm_training(screen, font, font_small, status, brain)
@@ -533,6 +584,14 @@ class DreamTheater:
             self._draw_hindsight(screen, rec, font, font_small)
         else:
             self._draw_legacy(screen, rec, font, font_small)
+        self._draw_hover_popover(screen, font_small)
+
+    def _draw_hover_popover(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
+        """Popover de la vignette survolée (coûts/action ou détail du dénouement)."""
+        for rect, step in self._thumbs:
+            if rect.collidepoint(self.mouse_pos):
+                draw_popover(screen, font, self.mouse_pos, step_popover_lines(step))
+                return
 
     def _draw_wm_training(self, screen: pygame.Surface, font: pygame.font.Font,
                           font_small: pygame.font.Font, status: str,
@@ -710,13 +769,14 @@ class DreamTheater:
         # 2. Rows content area
         content_y = self.header_h + 10 + int(self.scroll_y)
 
-        # --- ROW 0: Real Context (s0 -> s4) ---
+        # --- ROW 0: Real Context (s0 -> s{n_ctx}) ---
         row_rect = pygame.Rect(12, content_y, self.width - 24, self.row_h)
         pygame.draw.rect(screen, (24, 28, 36), row_rect, border_radius=4)
         pygame.draw.rect(screen, (60, 68, 88), row_rect, 1, border_radius=4)
 
         # Context row label
-        s_cxt = font_small.render("PAST REAL CONTEXT (s0 → s4)", FONT_AA, TEXT_ACCENT)
+        n_ctx = len(rec.context_steps) - 1
+        s_cxt = font_small.render(f"PAST REAL CONTEXT (s0 → s{n_ctx})", FONT_AA, TEXT_ACCENT)
         screen.blit(s_cxt, (20, content_y + 4))
 
         # Context thumbnails
@@ -728,6 +788,7 @@ class DreamTheater:
             cand_c = CAND_COLORS[0] if step.action is not None else None
             draw_thumbnail(screen, th_rect, step, font_small, facing=rec.facing,
                            cand_color=cand_c, highlight_label=lbl)
+            self._thumbs.append((th_rect, step))
 
         content_y += self.row_h + self.row_gap + 8
 
@@ -783,15 +844,16 @@ class DreamTheater:
                 s_best = font_small.render("★ Best Regime", FONT_AA, BEST_BORDER)
                 screen.blit(s_best, (20, content_y + 48))
 
-            # Render thumbnails along the row: [s4+a4] [s5+a5] [s6+a6] ...
+            # Render thumbnails along the row: [s{n_ctx}+a_dec] [s{n_ctx+1}+a] ...
             start_x = 180
             for s_idx, st in enumerate(traj.steps):
                 th_rect = pygame.Rect(start_x + s_idx * (self.thumb_w + self.thumb_gap),
                                       content_y + 4, self.thumb_w, self.thumb_h)
-                lbl = st.label or ("s4+cand" if s_idx == 0 else f"s{4 + s_idx}")
+                lbl = st.label or (f"s{n_ctx}+cand" if s_idx == 0 else f"s{n_ctx + s_idx}")
                 draw_thumbnail(screen, th_rect, st, font_small, facing=rec.facing,
                                cand_color=cand_color, is_best=is_best, is_winner=is_win,
                                highlight_label=lbl)
+                self._thumbs.append((th_rect, st))
 
             content_y += self.row_h + self.row_gap
 
@@ -817,7 +879,7 @@ class DreamTheater:
         y = self._draw_seq_row(screen, rec, rec.lived_steps, label, y, font_small,
                                TEXT_WHITE, (200, 200, 210))
 
-        # --- WM COMPLETION row: hindsight-generated a4 + imagined s5 -> s10 ---
+        # --- WM COMPLETION row: hindsight-generated a_dec + imagined futur ---
         label = "WM"
         traj_gen = rec.trajectories[1]
         if traj_gen.eos_pred is not None:
@@ -884,29 +946,32 @@ class DreamTheater:
             rect = pygame.Rect(x, yy, self.seq_thumb_w, self.seq_thumb_h)
             draw_thumbnail(screen, rect, st, font_small, facing=rec.facing,
                            cand_color=action_color)
+            self._thumbs.append((rect, st))
             x += step_w
         return yy + self.seq_thumb_h + 10
 
     def _draw_decision_row(self, screen: pygame.Surface, rec: DreamRecord,
                            font: pygame.font.Font, font_small: pygame.font.Font,
                            y: int) -> int:
-        """Side-by-side decision on s4, in order: the recorded action (real),
+        """Side-by-side decision on s{n_ctx}, in order: the recorded action (real),
         the WM hindsight suggestion, then the policy, with cost, imagined EOS
         and acceptance."""
         s_lbl = font_small.render("DECISION (REAL / WM HINDSIGHT / POLICY)", FONT_AA, TEXT_ACCENT)
         screen.blit(s_lbl, (16, y))
         y += 16
-        s4 = rec.context_steps[-1]
+        n_ctx = len(rec.context_steps) - 1
+        s_dec = rec.context_steps[-1]
         x = 16
-        # 1. Real recorded a4
+        # 1. Real recorded a_dec
         if rec.real_action is not None:
-            step = DreamStep(state_tokens=s4.state_tokens,
-                             action=rec.real_action, label="s4+a4 reel")
+            step = DreamStep(state_tokens=s_dec.state_tokens,
+                             action=rec.real_action, label=f"s{n_ctx}+a_dec reel")
             rect = pygame.Rect(x, y, self.thumb_w, self.thumb_h)
             draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
                            cand_color=(200, 200, 210))
+            self._thumbs.append((rect, step))
             ax = x + self.thumb_w + 10
-            screen.blit(font_small.render("REAL a4", FONT_AA, TEXT_WHITE), (ax, y + 4))
+            screen.blit(font_small.render("REAL a_dec", FONT_AA, TEXT_WHITE), (ax, y + 4))
             x = ax + 150
         # 2. WM hindsight suggestion, then policy (order: real, WM, policy)
         order = [1, 0] if len(rec.candidate_actions) >= 2 else [0]
@@ -915,11 +980,12 @@ class DreamTheater:
             if c_idx >= len(rec.trajectories):
                 break
             traj = rec.trajectories[c_idx]
-            step = DreamStep(state_tokens=s4.state_tokens,
+            step = DreamStep(state_tokens=s_dec.state_tokens,
                              action=rec.candidate_actions[c_idx])
             rect = pygame.Rect(x, y, self.thumb_w, self.thumb_h)
             draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
                            cand_color=CAND_COLORS[c_idx], is_winner=traj.is_winner)
+            self._thumbs.append((rect, step))
             ax = x + self.thumb_w + 10
             lines = [names[c_idx]]
             is_hindsight = (c_idx == 1)

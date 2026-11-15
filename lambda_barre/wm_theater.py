@@ -18,6 +18,7 @@ import argparse
 import math
 import os
 import random
+import time
 from dataclasses import dataclass, field
 
 import pygame
@@ -39,8 +40,10 @@ from .dream import (
     DreamStep,
     decode_state_tokens,
     draw_thumbnail,
+    step_popover_lines,
+    draw_popover,
 )
-from .tokenize import SIG_OFFSET, STATE_TOKENS, salve_cost
+from .tokenize import SALVE_TOKENS, SIG_OFFSET, STATE_TOKENS, salve_cost
 
 COST_COLORS = [
     (245, 140, 50),   # EF
@@ -67,6 +70,8 @@ FONT_AA = False
 
 SORT_MODES = ["coreset", "relief_desc", "relief_asc", "abs_desc"]
 
+# hauteur max des IHM : 520 px (écran 600 - barre de tâche 32 - titre ~28 - marge)
+
 
 @dataclass
 class WMTheaterRecord:
@@ -74,9 +79,9 @@ class WMTheaterRecord:
     total_seqs: int
     vivacity: float
     real_steps: list[DreamStep]        # 11 salves temporelles s0..s10 (métriques)
-    disp_real: list[DreamStep]         # 13 vignettes : s0..s3, s4, EOS réel, s4+a4, s5..s10
-    disp_argmax: list[DreamStep]       # idem, EOS = µ (plus probable), a4 = a*_µ
-    disp_elected: list[DreamStep]      # idem, EOS = élu (optimal), a4 = a*_élu
+    disp_real: list[DreamStep]         # vignettes : s0..s{n_ctx-1}, s{n_ctx}, EOS reel, s{n_ctx}+a*, s{n_ctx+1}..s{seq_steps}
+    disp_argmax: list[DreamStep]       # idem, EOS = mu (plus probable), a_dec = a*_mu
+    disp_elected: list[DreamStep]      # idem, EOS = elu (optimal), a_dec = a*_elu
     eos_observed: list[float]
     eos_argmax: list[float]
     eos_elected: list[float]
@@ -122,32 +127,49 @@ def _salve_costs(s_toks) -> list[float]:
 
 
 def _eos_vignette(eos_slots, label: str) -> DreamStep:
-    """Vignette étoile du dénouement (entre s4 seule et s4+a4)."""
+    """Vignette bargraph signé du dénouement (entre s{n_ctx} seule et s{n_ctx}+a_dec)."""
     return DreamStep(state_tokens=[], action=None, eos_slots=list(eos_slots),
                      label=label)
 
 
 def _gen_to_steps(brain, gen, real_steps, eos_slots) -> tuple[list[DreamStep], list[float]]:
-    """Transforme une génération [contexte, dénouement] en rangée d'affichage
-    de 13 vignettes : s0..s3+a, s4, EOS (étoile), s4+a*, s5^..s10^ (conséquence
-    inversée générée, réordonnée)."""
+    """Transforme une génération [contexte, dénouement] en rangée d'affichage :
+    s0..s{n_ctx-1}+a, s{n_ctx}, dénouement (bargraph), s{n_ctx}+a*, puis la conséquence rétro-causale
+    générée réordonnée en temporel s_{n_ctx+1}^..s_{seq_steps}^. Chaque unité
+    de la conséquence générée est [s_k inversée (13 tokens), a_{k-1} (3)] ;
+    la dernière unité n'a que s_{n_ctx+1} (a_dec est à part, dans gen["action"])."""
     conseq = gen["conseq"][0]                                   # [conseq_len, 25]
     a_star = brain._decode_action_batch(gen["action"])[0].tolist()
     n_im = brain.n_imagine
-    blocks = [conseq[j * STATE_TOKENS:(j + 1) * STATE_TOKENS].tolist()
-              for j in range(n_im)]                             # s_{seq_steps}..s_{n_ctx+1}
+    units = [conseq[j * SALVE_TOKENS:(j + 1) * SALVE_TOKENS].tolist()
+             for j in range(n_im - 1)]                          # unités complètes s_k+a_{k-1}
+    units.append(conseq[(n_im - 1) * SALVE_TOKENS:].tolist())  # dernière unité : s_{n_ctx+1} seule
+    # Feature rétro-causale : chaque état s_k de la conséquence est affiché avec
+    # l'action qui le produit, a_{k-1} (contenue dans la même unité) — la chaîne
+    # remonte jusqu'à la décision a_{n_ctx} (première action, affichée à part).
+    blocks = []
+    for u in units:
+        s_toks = u[:STATE_TOKENS][::-1]                         # ré-inverser s_k
+        a_toks = u[STATE_TOKENS:] if len(u) >= SALVE_TOKENS else None
+        blocks.append((s_toks, a_toks))
     blocks.reverse()                                            # ordre temporel s_{n_ctx+1}..s_{seq_steps}
     n_ctx = brain.n_ctx
-    s4 = real_steps[n_ctx]
+    s_dec = real_steps[n_ctx]
     steps: list[DreamStep] = (
         list(real_steps[:n_ctx])                                # s0..s3 (+a)
-        + [s4]                                                  # s4 seule
-        + [_eos_vignette(eos_slots, "EOS")]                     # vignette étoile
-        + [DreamStep(state_tokens=s4.state_tokens, action=a_star,
-                     step_cost=s4.step_cost, label=f"s{n_ctx}+a*")]  # s4+a*
+        + [s_dec]                                               # s{n_ctx} seule
+        + [_eos_vignette(eos_slots, "EOS")]                     # vignette bargraph
+        + [DreamStep(state_tokens=s_dec.state_tokens, action=a_star,
+                     step_cost=s_dec.step_cost, label=f"s{n_ctx}+a*")]  # s{n_ctx}+a*
     )
-    for j, s_toks in enumerate(blocks):
-        steps.append(DreamStep(state_tokens=s_toks, action=None,
+    for j, (s_toks, a_toks) in enumerate(blocks):
+        a = None
+        if a_toks is not None:
+            a_vals = brain._decode_action_batch(torch.tensor(
+                [a_toks], dtype=torch.float32, device=brain.device))[0].tolist()
+            if any(abs(v) > 1e-9 for v in a_vals):
+                a = a_vals
+        steps.append(DreamStep(state_tokens=s_toks, action=a,
                                step_cost=salve_cost(s_toks) if len(s_toks) >= 13 else 0.0,
                                label=f"s{n_ctx + 1 + j}^"))
     return steps, a_star
@@ -178,24 +200,27 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
 
     mu = brain.predict_denouement(ctx)                          # dénouement le plus probable
     gen_mu = brain.generate_from_denouement(ctx, mu)
-    eos_elu, p_elu = brain.sample_denouements(ctx, eos_observed=eos_obs)  # dénouement élu
+    # dénouement élu : PAS de règle de l'observé ici — le manager montre le vrai
+    # élu (max relief des tirages) ; la règle eos_observed reste réservée à
+    # l'entraînement de la policy (_policy_step)
+    eos_elu, p_elu = brain.sample_denouements(ctx)
     gen_el = brain.generate_from_denouement(ctx, eos_elu)
 
     disp_argmax, a_mu = _gen_to_steps(brain, gen_mu, real_steps, mu[0].tolist())
     disp_elected, a_el = _gen_to_steps(brain, gen_el, real_steps, eos_elu[0].tolist())
 
-    a4_real = brain._decode_action_batch(
+    a_dec_real = brain._decode_action_batch(
         vals[:, brain.action_pos:brain.action_pos + 3, :])[0].tolist()
-    # rangée réelle : s0..s3, s4, EOS réel (étoile), s4+a4, s5..s10
-    s4 = real_steps[brain.n_ctx]
-    disp_real = (list(real_steps[:brain.n_ctx]) + [s4]
+    # rangée réelle : s0..s{n_ctx-1}, s{n_ctx}, EOS réel (bargraph), s{n_ctx}+a_dec, puis la conséquence
+    s_dec = real_steps[brain.n_ctx]
+    disp_real = (list(real_steps[:brain.n_ctx]) + [s_dec]
                  + [_eos_vignette(eos_obs[0].tolist(), "EOS réel")]
-                 + [DreamStep(state_tokens=s4.state_tokens, action=a4_real,
-                              step_cost=s4.step_cost, label=f"s{brain.n_ctx}+a4")]
+                 + [DreamStep(state_tokens=s_dec.state_tokens, action=a_dec_real,
+                              step_cost=s_dec.step_cost, label=f"s{brain.n_ctx}+a_dec")]
                  + list(real_steps[brain.n_ctx + 1:]))
 
     # métriques sur la conséquence (s_{n_ctx+1}..s_{seq_steps}) : dans les rangées
-    # d'affichage, s_k siège à l'index k+2 (vignettes EOS et s4+a* insérées)
+    # d'affichage, s_k siège à l'index k+2 (vignettes EOS et s{n_ctx}+a* insérées)
     p_errs, c_errs = [], []
     for k in range(brain.n_ctx + 1, brain.seq_steps + 1):
         p_rmse = compute_posture_rmse(real_steps[k].state_tokens,
@@ -220,8 +245,8 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
         real_relief=float(relief_score(seq, eos_pos=brain.eos_pos)),
         argmax_relief=float(relief_score(mu, p=brain.eos_max_p)[0]),
         elected_relief=float(relief_score(eos_elu, p=brain.eos_max_p)[0]),
-        cos_argmax=_cos(a_mu, a4_real),
-        cos_elected=_cos(a_el, a4_real),
+        cos_argmax=_cos(a_mu, a_dec_real),
+        cos_elected=_cos(a_el, a_dec_real),
         rmse_posture_elected=sum(p_errs) / max(1, len(p_errs)),
         rmse_cost_elected=sum(c_errs) / max(1, len(c_errs)),
     )
@@ -231,8 +256,8 @@ class WMTheater:
     """Coreset browser: 3 rows per sequence (real / WM argmax / WM elected)."""
 
     def __init__(self, brain: Brain, buffer: ExperienceBuffer,
-                 width: int = 960, height: int = 560,
-                 initial_sort: str = "relief_desc"):
+                 width: int = 960, height: int = 520,
+                 initial_sort: str = "coreset"):
         self.brain = brain
         self.buffer = buffer
         self.width = width
@@ -240,7 +265,7 @@ class WMTheater:
         self.sort_mode = initial_sort if initial_sort in SORT_MODES else "coreset"
         self.sorted_idx = 0
         self.cache: dict[int, WMTheaterRecord] = {}
-        self.footer_hints = "Nav: [← / →]  |  [S] Sort  |  [R] Random  |  drag: scroll mignatures  |  [Esc] Quit"
+        self.footer_hints = "Nav: [← / →] / glider  |  [S] Sort  |  [R] Random  |  drag: scroll mignatures  |  [Esc] Quit"
         self.title_str = "WM THEATER"
         # géométrie du container scrollable des mignatures
         self.thumb_w, self.thumb_h, self.gap = 76, 56, 4
@@ -249,7 +274,57 @@ class WMTheater:
         self.scroll_x = 0
         self.scroll_y = 0
         self._drag: tuple | None = None  # (mouse_pos, scroll au départ du drag)
+        self.mouse_pos = (0, 0)          # survol des vignettes (popover)
+        self._thumbs: list = []          # (rect, DreamStep) dessinés à la frame
+        # slider de sélection + debouncing de la navigation (dernier index demandé
+        # appliqué après debounce_s d'inactivité : évite de recalculer un rollout
+        # à chaque frame pendant un scroll rapide)
+        self.debounce_s = 0.25
+        self._pending_idx: int | None = None
+        self._pending_t = 0.0
+        self._slider_rect: pygame.Rect | None = None
+        self._slider_drag = False
+        # filtre par similarité de contexte (touche F dans le manager) :
+        # ctx_ref = signaux du contexte de référence, _filtered_idx = indices gardés
+        self.ctx_filter_on = False
+        self.ctx_eps = 1e-3
+        self.ctx_ref: torch.Tensor | None = None
+        self._ref_idx = -1
+        self._filtered_idx: list[int] | None = None
         self._update_sorted_indices()
+
+    def set_ctx_reference(self, idx: int) -> int:
+        """Filtre le coreset aux séquences dont le contexte est similaire à celui
+        de la séquence ``idx`` (MSE sur les signaux du contexte <= ``ctx_eps``).
+        Retourne le nombre de séquences gardées."""
+        if not self.buffer._coreset:
+            return 0
+        idx = max(0, min(idx, self.buffer.coreset_size - 1))
+        allv = self.brain._batch_tensors(self.buffer._coreset)
+        ctxs = allv[:, :self.brain.ctx_len, SIG_OFFSET:]          # [N, ctx_len, 16]
+        ref = ctxs[idx:idx + 1]
+        d = ((ctxs - ref) ** 2).mean(dim=(1, 2))                  # [N]
+        keep = (d <= self.ctx_eps).nonzero().flatten().tolist()
+        if idx not in keep:
+            keep.append(idx)
+        self.ctx_ref = ref
+        self._ref_idx = idx
+        self.ctx_filter_on = True
+        self._filtered_idx = sorted(keep)
+        self._update_sorted_indices()
+        self.sorted_idx = self.order.index(idx) if idx in self.order else 0
+        self.cache.clear()
+        return len(keep)
+
+    def clear_ctx_reference(self) -> None:
+        """Reset du filtre : toutes les séquences du coreset redeviennent visibles."""
+        self.ctx_filter_on = False
+        self.ctx_ref = None
+        self._ref_idx = -1
+        self._filtered_idx = None
+        self._update_sorted_indices()
+        self.sorted_idx = 0
+        self.cache.clear()
 
     @property
     def _container_rect(self) -> pygame.Rect:
@@ -288,16 +363,18 @@ class WMTheater:
 
     def _update_sorted_indices(self) -> None:
         n = self.num_seqs
+        base = self._filtered_idx if (self.ctx_filter_on and self._filtered_idx) \
+            else list(range(n))
         if self.sort_mode == "coreset":
-            self.order = list(range(n))
+            self.order = list(base)
         else:
-            rels = [self._seq_relief(i) for i in range(n)]
+            rels = {i: self._seq_relief(i) for i in base}
             if self.sort_mode == "relief_desc":
-                self.order = sorted(range(n), key=lambda i: -rels[i])
+                self.order = sorted(base, key=lambda i: -rels[i])
             elif self.sort_mode == "relief_asc":
-                self.order = sorted(range(n), key=lambda i: rels[i])
+                self.order = sorted(base, key=lambda i: rels[i])
             else:  # abs_desc
-                self.order = sorted(range(n), key=lambda i: -abs(rels[i]))
+                self.order = sorted(base, key=lambda i: -abs(rels[i]))
         self.sorted_idx = min(self.sorted_idx, max(0, len(self.order) - 1))
 
     def set_sort(self, mode: str) -> None:
@@ -318,15 +395,37 @@ class WMTheater:
     def set_sorted_idx(self, idx: int) -> None:
         self.set_seq_idx(idx)
 
+    def _request_nav(self, idx: int) -> None:
+        """Demande de navigation debouncée : seul le dernier index demandé est
+        appliqué (dans ``update``) après ``debounce_s`` d'inactivité."""
+        if not self.order:
+            return
+        self._pending_idx = max(0, min(idx, len(self.order) - 1))
+        self._pending_t = time.monotonic()
+
+    def update(self) -> None:
+        """Applique la navigation en attente si le debounce est écoulé."""
+        if self._pending_idx is not None \
+                and time.monotonic() - self._pending_t >= self.debounce_s:
+            self.sorted_idx = self._pending_idx
+            self._pending_idx = None
+
+    def _slider_to(self, x: int) -> None:
+        r = self._slider_rect
+        if r is None or not self.order:
+            return
+        frac = (x - r.x) / max(1, r.w)
+        self._request_nav(int(frac * (len(self.order) - 1)))
+
     def prev_seq(self) -> None:
-        self.set_seq_idx(self.sorted_idx - 1)
+        self._request_nav(self.sorted_idx - 1)
 
     def next_seq(self) -> None:
-        self.set_seq_idx(self.sorted_idx + 1)
+        self._request_nav(self.sorted_idx + 1)
 
     def random_seq(self) -> None:
         if self.order:
-            self.sorted_idx = random.randrange(len(self.order))
+            self._request_nav(random.randrange(len(self.order)))
 
     def get_record(self, idx: int | None = None) -> WMTheaterRecord | None:
         if self.num_seqs == 0:
@@ -345,12 +444,6 @@ class WMTheater:
         self.cache.clear()
 
     def handle_event(self, ev: pygame.event.Event) -> bool:
-        if ev.type == pygame.VIDEORESIZE:
-            # la fenêtre est retaillée : le layout suit (la strip du manager
-            # reste collée en bas)
-            self.width = max(640, ev.w)
-            self.height = max(360, ev.h)
-            return True
         if ev.type == pygame.KEYDOWN:
             if ev.key == pygame.K_LEFT:
                 self.prev_seq()
@@ -365,15 +458,25 @@ class WMTheater:
                 self.random_seq()
                 return True
         elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if self._slider_rect is not None and self._slider_rect.collidepoint(ev.pos):
+                self._slider_drag = True
+                self._slider_to(ev.pos[0])
+                return True
             if self._container_rect.collidepoint(ev.pos):
                 self._drag = ev.pos
                 return True
         elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            self._slider_drag = False
             self._drag = None
-        elif ev.type == pygame.MOUSEMOTION and self._drag is not None:
-            self._apply_scroll(ev.pos[0] - self._drag[0], ev.pos[1] - self._drag[1])
-            self._drag = ev.pos
-            return True
+        elif ev.type == pygame.MOUSEMOTION:
+            self.mouse_pos = ev.pos
+            if self._slider_drag and self._slider_rect is not None:
+                self._slider_to(ev.pos[0])
+                return True
+            if self._drag is not None:
+                self._apply_scroll(ev.pos[0] - self._drag[0], ev.pos[1] - self._drag[1])
+                self._drag = ev.pos
+                return True
         elif ev.type == pygame.MOUSEWHEEL:
             pos = getattr(ev, "pos", None) or pygame.mouse.get_pos()
             if self._container_rect.collidepoint(pos):
@@ -412,17 +515,40 @@ class WMTheater:
         for st in steps:
             rect = pygame.Rect(x, yy, self.thumb_w, self.thumb_h)
             draw_thumbnail(screen, rect, st, font_tiny, facing=1, cand_color=color)
+            self._thumbs.append((rect, st))
             x += self.thumb_w + self.gap
         return yy + self.thumb_h + 8
 
     def _draw_header(self, screen, rec: WMTheaterRecord | None, font, font_small) -> int:
         pygame.draw.rect(screen, HEADER_BG, (0, 0, self.width, self.header_h - 6))
         title = f"{self.title_str}  |  seq {self.sorted_idx + 1}/{len(self.order)} (idx {rec.seq_idx if rec else '-'})  |  sort {self.sort_mode}"
-        screen.blit(font.render(title, FONT_AA, TEXT_WHITE), (16, 8))
+        if self.ctx_filter_on:
+            title += (f"  |  ctx-filter ref={self._ref_idx} kept={len(self.order)}"
+                      f"/{self.num_seqs} eps={self.ctx_eps:g}")
+        s_title = font.render(title, FONT_AA, TEXT_WHITE)
+        screen.blit(s_title, (16, 8))
+        # slider de sélection de séquence, 1re ligne à côté du sort
+        n = len(self.order)
+        lbl = font_small.render("glider", FONT_AA, TEXT_MUTED)
+        sw = min(240, max(90, self.width - (16 + s_title.get_width() + 20 + lbl.get_width() + 8) - 16))
+        sx = 16 + s_title.get_width() + 20 + lbl.get_width() + 8
+        sy = 10
+        self._slider_rect = pygame.Rect(sx, sy, sw, 10)
+        screen.blit(lbl, (16 + s_title.get_width() + 20, 8))
+        pygame.draw.rect(screen, (40, 46, 60), self._slider_rect, border_radius=5)
+        pygame.draw.rect(screen, CARD_BORDER, self._slider_rect, 1, border_radius=5)
+        if n > 0:
+            def cx_of(i):
+                return self._slider_rect.x + 6 + int(i / max(1, n - 1) * (self._slider_rect.w - 12))
+            if self._pending_idx is not None:   # dernier index demandé (debounced)
+                pygame.draw.circle(screen, TEXT_MUTED,
+                                   (cx_of(self._pending_idx), self._slider_rect.centery), 4)
+            pygame.draw.circle(screen, TEXT_ACCENT,
+                               (cx_of(self.sorted_idx), self._slider_rect.centery), 6)
         if rec is not None:
             info = (f"relief reel {rec.real_relief:+.3f} | mu {rec.argmax_relief:+.3f} | "
                     f"elu {rec.elected_relief:+.3f} (p={rec.p_elected:.2f}) | "
-                    f"cos(a*,a4) mu {rec.cos_argmax:+.2f} elu {rec.cos_elected:+.2f} | "
+                    f"cos(a*,a_dec) mu {rec.cos_argmax:+.2f} elu {rec.cos_elected:+.2f} | "
                     f"rmse posture {rec.rmse_posture_elected:.3f} cout {rec.rmse_cost_elected:.3f}")
             screen.blit(font_small.render(info, FONT_AA, TEXT_ACCENT), (16, 32))
         return self.header_h
@@ -431,6 +557,7 @@ class WMTheater:
         if font_tiny is None:
             font_tiny = font_small
         screen.fill(DREAM_BG)
+        self._thumbs.clear()
         rec = self.get_record()
         self._draw_header(screen, rec, font, font_small)
         # container scrollable des mignatures (drag / molette), dessiné avec clip
@@ -456,6 +583,11 @@ class WMTheater:
                 screen.blit(font_tiny.render(txt, FONT_AA, col), (ox, yy))
                 yy += 14
         screen.set_clip(prev_clip)
+        # popover de la vignette survolée (hors clip du container scrollable)
+        for rect, st in self._thumbs:
+            if rect.collidepoint(self.mouse_pos):
+                draw_popover(screen, font_tiny, self.mouse_pos, step_popover_lines(st))
+                break
         pygame.draw.rect(screen, CARD_BORDER, (0, self.height - 24, self.width, 24))
         screen.blit(font_small.render(self.footer_hints, FONT_AA, TEXT_MUTED),
                     (16, self.height - 20))
@@ -463,19 +595,19 @@ class WMTheater:
 
 def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                 pol_path: str = "pol_ckpt.pt", initial_index: int = 0,
-                device: str = "cpu", initial_sort: str = "relief_desc",
+                device: str = "cpu", initial_sort: str = "coreset",
                 d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
                 dim_ff: int = 384, wm_dropout: float = 0.0, pol_hidden: int = 256,
                 lr_wm: float = 3e-4, lr_pol: float = 2e-4, seed: int = 0,
                 buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                 seq_steps: int = 10, n_ctx: int = 4,
-                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1,
+                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
                 eos_max_p: float = 8.0, compile_wm: bool = False,
                 **_ignored) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Theater — refonte")
-    width, height = 960, 560
+    width, height = 960, 520
     screen = pygame.display.set_mode((width, height), pygame.SCALED | pygame.RESIZABLE)
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(FONT_NAME, 14, bold=True)
@@ -487,7 +619,8 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                   dropout=wm_dropout, pol_hidden=pol_hidden, lr_wm=lr_wm, lr_pol=lr_pol,
                   seed=seed, buffer_capacity=buffer_capacity,
                   buffer_pool_capacity=buffer_pool_capacity,
-                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin, eos_max_p=eos_max_p)
+                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
+                  eos_poids_arrivee=eos_poids_arrivee, eos_max_p=eos_max_p)
     if os.path.exists(wm_path):
         brain.load_checkpoint(wm_path=wm_path,
                               pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt")
@@ -497,7 +630,8 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
 
     buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
                            seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed,
-                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin)
+                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
+                           eos_poids_arrivee=eos_poids_arrivee)
     if os.path.exists(buffer_path):
         ok = buf.load(buffer_path)
         print(f"Loaded {buf.coreset_size} sequences from {buffer_path}" if ok
@@ -514,9 +648,6 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             if ev.type == pygame.QUIT:
                 running = False
                 break
-            elif ev.type == pygame.VIDEORESIZE:
-                screen = pygame.display.set_mode(
-                    (max(640, ev.w), max(360, ev.h)), flags)
             elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
                 break
@@ -525,6 +656,7 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                 pygame.display.toggle_fullscreen()
                 continue
             theater.handle_event(ev)
+        theater.update()
         theater.draw(screen, font, font_small, font_tiny)
         pygame.display.flip()
         clock.tick(60)
@@ -537,13 +669,13 @@ def main() -> None:
         "buffer_path": "buf_ckpt.pt", "wm_path": "wm_ckpt.pt", "pol_path": "pol_ckpt.pt",
         "initial_index": 0,
         "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "initial_sort": "relief_desc", "accel": False,
+        "initial_sort": "coreset", "accel": False,
         "d_model": 64, "nhead": 4, "wm_layers": 3,
         "dim_ff": 384, "wm_dropout": 0.0, "pol_hidden": 256,
         "lr_wm": 3e-4, "lr_pol": 2e-4, "seed": 0,
         "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
         "seq_steps": 10, "n_ctx": 4,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_max_p": 8.0,
+        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
         "compile_wm": False,
     }
     CFG.apply_toml(params, cfg)

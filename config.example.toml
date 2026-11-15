@@ -31,10 +31,10 @@ lr_pol        = 2.0e-4   # Policy learning rate (Adam)
 act_std       = 0.0      # action sampling std during wake (0 = pas de bruit)
 
 # Sleep cycle training
-wm_coreset_epoch   = 512    # World Model training epochs per sleep cycle (Coreset phase)
-wm_addendum_epoch  = 128    # World Model training epochs per sleep cycle (Addendum phase)
+wm_coreset_epoch   = 300    # World Model training epochs per sleep cycle (Coreset phase)
+wm_addendum_epoch  = 300    # World Model training epochs per sleep cycle (Addendum phase)
 wm_batch        = 64     # World Model training batch size
-wm_target_loss  = 0.01   # early-stop target loss for WM coreset training
+wm_target_loss  = 0.004  # early-stop target loss for WM coreset training (overtime palier)
 pol_steps       = 256    # Policy training steps per sleep cycle
 eos_force_eps_lo = 0.015  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
 eos_force_eps_hi = 0.0375
@@ -72,7 +72,7 @@ surprise_floor   = 0.001 # floor on the surprise threshold (lower = eject less)
 # ---------------------------------------------------------------------------
 [sequence]
 seq_steps = 16   # number of transitions (salves) per training sequence (fenêtre de conséquence doublée : 12 salves)
-n_ctx     = 4    # decision context length — must be strictly less than seq_steps
+n_ctx     = 13   # decision context length, milieu de la fenetre — must be strictly less than seq_steps
                  # The policy decides at step n_ctx; consequences are evaluated
                  # from n_ctx+1 to seq_steps.
 
