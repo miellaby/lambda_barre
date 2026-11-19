@@ -55,6 +55,8 @@ wm_input_noise   = 0.015    # light Gaussian noise on valid signal slots during 
 [buffer]
 capacity        = 1000   # session journal: max extractable sequences during wake
 pool_capacity   = 1000   # coreset: max long-term consolidated sequences
+dedup_eps       = 0.02   # RMSE threshold over full sequence (context + EOS + consequence + action); 0 = off
+vivacity_decay  = 0.95   # per-sleep multiplicative decay of coreset vivacity (1.0 = no decay)
 
 # ---------------------------------------------------------------------------
 # Sequence geometry

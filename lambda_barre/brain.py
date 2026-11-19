@@ -413,7 +413,10 @@ class ExperienceBuffer:
                  pool_capacity: int = 1000, seed: int = 0,
                  n_ctx: int | None = None,
                  eos_decay: float = _EOS_DECAY,
-                 lookahead: int | None = None):
+                 lookahead: int | None = None,
+                 dedup_eps: float = 0.02,
+                 vivacity_decay: float = 0.95,
+                 impact_floor: float = 0.25):
         self.seq_len = seq_len                      # salves per temporal window
         self.capacity = capacity
         self.pool_capacity = pool_capacity
@@ -423,12 +426,40 @@ class ExperienceBuffer:
         else:
             self.n_ctx = n_ctx
         self.eos_decay = eos_decay
+        self.dedup_eps = dedup_eps
+        self.vivacity_decay = vivacity_decay
+        self.impact_floor = impact_floor
         # saut de la fenêtre : la dernière salve est à +lookahead de la décision
         # (défaut seq_steps - n_ctx = pas de saut, dernière salve à +1 tick)
         self.lookahead = lookahead if lookahead is not None else self.seq_steps - self.n_ctx
         # portée réelle d'une fenêtre dans le journal : au moins seq_steps
         # salves consécutives ET la dernière salve à n_ctx + lookahead
         self.window_span = max(self.seq_steps, self.n_ctx + self.lookahead + 1)
+        self._layout = compute_seq_layout(self.seq_steps, self.n_ctx)
+        # Masque bool [seq_len_toks, N_SIGNAL] des slots signaux valides sur
+        # TOUTE la séquence enregistrée (contexte + dénouement + conséquence
+        # inversée + action de décision, hors tokens intero masqués et padding).
+        sig_mask = torch.zeros(self._layout["seq_len"], N_SIGNAL, dtype=torch.bool)
+        ctx_len = self._layout["ctx_len"]
+        eos_pos = self._layout["eos_pos"]
+        conseq_start = self._layout["conseq_start"]
+        action_pos = self._layout["action_pos"]
+        for q in range(self._layout["seq_len"]):
+            if q == eos_pos:
+                sig_mask[q, :_EOS_NSLOTS] = True
+                continue
+            if q < ctx_len:
+                tidx = q % SALVE_TOKENS
+            elif q < action_pos:
+                off = (q - conseq_start) % SALVE_TOKENS
+                tidx = STATE_TOKENS - 1 - off if off < STATE_TOKENS else off
+            else:
+                tidx = STATE_TOKENS + (q - action_pos)
+            if tidx == _INTERO_IDX:
+                continue
+            sig_mask[q, :_N_SIGNALS[tidx]] = True
+        self._sig_mask = sig_mask
+        self.last_evicted = 0
         self._segments: deque[list[list[float]]] = deque()
         self._current: list[list[float]] = []
         self._coreset: list[list[list[float]]] = []
@@ -443,6 +474,7 @@ class ExperienceBuffer:
         return {
             "origin": origin,
             "vivacity": 1.0,
+            "count": 1,
             "learn_count": 0,
             "relief_score": None,
             "surprise": None,
@@ -533,19 +565,125 @@ class ExperienceBuffer:
         self._current.clear()
         return added
 
-    def commit_addendum(self) -> int:
-        """Move all Addendum sequences into the Coreset (simple FIFO capacity
-        eviction), then clear the Addendum. Returns the number committed."""
+    def _seq_sig_matrix(self, seqs: list, device=None) -> torch.Tensor:
+        """Flatten all valid signal slots of full recorded sequences (context +
+        dénouement + reversed consequence + decision action, excluding masked
+        intero & padding) into a [N, D] float32 matrix for RMSE distance."""
+        t = torch.tensor(seqs, dtype=torch.float32, device=device)  # [N, L, 29]
+        mask = self._sig_mask.to(t.device)                          # [L, 16]
+        return t[:, :, SIG_OFFSET:][:, mask]                        # [N, D]
+
+    def deduplicate_addendum(self, eps: float | None = None, device=None) -> int:
+        """Drop near-duplicate sequences within the Addendum using RMSE over
+        all valid signal slots of the full sequence (context + dénouement +
+        consequence + decision action). Refreshes count/vivacity on the kept
+        representative. Returns the number dropped."""
+        thr = self.dedup_eps if eps is None else eps
+        n = len(self._addendum)
+        if thr <= 0.0 or n <= 1:
+            return 0
+        vecs = self._seq_sig_matrix(self._addendum, device=device)
+        inv_sqrt_d = 1.0 / math.sqrt(vecs.shape[1])
+        dists = (torch.cdist(vecs, vecs) * inv_sqrt_d).cpu()
+        kept_idx: list[int] = []
+        for i in range(n):
+            dup_of = -1
+            best_d = thr
+            row = dists[i]
+            for j in kept_idx:
+                d = float(row[j])
+                if d < best_d:
+                    best_d = d
+                    dup_of = j
+            if dup_of >= 0:
+                m = self._addendum_meta[dup_of]
+                m["vivacity"] = 1.0
+                m["count"] = m.get("count", 1) + 1
+            else:
+                kept_idx.append(i)
+        dropped = n - len(kept_idx)
+        if dropped > 0:
+            self._addendum = [self._addendum[i] for i in kept_idx]
+            self._addendum_meta = [self._addendum_meta[i] for i in kept_idx]
+        return dropped
+
+    def deduplicate_against_coreset(self, eps: float | None = None, device=None) -> int:
+        """Drop Addendum sequences that are within RMSE ``eps`` (over the full
+        sequence including consequence) of an existing Coreset memory. Refreshes
+        the matching Coreset memory's vivacity and count. Returns number dropped."""
+        thr = self.dedup_eps if eps is None else eps
+        if thr <= 0.0 or not self._addendum or not self._coreset:
+            return 0
+        add_vecs = self._seq_sig_matrix(self._addendum, device=device)
+        core_vecs = self._seq_sig_matrix(self._coreset, device=device)
+        inv_sqrt_d = 1.0 / math.sqrt(add_vecs.shape[1])
+        dists = torch.cdist(add_vecs, core_vecs) * inv_sqrt_d       # [N_add, N_core]
+        min_d, nearest = dists.min(dim=1)
+        min_d_list = min_d.tolist()
+        nearest_list = nearest.tolist()
+        kept_seqs: list = []
+        kept_metas: list = []
+        dropped = 0
+        for i, (d, j) in enumerate(zip(min_d_list, nearest_list)):
+            if d < thr:
+                self._coreset_vivacity[j] = 1.0
+                if j < len(self._coreset_meta):
+                    self._coreset_meta[j]["vivacity"] = 1.0
+                    self._coreset_meta[j]["count"] = (
+                        self._coreset_meta[j].get("count", 1)
+                        + self._addendum_meta[i].get("count", 1))
+                dropped += 1
+            else:
+                kept_seqs.append(self._addendum[i])
+                kept_metas.append(self._addendum_meta[i])
+        if dropped > 0:
+            self._addendum = kept_seqs
+            self._addendum_meta = kept_metas
+        return dropped
+
+    def commit_addendum(self, device=None) -> int:
+        """Consolidate Addendum into the Coreset with gentle vivacity decay and
+        density-based capacity eviction (drops from the closest full-sequence
+        pairs, keeping the higher-priority member so rare old memories survive).
+        Returns the number of Addendum sequences committed."""
+        if self._coreset and self.vivacity_decay < 1.0:
+            for i in range(len(self._coreset_vivacity)):
+                self._coreset_vivacity[i] *= self.vivacity_decay
+                if i < len(self._coreset_meta):
+                    self._coreset_meta[i]["vivacity"] = self._coreset_vivacity[i]
         n = len(self._addendum)
         self._coreset.extend(self._addendum)
         self._coreset_vivacity.extend([1.0] * n)
         self._coreset_meta.extend(self._addendum_meta)
         self._addendum.clear()
         self._addendum_meta.clear()
-        while len(self._coreset) > self.pool_capacity:
-            self._coreset.pop(0)
-            self._coreset_vivacity.pop(0)
-            self._coreset_meta.pop(0)
+
+        excess = len(self._coreset) - self.pool_capacity
+        self.last_evicted = max(0, excess)
+        if excess > 0:
+            m = len(self._coreset)
+            vecs = self._seq_sig_matrix(self._coreset, device=device)
+            inv_sqrt_d = 1.0 / math.sqrt(vecs.shape[1])
+            dists = torch.cdist(vecs, vecs) * inv_sqrt_d
+            dists.fill_diagonal_(float("inf"))
+            eos_pos = self._layout["eos_pos"]
+            priorities = [
+                max(abs(float(relief_score(seq, eos_pos=eos_pos))), self.impact_floor)
+                * (0.5 + 0.5 * viv)
+                for seq, viv in zip(self._coreset, self._coreset_vivacity)
+            ]
+            evicted: set[int] = set()
+            for _ in range(excess):
+                flat = int(dists.argmin().item())
+                i, j = divmod(flat, m)
+                victim = i if priorities[i] <= priorities[j] else j
+                evicted.add(victim)
+                dists[victim, :] = float("inf")
+                dists[:, victim] = float("inf")
+            keep = [k for k in range(m) if k not in evicted]
+            self._coreset = [self._coreset[k] for k in keep]
+            self._coreset_vivacity = [self._coreset_vivacity[k] for k in keep]
+            self._coreset_meta = [self._coreset_meta[k] for k in keep]
         return n
 
     def consolidate(self, stride: int = 1) -> int:
@@ -678,6 +816,8 @@ class Brain:
                  dim_ff: int = 384, dropout: float = 0.0,
                  pol_hidden: int = 256,
                  buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
+                 dedup_eps: float = 0.02,
+                 vivacity_decay: float = 0.95,
                  eos_decay: float = _EOS_DECAY,
                  # tête MDN du dénouement + élection sur les K modes
                  eos_n_modes: int = M.EOS_N_MODES,
@@ -718,7 +858,10 @@ class Brain:
         self.buffer = ExperienceBuffer(seq_len=seq_steps + 1, seed=seed, n_ctx=n_ctx,
                                        eos_decay=eos_decay, lookahead=self.lookahead,
                                        capacity=buffer_capacity,
-                                       pool_capacity=buffer_pool_capacity)
+                                       pool_capacity=buffer_pool_capacity,
+                                       dedup_eps=dedup_eps,
+                                       vivacity_decay=vivacity_decay,
+                                       impact_floor=wm_impact_floor)
         # Positions temporelles (PE sinusoïdal) et tables de loss du layout.
         self.salve_positions = torch.tensor(
             compute_salve_positions(seq_steps, n_ctx, lookahead=self.lookahead),
@@ -1044,9 +1187,9 @@ class Brain:
                        slingshot_settle: int = 3,
                        slingshot_max_extra: int | None = None):
         """One WM training phase as a generator yielding ``(label, epoch, loss)``
-        after each batch. 1 epoch = the whole dataset swept in batches without
-        omission or replacement; addendum is shuffled each epoch. ``fixed_seq``
-        (a sequence or a callable) is prepended to every batch.
+        after each batch. 1 epoch = the whole dataset shuffled and swept in
+        batches without omission or replacement. ``fixed_seq`` (a sequence or
+        a callable) is prepended to every batch.
 
         Slingshot guard: if Adam triggers a sudden loss spike above
         ``slingshot_ratio * best_smooth`` (or ``slingshot_ratio * prev_loss``),
@@ -1076,18 +1219,23 @@ class Brain:
         while True:
             ep += 1
             self.sleep_wm_step = ep
-            if source == "addendum":
-                buf._rng.shuffle(order)
-            # coreset NON shufflé : ordre volontaire (tri moins -> plus pertinent)
+            mix_coreset = (source == "addendum" and len(buf._coreset) > 0)
+            step_batch = max(1, batch // 2) if mix_coreset else batch
+            buf._rng.shuffle(order)
             self.sleep_wm_n = n
-            self.sleep_wm_batches = max(1, (n + batch - 1) // batch)
+            self.sleep_wm_batches = max(1, (n + step_batch - 1) // step_batch)
             self.sleep_wm_batch = 0
             epoch_losses = []
             skip = False
-            for start in range(0, max(n, 1), batch):
-                idxs = order[start:start + batch]
-                self.sleep_wm_batch = start // batch + 1
+            for start in range(0, max(n, 1), step_batch):
+                idxs = order[start:start + step_batch]
+                self.sleep_wm_batch = start // step_batch + 1
                 batch_seqs = [seqs_all[i] for i in idxs]
+                if mix_coreset and batch_seqs:
+                    # Replay mixte 50/50 addendum + coreset : évite l'oubli
+                    # catastrophique du coreset pendant la phase addendum.
+                    n_replay = min(len(buf._coreset), len(batch_seqs))
+                    batch_seqs = batch_seqs + buf._rng.sample(buf._coreset, n_replay)
                 if fixed_seq is not None:
                     fs = fixed_seq() if callable(fixed_seq) else fixed_seq
                     if fs is not None:
@@ -1540,14 +1688,26 @@ class Brain:
         coreset_before = self.buffer.coreset_size
 
         n_wake = self.buffer.extract_addendum()
+        d_intra = self.buffer.deduplicate_addendum(device=self.device)
+        d_core = self.buffer.deduplicate_against_coreset(device=self.device)
         self.sleep_cycle_stats = {
             "coreset_before": coreset_before,
             "wake": n_wake,
+            "dedup_intra": d_intra,
+            "dedup_coreset": d_core,
+            "addendum_kept": len(self.buffer._addendum),
+            "evicted": 0,
             "coreset_after": None,
+        }
+        yield "prune", {
+            "pruned": 0,
+            "coreset": self.buffer.coreset_size,
+            "dedup_intra": d_intra,
+            "dedup_coreset": d_core,
         }
 
         has_coreset = self.buffer.coreset_size > 0
-        has_addendum = self.buffer.addendum_size > 0
+        has_addendum = len(self.buffer._addendum) > 0
         if not has_coreset and not has_addendum:
             self.mode = "wake"
             yield "done", {"wm_loss": float("nan"), "pol_loss": float("nan"),
@@ -1584,7 +1744,8 @@ class Brain:
         for label, value in self.train_policy(pol_steps, pol_batch):
             yield label, value
 
-        n_committed = self.buffer.commit_addendum()
+        n_committed = self.buffer.commit_addendum(device=self.device)
+        self.sleep_cycle_stats["evicted"] = self.buffer.last_evicted
         self.sleep_cycle_stats["coreset_after"] = self.buffer.coreset_size
         self._recording = True
         self._static_ticks = 0

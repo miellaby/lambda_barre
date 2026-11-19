@@ -588,3 +588,94 @@ def test_eos_cond_infusion_zero_leak_on_context(brain, rng):
         assert torch.equal(t_lo, t_hi)
     # Effet direct immédiat sur la conséquence et l'action (q >= eos_pos)
     assert (p_lo[:, brain.eos_pos:] - p_hi[:, brain.eos_pos:]).abs().max().item() > 1e-3
+
+
+def test_dedup_includes_consequence_and_drops_true_duplicates(rng):
+    buf = ExperienceBuffer(seq_len=SEQ_STEPS + 1, n_ctx=N_CTX,
+                           dedup_eps=0.02, capacity=50, pool_capacity=50, seed=0)
+    layout = compute_seq_layout(SEQ_STEPS, N_CTX)
+    base_win = _rand_window(rng)
+    seq_a = build_sequence(base_win, n_ctx=N_CTX)
+    # Quasi-doublon complet (perturbation minuscule 1e-3 partout)
+    seq_dup = [list(tok) for tok in seq_a]
+    seq_dup[0][SIG_OFFSET] = min(1.0, max(0.0, seq_dup[0][SIG_OFFSET] + 1e-3))
+    # Même contexte + même EOS + même action de décision, MAIS conséquence différente !
+    seq_diff_conseq = [list(tok) for tok in seq_a]
+    for q in range(layout["eos_pos"] + 1, layout["action_pos"]):
+        for k in range(SIG_OFFSET, DENSE_DIM):
+            if seq_diff_conseq[q][k] != 0.0:
+                seq_diff_conseq[q][k] = 1.0 - seq_diff_conseq[q][k]
+    buf._addendum = [seq_a, seq_dup, seq_diff_conseq]
+    buf._addendum_meta = [ExperienceBuffer._default_meta("wake") for _ in range(3)]
+
+    d_intra = buf.deduplicate_addendum()
+    assert d_intra == 1
+    assert len(buf._addendum) == 2                   # seq_a et seq_diff_conseq gardées
+    assert buf._addendum_meta[0]["count"] == 2
+
+    # Consolidation puis arrivée d'un doublon du coreset -> rafraîchit la vivacité
+    buf.commit_addendum()
+    buf._coreset_vivacity[0] = 0.2
+    buf._coreset_meta[0]["vivacity"] = 0.2
+    buf._addendum = [[list(tok) for tok in seq_dup]]
+    buf._addendum_meta = [ExperienceBuffer._default_meta("wake")]
+    d_core = buf.deduplicate_against_coreset()
+    assert d_core == 1
+    assert len(buf._addendum) == 0
+    assert buf._coreset_vivacity[0] == 1.0
+    assert buf._coreset_meta[0]["count"] == 3
+
+
+def test_density_eviction_protects_rare_old_memories(rng):
+    buf = ExperienceBuffer(seq_len=SEQ_STEPS + 1, n_ctx=N_CTX,
+                           dedup_eps=0.0, vivacity_decay=0.95,
+                           capacity=50, pool_capacity=3, seed=0)
+    # 1 souvenir ancien et rare (loin de tout, vivacité très faible)
+    win_rare = [make_salve([0.9] * 53, [0.9] * 5) for _ in range(SEQ_STEPS + 1)]
+    seq_rare = build_sequence(win_rare, n_ctx=N_CTX)
+    # 4 souvenirs très proches dans un cluster dense
+    win_dense = [make_salve([0.1] * 53, [0.1] * 5) for _ in range(SEQ_STEPS + 1)]
+    seq_dense = build_sequence(win_dense, n_ctx=N_CTX)
+    cluster = []
+    for k in range(4):
+        s = [list(tok) for tok in seq_dense]
+        s[0][SIG_OFFSET] = 0.1 + 0.002 * k
+        cluster.append(s)
+
+    buf._coreset = [seq_rare] + cluster[:2]
+    buf._coreset_vivacity = [0.05, 0.5, 0.8]
+    buf._coreset_meta = [ExperienceBuffer._default_meta("coreset") for _ in range(3)]
+    buf._addendum = cluster[2:]
+    buf._addendum_meta = [ExperienceBuffer._default_meta("wake") for _ in range(2)]
+
+    buf.commit_addendum()
+    assert buf.coreset_size == 3
+    assert buf.last_evicted == 2
+    # Le souvenir rare ancien (malgré vivacité 0.05) n'est PAS évincé !
+    assert seq_rare in buf._coreset
+
+
+def test_addendum_phase_uses_mixed_coreset_replay(brain, rng, monkeypatch):
+    core_seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(6)]
+    add_seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(4)]
+    brain.buffer._coreset = core_seqs
+    brain.buffer._coreset_vivacity = [1.0] * len(core_seqs)
+    brain.buffer._coreset_meta = [ExperienceBuffer._default_meta("coreset") for _ in core_seqs]
+    brain.buffer._addendum = add_seqs
+    brain.buffer._addendum_meta = [ExperienceBuffer._default_meta("wake") for _ in add_seqs]
+
+    seen_batches = []
+    def spy_train(batch_seqs):
+        seen_batches.append(batch_seqs)
+        return 0.01
+
+    monkeypatch.setattr(brain, "_train_wm_batch", spy_train)
+    list(brain.train_wm_phase(epochs=1, batch=4, target_loss=None, source="addendum"))
+    # batch=4 -> step_batch=2 addendum + 2 coreset = 4 (mix 50/50), 2 batchs par epoch
+    assert len(seen_batches) == 2
+    core_ids = {id(s) for s in core_seqs}
+    add_ids = {id(s) for s in add_seqs}
+    for b in seen_batches:
+        assert len(b) == 4
+        assert sum(id(s) in add_ids for s in b) == 2
+        assert sum(id(s) in core_ids for s in b) == 2

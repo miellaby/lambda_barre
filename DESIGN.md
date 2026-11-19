@@ -63,10 +63,32 @@ Dans le même forward, le dénouement est prédit depuis le contexte, et la
 conséquence inversée puis l'action de décision sont prédites conditionnellement
 au dénouement (teacher-forcing). Aucun dénouement contrefactuel injecté.
 
-`train_wm_phase` : vraies epochs (dataset balayé en batchs sans omission ni
-remise), `learn_count` +1 par epoch, `surprise` = loss du batch. L'optimisation
-du dataset (dedup, filtrage surprise, oubli actif, tri plateau) est **mise de
-côté** pour l'instant.
+`train_wm_phase` : vraies epochs (dataset shufflé et balayé en batchs sans
+omission ni remise — préserve la pondération intra-batch par impact et la
+calibration du MDN), `learn_count` +1 par epoch, `surprise` = loss du batch, et
+garde-fou anti-arrêt en plein slingshot d'Adam. En phase `wm_addendum`, lorsque
+le coreset est non vide, chaque batch fait un **replay mixte 50/50** (moitié
+addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
+`train_policy`.
+
+## Optimisation simple du dataset (`ExperienceBuffer`)
+
+- **Déduplication géométrique complète** (`deduplicate_addendum` et
+  `deduplicate_against_coreset`, seuil RMSE `dedup_eps = 0.02`) calculée sur
+  **tous les slots signaux valides de la séquence complète** (contexte +
+  dénouement + conséquence inversée + action de décision, hors `intero` masqué
+  et padding). Deux séquences ayant une conséquence différente ne sont jamais
+  fusionnées ; un vrai doublon rafraîchit `vivacity = 1.0` et incrémente `count`
+  du représentant conservé.
+- **Pas de filtrage destructif par surprise** ni de remise en jeu d'un tiers du
+  coreset (préserve les souvenirs sains maîtrisés et les paires
+  contrefactuelles).
+- **Éviction à capacité par densité** (`commit_addendum`) : décroissance douce
+  de la vivacité (`vivacity_decay = 0.95` par cycle), puis si `coreset >
+  pool_capacity`, éviction dans les **paires les plus proches** (distance RMSE
+  sur la séquence complète) en gardant le membre de plus haute priorité
+  `max(|relief|, impact_floor) · (0.5 + 0.5·vivacity)` — compresse les routines
+  denses tout en protégeant les comportements rares anciens.
 
 ## Inférence (`Brain.sample_denouements` / `generate_from_denouement`)
 
@@ -102,13 +124,14 @@ côté** pour l'instant.
 
 Générateur consommé frame par frame par l'UI :
 
-1. `extract_addendum` — fenêtres du journal → séquences enregistrées dans
-   l'Addendum (yield `wm_*` ensuite) ;
-2. phase WM Coreset (`yield "wm_coreset", loss`), puis phase WM Addendum
-   (`yield "wm_addendum", loss`) ;
-3. policy (`yield "pol", loss`), record Dream Theater minimal ;
-4. `commit_addendum` — Addendum → Coreset (éviction FIFO de capacité) ;
-5. `yield "done", stats`.
+- `extract_addendum` + déduplication géométrique intra-addendum et contre le
+  coreset (`yield "prune", ...`) ;
+- phase WM Coreset (`yield "wm_coreset", loss`), puis phase WM Addendum en
+  replay mixte 50/50 avec le Coreset (`yield "wm_addendum", loss`) ;
+- policy (`yield "pol", loss`), record Dream Theater avec conséquence imaginée ;
+- `commit_addendum` — Addendum → Coreset (décroissance vivacité + éviction par
+  densité si capacité dépassée) ;
+- `yield "done", stats`.
 
 `wm_loss_ratio = loss_après / loss_avant` ; `wm_plateau = ratio > 0.95` (HUD).
 

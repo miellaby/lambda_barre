@@ -68,6 +68,8 @@ TOML_TO_PARAM: dict[str, str] = {
     # buffer section
     "buffer_capacity":             "buffer_capacity",
     "buffer_pool_capacity":        "buffer_pool_capacity",
+    "buffer_dedup_eps":            "dedup_eps",
+    "buffer_vivacity_decay":       "vivacity_decay",
     # sequence section
     "sequence_seq_steps":          "seq_steps",
     "sequence_n_ctx":              "n_ctx",
@@ -106,6 +108,8 @@ BRAIN_DEFAULTS: dict = {
     "pol_hz": 8.0,
     "buffer_capacity": 1000,
     "buffer_pool_capacity": 1000,
+    "dedup_eps": 0.02,
+    "vivacity_decay": 0.95,
     "eos_decay": 0.8706,
     "eos_n_modes": 8,
     "eos_sigma_min": 0.02,
@@ -143,6 +147,8 @@ _PARAM_TO_BRAIN_KWARG: dict[str, str] = {
     "act_conseq_shift":     "act_conseq_shift",
     "buffer_capacity":      "buffer_capacity",
     "buffer_pool_capacity": "buffer_pool_capacity",
+    "dedup_eps":            "dedup_eps",
+    "vivacity_decay":       "vivacity_decay",
     "eos_decay":            "eos_decay",
     "eos_n_modes":          "eos_n_modes",
     "eos_sigma_min":        "eos_sigma_min",
