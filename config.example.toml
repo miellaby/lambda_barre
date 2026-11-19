@@ -39,7 +39,7 @@ wm_target_loss     = 0.004  # early-stop target loss for WM training (overtime p
 pol_steps          = 256    # Policy training steps per sleep cycle
 
 # Outcome (EOS) & MDN head
-eos_decay        = 0.8706   # EOS integral decay: 0.25^(1/lookahead) = 0.25^(1/10)
+eos_decay        = 0.91     # Bellman discount of EOS integral: path s7..s11 = 3.80, infinite tail s16 = 4.33
 eos_n_modes      = 8        # number of Gaussian mixture components in the MDN EOS head
 eos_sigma_min    = 0.02     # std floor for MDN components
 eos_nll_w        = 0.1      # weight of shifted per-slot MDN NLL (>= 0) in WM loss
@@ -55,8 +55,9 @@ wm_input_noise   = 0.015    # light Gaussian noise on valid signal slots during 
 [buffer]
 capacity        = 1000   # session journal: max extractable sequences during wake
 pool_capacity   = 1000   # coreset: max long-term consolidated sequences
-dedup_eps       = 0.02   # RMSE threshold over full sequence (context + EOS + consequence + action); 0 = off
-vivacity_decay  = 0.95   # per-sleep multiplicative decay of coreset vivacity (1.0 = no decay)
+dedup_eps        = 0.02   # cold-start fallback: per-token RMSE over full sequence (0 = off)
+dedup_latent_eps = 0.02   # converged WM: cosine distance on full-sequence latent [ctx, conseq+act] (0 = off)
+vivacity_decay   = 0.95   # per-sleep multiplicative decay of coreset vivacity (1.0 = no decay)
 
 # ---------------------------------------------------------------------------
 # Sequence geometry

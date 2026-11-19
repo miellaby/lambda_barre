@@ -193,13 +193,11 @@ def build_target_tables(seq_steps: int = DEFAULT_SEQ_STEPS,
 # --- dénouement (EOS) ---------------------------------------------------------
 _EOS_CANAL = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # canal 0 de la modalité EOS dédiée
 _EOS_NSLOTS = M.EOS_NSLOTS
-_EOS_DECAY = 0.8706       # eos_decay : décroissance temporelle de l'intégrale des écarts de coût.
-                          # Fixé pour lookahead=10 (seq_steps=12, n_ctx=6) tel que le dernier
-                          # terme NU (vraie position n_ctx+lookahead) vaille le QUART du début :
-                          #   eos_decay^lookahead = 0.25  =>  eos_decay = 0.25^(1/10) ≈ 0.8706
-                          # avec la prolongation p_dernier = lookahead = 10, le poids EFFECTIF
-                          # du dernier coût = 0.25 * 10 = 2.5
-# Poids relatifs W / W_max = [0.25, 1.0, 0.5, 0.5, 0.75, 0.25] pour relief_score en tanh
+_EOS_DECAY = 0.91         # eos_decay : facteur d'actualisation Bellman de l'intégrale EOS.
+                          # Pour lookahead=10 : trajet s7..s11 = 3.80, queue infinie de
+                          # Bellman sur s16 = decay^10 / (1 - decay) = 4.33 — le dénouement
+                          # final domine l'effort transitoire tout en favorisant un geste précoce.
+# Poids relatifs W / W_max = [0.125, 1.0, 0.5, 0.5, 0.75, 0.25] pour relief_score en tanh
 _EOS_CHANNEL_W_REL = (torch.tensor(_EOS_CHANNEL_W, dtype=torch.float32)
                       / float(max(_EOS_CHANNEL_W)))
 
@@ -240,11 +238,12 @@ def _eos_slots_of_window(window: list, n_ctx: int = DEFAULT_N_CTX,
             row.append(-salve[_REWARD_IDX][SIG_OFFSET])    # inconfort = -confort
             c.append(row)
         out = []
+        p_tail = (1.0 / (1.0 - decay)) if decay < 1.0 else float(lookahead)
         for j in range(_EOS_NSLOTS):
             r = 0.0
             for k in range(n_ctx + 1, L):
                 pos = (n_ctx + lookahead) if k == L - 1 else k
-                p = lookahead if k == L - 1 else 1.0
+                p = p_tail if k == L - 1 else 1.0
                 r += decay ** (pos - n_ctx) * (c[k][j] - c[n_ctx][j]) * p
             out.append(0.5 - 0.5 * math.tanh(r))
         return out
@@ -416,7 +415,7 @@ class ExperienceBuffer:
                  lookahead: int | None = None,
                  dedup_eps: float = 0.02,
                  vivacity_decay: float = 0.95,
-                 impact_floor: float = 0.25):
+                 impact_floor: float = 0.10):
         self.seq_len = seq_len                      # salves per temporal window
         self.capacity = capacity
         self.pool_capacity = pool_capacity
@@ -438,8 +437,11 @@ class ExperienceBuffer:
         self._layout = compute_seq_layout(self.seq_steps, self.n_ctx)
         # Masque bool [seq_len_toks, N_SIGNAL] des slots signaux valides sur
         # TOUTE la séquence enregistrée (contexte + dénouement + conséquence
-        # inversée + action de décision, hors tokens intero masqués et padding).
+        # inversée + action de décision, hors tokens intero masqués et padding),
+        # avec pondération PAR TOKEN (1 / sqrt(N_tok * n_slots_tok)) pour que
+        # VISION (16 slots) ne pèse pas 16x plus qu'ACT_TAIL (1 slot).
         sig_mask = torch.zeros(self._layout["seq_len"], N_SIGNAL, dtype=torch.bool)
+        tok_slot_counts: list[int] = []
         ctx_len = self._layout["ctx_len"]
         eos_pos = self._layout["eos_pos"]
         conseq_start = self._layout["conseq_start"]
@@ -447,6 +449,7 @@ class ExperienceBuffer:
         for q in range(self._layout["seq_len"]):
             if q == eos_pos:
                 sig_mask[q, :_EOS_NSLOTS] = True
+                tok_slot_counts.append(_EOS_NSLOTS)
                 continue
             if q < ctx_len:
                 tidx = q % SALVE_TOKENS
@@ -457,8 +460,16 @@ class ExperienceBuffer:
                 tidx = STATE_TOKENS + (q - action_pos)
             if tidx == _INTERO_IDX:
                 continue
-            sig_mask[q, :_N_SIGNALS[tidx]] = True
+            n_s = _N_SIGNALS[tidx]
+            sig_mask[q, :n_s] = True
+            tok_slot_counts.append(n_s)
+        n_tok = max(1, len(tok_slot_counts))
+        weights = []
+        for n_s in tok_slot_counts:
+            w = 1.0 / math.sqrt(n_tok * n_s)
+            weights.extend([w] * n_s)
         self._sig_mask = sig_mask
+        self._sig_weights = torch.tensor(weights, dtype=torch.float32)
         self.last_evicted = 0
         self._segments: deque[list[list[float]]] = deque()
         self._current: list[list[float]] = []
@@ -568,23 +579,40 @@ class ExperienceBuffer:
     def _seq_sig_matrix(self, seqs: list, device=None) -> torch.Tensor:
         """Flatten all valid signal slots of full recorded sequences (context +
         dénouement + reversed consequence + decision action, excluding masked
-        intero & padding) into a [N, D] float32 matrix for RMSE distance."""
+        intero & padding) weighted equally per token into a [N, D] float32
+        matrix so ``torch.cdist(A, B)`` is the per-token weighted RMSE."""
         t = torch.tensor(seqs, dtype=torch.float32, device=device)  # [N, L, 29]
         mask = self._sig_mask.to(t.device)                          # [L, 16]
-        return t[:, :, SIG_OFFSET:][:, mask]                        # [N, D]
+        w = self._sig_weights.to(t.device)                          # [D]
+        return t[:, :, SIG_OFFSET:][:, mask] * w                    # [N, D]
 
-    def deduplicate_addendum(self, eps: float | None = None, device=None) -> int:
-        """Drop near-duplicate sequences within the Addendum using RMSE over
-        all valid signal slots of the full sequence (context + dénouement +
+    def _pairwise_dists(self, seqs_a: list, seqs_b: list | None = None,
+                        embed_fn=None, device=None) -> torch.Tensor:
+        """Pairwise distance matrix [Na, Nb] between full recorded sequences:
+        - if ``embed_fn`` is given (converged WM full-sequence latents, unit
+          normalized): cosine distance ``1 - A @ B.T`` in [0, 2];
+        - otherwise (cold-start fallback): per-token weighted RMSE over all
+          valid signal slots of the full sequence."""
+        if embed_fn is not None:
+            a = embed_fn(seqs_a)
+            b = a if seqs_b is None else embed_fn(seqs_b)
+            return (1.0 - a @ b.T).clamp(min=0.0)
+        a = self._seq_sig_matrix(seqs_a, device=device)
+        b = a if seqs_b is None else self._seq_sig_matrix(seqs_b, device=device)
+        return torch.cdist(a, b)
+
+    def deduplicate_addendum(self, eps: float | None = None,
+                             embed_fn=None, device=None) -> int:
+        """Drop near-duplicate sequences within the Addendum using full-sequence
+        distance (WM latent cosine distance when ``embed_fn`` is provided,
+        otherwise per-token weighted RMSE over context + dénouement +
         consequence + decision action). Refreshes count/vivacity on the kept
         representative. Returns the number dropped."""
         thr = self.dedup_eps if eps is None else eps
         n = len(self._addendum)
         if thr <= 0.0 or n <= 1:
             return 0
-        vecs = self._seq_sig_matrix(self._addendum, device=device)
-        inv_sqrt_d = 1.0 / math.sqrt(vecs.shape[1])
-        dists = (torch.cdist(vecs, vecs) * inv_sqrt_d).cpu()
+        dists = self._pairwise_dists(self._addendum, embed_fn=embed_fn, device=device).cpu()
         kept_idx: list[int] = []
         for i in range(n):
             dup_of = -1
@@ -607,17 +635,16 @@ class ExperienceBuffer:
             self._addendum_meta = [self._addendum_meta[i] for i in kept_idx]
         return dropped
 
-    def deduplicate_against_coreset(self, eps: float | None = None, device=None) -> int:
-        """Drop Addendum sequences that are within RMSE ``eps`` (over the full
-        sequence including consequence) of an existing Coreset memory. Refreshes
-        the matching Coreset memory's vivacity and count. Returns number dropped."""
+    def deduplicate_against_coreset(self, eps: float | None = None,
+                                    embed_fn=None, device=None) -> int:
+        """Drop Addendum sequences within ``eps`` (full-sequence latent cosine
+        or per-token RMSE) of an existing Coreset memory. Refreshes the matching
+        Coreset memory's vivacity and count. Returns number dropped."""
         thr = self.dedup_eps if eps is None else eps
         if thr <= 0.0 or not self._addendum or not self._coreset:
             return 0
-        add_vecs = self._seq_sig_matrix(self._addendum, device=device)
-        core_vecs = self._seq_sig_matrix(self._coreset, device=device)
-        inv_sqrt_d = 1.0 / math.sqrt(add_vecs.shape[1])
-        dists = torch.cdist(add_vecs, core_vecs) * inv_sqrt_d       # [N_add, N_core]
+        dists = self._pairwise_dists(
+            self._addendum, self._coreset, embed_fn=embed_fn, device=device)
         min_d, nearest = dists.min(dim=1)
         min_d_list = min_d.tolist()
         nearest_list = nearest.tolist()
@@ -641,7 +668,7 @@ class ExperienceBuffer:
             self._addendum_meta = kept_metas
         return dropped
 
-    def commit_addendum(self, device=None) -> int:
+    def commit_addendum(self, embed_fn=None, device=None) -> int:
         """Consolidate Addendum into the Coreset with gentle vivacity decay and
         density-based capacity eviction (drops from the closest full-sequence
         pairs, keeping the higher-priority member so rare old memories survive).
@@ -662,9 +689,7 @@ class ExperienceBuffer:
         self.last_evicted = max(0, excess)
         if excess > 0:
             m = len(self._coreset)
-            vecs = self._seq_sig_matrix(self._coreset, device=device)
-            inv_sqrt_d = 1.0 / math.sqrt(vecs.shape[1])
-            dists = torch.cdist(vecs, vecs) * inv_sqrt_d
+            dists = self._pairwise_dists(self._coreset, embed_fn=embed_fn, device=device)
             dists.fill_diagonal_(float("inf"))
             eos_pos = self._layout["eos_pos"]
             priorities = [
@@ -676,7 +701,12 @@ class ExperienceBuffer:
             for _ in range(excess):
                 flat = int(dists.argmin().item())
                 i, j = divmod(flat, m)
-                victim = i if priorities[i] <= priorities[j] else j
+                victim, survivor = (i, j) if priorities[i] <= priorities[j] else (j, i)
+                # Transfère le count de la victime vers son plus proche voisin survivant
+                if survivor < len(self._coreset_meta) and victim < len(self._coreset_meta):
+                    self._coreset_meta[survivor]["count"] = (
+                        self._coreset_meta[survivor].get("count", 1)
+                        + self._coreset_meta[victim].get("count", 1))
                 evicted.add(victim)
                 dists[victim, :] = float("inf")
                 dists[:, victim] = float("inf")
@@ -817,6 +847,7 @@ class Brain:
                  pol_hidden: int = 256,
                  buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
                  dedup_eps: float = 0.02,
+                 dedup_latent_eps: float = 0.02,
                  vivacity_decay: float = 0.95,
                  eos_decay: float = _EOS_DECAY,
                  # tête MDN du dénouement + élection sur les K modes
@@ -828,7 +859,7 @@ class Brain:
                  eos_top_p: float = 0.9,
                  eos_min_p: float = 1e-3,
                  wm_input_noise: float = 0.015,
-                 wm_impact_floor: float = 0.25,
+                 wm_impact_floor: float = 0.10,
                  act_conseq_shift: int = 0):
         torch.manual_seed(seed)
         self.device, self.device_desc = M.configure_hardware(device)
@@ -867,6 +898,7 @@ class Brain:
             compute_salve_positions(seq_steps, n_ctx, lookahead=self.lookahead),
             dtype=torch.long, device=self.device)
         self.wm_impact_floor = wm_impact_floor
+        self.dedup_latent_eps = dedup_latent_eps
         self.mask = build_salve_mask(self.seq_len, self.device)
         t_valid, t_weight = build_target_tables(seq_steps, n_ctx)
         self.target_valid = t_valid.to(self.device)
@@ -1122,12 +1154,16 @@ class Brain:
         return (per_seq * sw).sum() / sw.sum().clamp(min=1e-8)
 
     def _wm_loss_impl(self, vals: torch.Tensor,
-                      seq_weights: torch.Tensor | None = None) -> torch.Tensor:
+                      seq_weights: torch.Tensor | None = None,
+                      nll_weights: torch.Tensor | None = None) -> torch.Tensor:
         """One forward, two losses over the whole recorded sequence (causal
         mask + salve positions):
-        - MSE on all tokens from the dénouement on (signal slots);
+        - MSE on all tokens from the dénouement on (signal slots, weighted by
+          ``seq_weights`` = impact);
         - exact shifted non-negative MDN NLL (per slot) on the 6 continuous
-          dénouement slots predicted at row ``eos_pos - 1``.
+          dénouement slots predicted at row ``eos_pos - 1`` (weighted only by
+          ``nll_weights`` = log1p(count), never by impact, to preserve
+          calibrated frequencies P(EOS | ctx)).
         Le token dénouement reste inconditionnellement dans l'entrée (teacher
         forcing) : la conséquence est conditionnée par contexte ET dénouement."""
         # data augmentation : bruit léger sur les seuls slots signaux valides
@@ -1151,10 +1187,11 @@ class Brain:
         log_ratio = torch.log(sigma / self.world.eos_sigma_min)             # [B, K, 6] >= 0
         log_comp = -0.5 * (diff * diff + 2.0 * log_ratio).sum(dim=-1)       # [B, K] <= 0
         nll = -torch.logsumexp(log_pi + log_comp, dim=-1) / _EOS_NSLOTS     # [B] >= 0
-        # MDN NLL stays unweighted by impact so pi learns the true calibrated
-        # conditional frequencies P(EOS | ctx) rather than an impact-tilted
-        # distribution (impact weighting applies to the trajectory/action MSE).
-        nll_loss = nll.mean()
+        if nll_weights is None:
+            nll_loss = nll.mean()
+        else:
+            nw = nll_weights.to(nll.device)
+            nll_loss = (nll * nw).sum() / nw.sum().clamp(min=1e-8)
         return mse + self.eos_nll_w * nll_loss
 
     def _seq_impact(self, seq: list) -> float:
@@ -1163,15 +1200,19 @@ class Brain:
         rel = abs(float(relief_score(seq, eos_pos=self.eos_pos)))
         return max(rel, self.wm_impact_floor)
 
-    def _train_wm_batch(self, sequences) -> float:
+    def _train_wm_batch(self, sequences, counts: list[int] | None = None) -> float:
         """One WM optimization step on a batch of recorded sequences.
-        Impact-proportional training : chaque séquence est pondérée par
-        ``_seq_impact`` — les séquences à fort soulagement pèsent plus que
-        les séquences neutres."""
+        - MSE is weighted by ``_seq_impact`` (impact-proportional training);
+        - MDN NLL is weighted by ``log1p(count)`` when ``counts`` are given
+          (reflects deduplicated multiplicity without letting one static point
+          dominate a batch)."""
         vals = self._batch_tensors(sequences)
         impacts = [self._seq_impact(s) for s in sequences]
         seq_w = torch.tensor(impacts, dtype=torch.float32, device=self.device)
-        loss = self._wm_loss(vals, seq_w)
+        nll_w = (torch.tensor([math.log1p(max(1, int(c))) for c in counts],
+                              dtype=torch.float32, device=self.device)
+                 if counts is not None else None)
+        loss = self._wm_loss(vals, seq_w, nll_w)
         self.opt_wm.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
@@ -1231,21 +1272,32 @@ class Brain:
                 idxs = order[start:start + step_batch]
                 self.sleep_wm_batch = start // step_batch + 1
                 batch_seqs = [seqs_all[i] for i in idxs]
+                batch_counts = [
+                    metas_all[i].get("count", 1) if i < len(metas_all) else 1
+                    for i in idxs
+                ]
                 if mix_coreset and batch_seqs:
                     # Replay mixte 50/50 addendum + coreset : évite l'oubli
                     # catastrophique du coreset pendant la phase addendum.
                     n_replay = min(len(buf._coreset), len(batch_seqs))
-                    batch_seqs = batch_seqs + buf._rng.sample(buf._coreset, n_replay)
+                    r_idxs = buf._rng.sample(range(len(buf._coreset)), n_replay)
+                    batch_seqs = batch_seqs + [buf._coreset[r] for r in r_idxs]
+                    batch_counts = batch_counts + [
+                        buf._coreset_meta[r].get("count", 1)
+                        if r < len(buf._coreset_meta) else 1
+                        for r in r_idxs
+                    ]
                 if fixed_seq is not None:
                     fs = fixed_seq() if callable(fixed_seq) else fixed_seq
                     if fs is not None:
                         batch_seqs = [fs] + batch_seqs
+                        batch_counts = [1] + batch_counts
                 if not batch_seqs:
                     if n == 0:
                         self.sleep_wm_slingshot = False
                         return  # source vide et fixed_seq None : rien à entraîner
                     continue
-                loss_c = self._train_wm_batch(batch_seqs)
+                loss_c = self._train_wm_batch(batch_seqs, counts=batch_counts)
                 epoch_losses.append(loss_c)
                 for i in idxs:
                     if i < len(metas_all):
@@ -1287,6 +1339,37 @@ class Brain:
                     self.sleep_wm_slingshot = False
                     break
                 extra_used += 1
+
+    @torch.inference_mode()
+    def encode_sequence_latents(self, sequences: list, batch_size: int = 128) -> torch.Tensor:
+        """Extract normalized full-sequence WM latent embeddings [N, 2*d_model]
+        concatenating [mean(contexte), mean(eos..action)] from the mid-layer
+        representation (50/50 balance between context and full consequence +
+        decision action). Restores ``self.world.training`` afterwards."""
+        if not sequences:
+            return torch.zeros(0, 2 * self.world.d_model, device=self.device)
+        was_training = self.world.training
+        self.world.eval()
+        chunks = []
+        try:
+            for i in range(0, len(sequences), batch_size):
+                vals = self._batch_tensors(sequences[i:i + batch_size])
+                eos_cond = vals[:, self.eos_pos, SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS]
+                self.world(vals, attn_mask=self.mask, is_causal=True,
+                           salve_positions=self.salve_positions,
+                           eos_cond=eos_cond, eos_pos=self.eos_pos)
+                lat = self.world._latent                                # [B, seq_len, d]
+                ctx_m = torch.nn.functional.normalize(
+                    lat[:, :self.eos_pos, :].mean(dim=1), dim=-1)       # [B, d]
+                conseq_m = torch.nn.functional.normalize(
+                    lat[:, self.eos_pos:, :].mean(dim=1), dim=-1)       # [B, d]
+                emb = torch.nn.functional.normalize(
+                    torch.cat([ctx_m, conseq_m], dim=-1), dim=-1)       # [B, 2*d]
+                chunks.append(emb)
+        finally:
+            if was_training:
+                self.world.train()
+        return torch.cat(chunks, dim=0)
 
     def evaluate_sequences_surprise(self, sequences, batch_size: int = 32) -> list[float]:
         """Per-sequence prediction MSE under the current WM (inference only)."""
@@ -1384,8 +1467,8 @@ class Brain:
                            top_n: int | None = None,
                            top_p: float | None = None,
                            min_p: float | None = None,
-                           eos_observed: torch.Tensor | None = None
-                           ) -> tuple[torch.Tensor, torch.Tensor]:
+                           eos_observed: torch.Tensor | None = None,
+                           return_value: bool = False):
         """Exact election over the K continuous MDN modes predicted from context:
 
         - ``probs = softmax(logits_pi / T)`` gives the exact probability of each
@@ -1401,7 +1484,9 @@ class Brain:
           mode only when its relief strictly exceeds the elected mode's relief
           (with ``p_elu = 1.0``).
 
-        Returns (eos_elu [B, 6], p_elu [B])."""
+        Returns ``(eos_elu [B, 6], p_elu [B])``, or ``(eos_elu, p_elu, v_ctx [B])``
+        when ``return_value=True``, where ``v_ctx = sum_k probs_k * relief(mu_k)``
+        is the MDN expected relief of the context (for advantage weighting)."""
         B = ctx.shape[0]
         device = ctx.device
         T = temperature if temperature is not None else self.eos_temperature
@@ -1430,6 +1515,7 @@ class Brain:
             eligible = eligible.scatter(1, best, torch.ones_like(best, dtype=torch.bool))
 
         relief = relief_score(mu)                                         # [B, K]
+        v_ctx = (probs * relief).sum(dim=1)                               # [B]
         elu = torch.where(
             eligible, relief, torch.full_like(relief, float("-inf"))).argmax(dim=1)
         b_idx = torch.arange(B, device=device)
@@ -1440,6 +1526,8 @@ class Brain:
             use_obs = rel_obs > relief[b_idx, elu]
             eos_elu = torch.where(use_obs.unsqueeze(1), eos_observed, eos_elu)
             p_elu = torch.where(use_obs, torch.ones_like(p_elu), p_elu)
+        if return_value:
+            return eos_elu, p_elu, v_ctx
         return eos_elu, p_elu
 
     @torch.inference_mode()
@@ -1574,7 +1662,8 @@ class Brain:
             scalars_inf = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
             pol_in_inf = torch.cat([scalars_inf, latent_inf], dim=1)
             pol_action = self.policy(pol_in_inf)                 # [B, 5]
-            eos_elu_inf, p_elu_inf = self.sample_denouements(ctx, eos_observed=eos_obs)
+            eos_elu_inf, p_elu_inf, v_ctx_inf = self.sample_denouements(
+                ctx, eos_observed=eos_obs, return_value=True)
             gen_inf = self.generate_from_denouement(ctx, eos_elu_inf)
             gen_action_inf = gen_inf["action"]
             gen_full_0 = gen_inf["full"][0].tolist()
@@ -1586,11 +1675,15 @@ class Brain:
         a_star = self._decode_action_batch(gen_action_inf.clone())   # [B, 5]
         pred = self.policy(pol_in)
         per_seq = ((pred - a_star) ** 2).mean(dim=1)             # [B]
-        # RL offline par régression pondérée : poids = confiance de l'élu (p_elu)
-        # x return (relief du dénouement élu, cappé à 0 — on n'imite pas les
-        # trajectoires à return négatif)
+        # RL offline par régression pondérée par l'avantage (AWR) :
+        #   A = relief(élu) - V_MDN(ctx)
+        # Permet d'apprendre aussi le maintien debout et l'évitement de chute
+        # (élu = 0.0 vs V = -0.6 -> A = +0.6 > 0). max(A, relief_elu) évite
+        # d'annuler un contexte où toutes les issues observées sont déjà de
+        # bons relèvements.
         relief_elu = relief_score(eos_elu).detach()              # [B]
-        w = p_elu_inf.clone().detach() * torch.relu(relief_elu)
+        adv = relief_elu - v_ctx_inf.clone().detach()            # [B]
+        w = p_elu_inf.clone().detach() * torch.relu(torch.maximum(adv, relief_elu))
         loss = (per_seq * w).sum() / w.sum().clamp(min=1e-8)
         self.opt_pol.zero_grad()
         loss.backward()
@@ -1688,11 +1781,18 @@ class Brain:
         coreset_before = self.buffer.coreset_size
 
         n_wake = self.buffer.extract_addendum()
-        d_intra = self.buffer.deduplicate_addendum(device=self.device)
-        d_core = self.buffer.deduplicate_against_coreset(device=self.device)
+        wm_converged = (not math.isnan(self.last_wm_loss)) and (
+            wm_target_loss is None or self.last_wm_loss <= wm_target_loss)
+        dedup_embed = self.encode_sequence_latents if wm_converged else None
+        dedup_eps = self.dedup_latent_eps if wm_converged else self.buffer.dedup_eps
+        d_intra = self.buffer.deduplicate_addendum(
+            eps=dedup_eps, embed_fn=dedup_embed, device=self.device)
+        d_core = self.buffer.deduplicate_against_coreset(
+            eps=dedup_eps, embed_fn=dedup_embed, device=self.device)
         self.sleep_cycle_stats = {
             "coreset_before": coreset_before,
             "wake": n_wake,
+            "dedup_mode": "latent" if wm_converged else "geom",
             "dedup_intra": d_intra,
             "dedup_coreset": d_core,
             "addendum_kept": len(self.buffer._addendum),
@@ -1744,7 +1844,10 @@ class Brain:
         for label, value in self.train_policy(pol_steps, pol_batch):
             yield label, value
 
-        n_committed = self.buffer.commit_addendum(device=self.device)
+        commit_converged = (not math.isnan(self.last_wm_loss)) and (
+            wm_target_loss is None or self.last_wm_loss <= wm_target_loss)
+        commit_embed = self.encode_sequence_latents if commit_converged else None
+        n_committed = self.buffer.commit_addendum(embed_fn=commit_embed, device=self.device)
         self.sleep_cycle_stats["evicted"] = self.buffer.last_evicted
         self.sleep_cycle_stats["coreset_after"] = self.buffer.coreset_size
         self._recording = True

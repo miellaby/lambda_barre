@@ -537,7 +537,7 @@ def test_train_wm_phase_waits_out_adam_slingshot(brain, rng, monkeypatch):
     # Simule une loss qui descend, puis un slingshot à l'epoch 4 (juste avant
     # quota=5) qui ne retombe et ne se stabilise qu'aux epochs 7, 8, 9.
     losses = iter([0.10, 0.05, 0.02, 0.08, 0.05, 0.03, 0.02, 0.018, 0.017, 0.016])
-    monkeypatch.setattr(brain, "_train_wm_batch", lambda batch: next(losses))
+    monkeypatch.setattr(brain, "_train_wm_batch", lambda batch, **kw: next(losses))
     epochs_seen = [ep for _, ep, _ in brain.train_wm_phase(
         epochs=5, batch=8, target_loss=0.06, source="coreset",
         slingshot_ratio=1.30, slingshot_settle=3, slingshot_max_extra=20)]
@@ -653,6 +653,8 @@ def test_density_eviction_protects_rare_old_memories(rng):
     assert buf.last_evicted == 2
     # Le souvenir rare ancien (malgré vivacité 0.05) n'est PAS évincé !
     assert seq_rare in buf._coreset
+    # Le count total (1 rare + 4 cluster = 5) est conservé via transfert aux survivants
+    assert sum(m["count"] for m in buf._coreset_meta) == 5
 
 
 def test_addendum_phase_uses_mixed_coreset_replay(brain, rng, monkeypatch):
@@ -665,8 +667,8 @@ def test_addendum_phase_uses_mixed_coreset_replay(brain, rng, monkeypatch):
     brain.buffer._addendum_meta = [ExperienceBuffer._default_meta("wake") for _ in add_seqs]
 
     seen_batches = []
-    def spy_train(batch_seqs):
-        seen_batches.append(batch_seqs)
+    def spy_train(batch_seqs, counts=None):
+        seen_batches.append((batch_seqs, counts))
         return 0.01
 
     monkeypatch.setattr(brain, "_train_wm_batch", spy_train)
@@ -675,7 +677,86 @@ def test_addendum_phase_uses_mixed_coreset_replay(brain, rng, monkeypatch):
     assert len(seen_batches) == 2
     core_ids = {id(s) for s in core_seqs}
     add_ids = {id(s) for s in add_seqs}
-    for b in seen_batches:
-        assert len(b) == 4
+    for b, cts in seen_batches:
+        assert len(b) == 4 and len(cts) == 4
         assert sum(id(s) in add_ids for s in b) == 2
         assert sum(id(s) in core_ids for s in b) == 2
+
+
+def test_latent_full_sequence_dedup_and_mode_switch(brain, rng):
+    seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(3)]
+    dup = [list(tok) for tok in seqs[0]]
+    # encode_sequence_latents : shape [N, 2*d_model], norme unitaire, préserve train()
+    brain.world.train()
+    emb = brain.encode_sequence_latents([seqs[0], dup, seqs[1]])
+    assert brain.world.training
+    assert emb.shape == (3, 2 * brain.world.d_model)
+    assert torch.allclose(emb.norm(dim=-1), torch.ones(3, device=brain.device), atol=1e-5)
+    # Identiques -> distance cosinus ~ 0 ; différentes -> distance > 0
+    d01 = float((1.0 - (emb[0] * emb[1]).sum()).clamp(min=0.0))
+    d02 = float((1.0 - (emb[0] * emb[2]).sum()).clamp(min=0.0))
+    assert d01 < 1e-5 and d02 > 1e-3
+
+    # Déduplication par latent sur la séquence complète
+    brain.buffer._addendum = [seqs[0], dup, seqs[1]]
+    brain.buffer._addendum_meta = [ExperienceBuffer._default_meta("wake") for _ in range(3)]
+    dropped = brain.buffer.deduplicate_addendum(
+        eps=0.01, embed_fn=brain.encode_sequence_latents, device=brain.device)
+    assert dropped == 1
+    assert len(brain.buffer._addendum) == 2
+
+    # Mode automatique dans sleep_cycle : "geom" avant convergence, "latent" après
+    brain.buffer.clear()
+    for _ in range(SEQ_STEPS + 5):
+        brain.record_tick(_rand_salve(rng))
+    brain.last_wm_loss = float("nan")
+    list(brain.sleep_cycle(wm_coreset_epoch=0, wm_addendum_epoch=0,
+                           pol_steps=0, wm_target_loss=0.05))
+    assert brain.sleep_cycle_stats["dedup_mode"] == "geom"
+
+    for _ in range(SEQ_STEPS + 5):
+        brain.record_tick(_rand_salve(rng))
+    brain.last_wm_loss = 0.01
+    list(brain.sleep_cycle(wm_coreset_epoch=0, wm_addendum_epoch=0,
+                           pol_steps=0, wm_target_loss=0.05))
+    assert brain.sleep_cycle_stats["dedup_mode"] == "latent"
+
+
+def test_mdn_nll_weighted_by_log1p_count(rng):
+    torch.manual_seed(0)
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=64, nhead=4, layers=1,
+              dim_ff=128, pol_hidden=32, lr_wm=3e-3, wm_input_noise=0.0,
+              eos_n_modes=4, eos_nll_w=1.0)
+    base_win = _rand_window(rng)
+    eos_pos = b.eos_pos
+    seq_a = build_sequence(base_win, n_ctx=N_CTX)
+    seq_b = [list(t) for t in seq_a]
+    eos_a = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    eos_b = [0.2, 0.05, 0.5, 0.1, 0.1, 0.2]
+    seq_a[eos_pos] = seq_a[eos_pos][:SIG_OFFSET] + eos_a + [0.0] * (N_SIGNAL - 6)
+    seq_b[eos_pos] = seq_b[eos_pos][:SIG_OFFSET] + eos_b + [0.0] * (N_SIGNAL - 6)
+    # 1 représentant chacun, mais count=100 vs count=1 -> log1p(100)/log1p(1) ~ 6.7x
+    b.world.train()
+    for _ in range(300):
+        b._train_wm_batch([seq_a, seq_b], counts=[100, 1])
+    ctx = b._batch_tensors([seq_a])[:, :b.ctx_len]
+    mu_best = b.predict_denouement(ctx)[0]
+    assert (mu_best - torch.tensor(eos_a, device=b.device)).abs().max().item() < 0.1
+
+
+def test_policy_advantage_learns_fall_avoidance(brain, rng, monkeypatch):
+    # Contexte à chute probable (V_ctx = -0.6) où l'élu est le maintien debout
+    # neutre (relief_elu = 0.0) : l'avantage A = +0.6 > 0 doit donner une loss
+    # non nulle et un vrai gradient sur la policy (contrairement à relu(0)=0).
+    seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    neutral_eos = torch.full((1, 6), 0.5, device=brain.device)
+    fake_p = torch.tensor([0.5], device=brain.device)
+    fake_v = torch.tensor([-0.6], device=brain.device)
+    monkeypatch.setattr(
+        brain, "sample_denouements",
+        lambda ctx, eos_observed=None, return_value=False, **kw:
+            (neutral_eos, fake_p, fake_v) if return_value else (neutral_eos, fake_p))
+    before = [p.clone() for p in brain.policy.parameters()]
+    loss = brain._policy_step([seq], step_idx=0, total_steps=1)
+    assert loss > 0.0
+    assert any(not torch.equal(a, b) for a, b in zip(before, brain.policy.parameters()))

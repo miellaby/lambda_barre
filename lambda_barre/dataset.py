@@ -30,7 +30,7 @@ def generate_balance_dataset(
     seq_steps: int = 12,
     n_ctx: int = 6,
     lookahead: int | None = 10,
-    eos_decay: float = 0.8706,
+    eos_decay: float = 0.91,
     wm_hz: float = 4.0,
     buffer_capacity: int = 1000,
     buffer_pool_capacity: int = 1000,

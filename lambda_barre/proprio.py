@@ -268,8 +268,8 @@ class Reward:
         else:
             confort = 0.0
 
-        reward_neg = (1.0 * effort + 4.0 * douleur + 2.0 * courbature
-                      + 2.0 * instabilite + 3.0 * vertige) / 12.0
+        reward_neg = (0.5 * effort + 4.0 * douleur + 2.0 * courbature
+                      + 2.0 * instabilite + 3.0 * vertige) / 11.5
         reward_pos = 1.0 * confort  # already negative (reward)
 
         return {

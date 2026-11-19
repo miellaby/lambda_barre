@@ -287,7 +287,7 @@ _ACTION_LOOKUP = {
 
 # Weights for each innate cost signal in salve_cost.
 _COST_WEIGHTS = {
-    "effort": 1.0,
+    "effort": 0.5,
     "douleur": 4.0,
     "courbature": 2.0,
     "instabilite": 2.0,
@@ -301,7 +301,7 @@ _COST_WEIGHTS = {
 # saliency anchor, Dream Theater display); the slots themselves stay raw
 # per-channel aggregates.
 _EOS_CHANNEL_W = ([_COST_WEIGHTS[k] for k in _COST_KEYS]
-                  + [_COST_WEIGHTS["confort"]])          # [1, 4, 2, 2, 3, 1]
+                  + [_COST_WEIGHTS["confort"]])          # [0.5, 4, 2, 2, 3, 1]
 
 
 def _prefix(ch: ChannelSpec) -> list[float]:

@@ -21,9 +21,10 @@ puis la dernière salve à `+lookahead` ticks de la décision
   l'extraction (`_eos_slots_of_window`) : intégrale par canal de l'écart au
   coût de la décision pondérée par la vraie position temporelle,
   `r[j] = Σ_{k>d} eos_decay^(pos_k−d)·(c[k][j]−c[d][j])·p_k` avec `pos_k = k`
-  sauf dernière salve à `pos = n_ctx+lookahead`, et `p_k = lookahead` pour le
-  dernier état (prolongation fictive du coût final),
-  `slot[j] = 0.5 − 0.5·tanh(r[j])`, 0.5 = neutre ;
+  sauf dernière salve à `pos = n_ctx+lookahead`, et `p_k = 1/(1−eos_decay)`
+  pour le dernier état (queue géométrique infinie de Bellman ; pour
+  `eos_decay = 0.91` et `lookahead = 10`, arrivée = `4.33` contre `3.80` sur le
+  trajet intermédiaire), `slot[j] = 0.5 − 0.5·tanh(r[j])`, 0.5 = neutre ;
 - **conséquence inversée** : états seuls `s_{seq_steps} .. s_{n_ctx+1}`, du plus
   tardif au plus précoce — `conseq_len = n_imagine × 13` tokens ;
 - **action de décision** : `a_{n_ctx}`, 3 tokens, **dernier token** de la
@@ -53,11 +54,12 @@ La loss combine :
   action de décision), pondérée par token ;
 - une tête **MDN** (*Mixture Density Network*, `eos_n_modes` = 8 composantes
   gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) lue à la
-  row `eos_pos - 1`, entraînée par **NLL exacte** non pondérée par l'impact
-  (préserve les vraies fréquences calibrées $P(\text{EOS}\mid\text{ctx})$,
-  décalée par son minimum théorique en `sigma_min` et normalisée par slot, donc
-  toujours $\ge 0$, poids `eos_nll_w`) — une vraie distribution **jointe
-  continue et multimodale** sur les 6 slots, sans codebook ni k-means.
+  row `eos_pos - 1`, entraînée par **NLL exacte** pondérée uniquement par
+  `log1p(count)` (jamais par l'impact — reflète la multiplicité des séquences
+  dédupliquées sans qu'un point immobile écrase le batch ; décalée par son
+  minimum théorique en `sigma_min` et normalisée par slot, donc toujours
+  $\ge 0$, poids `eos_nll_w`) — une vraie distribution **jointe continue et
+  multimodale** sur les 6 slots, sans codebook ni k-means.
 
 Dans le même forward, le dénouement est prédit depuis le contexte, et la
 conséquence inversée puis l'action de décision sont prédites conditionnellement
@@ -73,22 +75,32 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
 
 ## Optimisation simple du dataset (`ExperienceBuffer`)
 
-- **Déduplication géométrique complète** (`deduplicate_addendum` et
-  `deduplicate_against_coreset`, seuil RMSE `dedup_eps = 0.02`) calculée sur
-  **tous les slots signaux valides de la séquence complète** (contexte +
-  dénouement + conséquence inversée + action de décision, hors `intero` masqué
-  et padding). Deux séquences ayant une conséquence différente ne sont jamais
-  fusionnées ; un vrai doublon rafraîchit `vivacity = 1.0` et incrémente `count`
-  du représentant conservé.
+- **Déduplication sur la séquence complète** (`deduplicate_addendum` et
+  `deduplicate_against_coreset`) :
+  - **avant convergence du WM** (`last_wm_loss` NaN ou `> wm_target_loss`,
+    démarrage à froid) : distance RMSE **pondérée par token** (`dedup_eps =
+    0.02`) sur tous les slots signaux valides de la séquence complète (contexte
+    + dénouement + conséquence inversée + action de décision, hors `intero`
+    masqué et padding) ;
+  - **une fois le WM convergé** (`last_wm_loss <= wm_target_loss`) : distance
+    cosinus (`dedup_latent_eps = 0.02`) sur le **latent WM de la séquence
+    complète** (`Brain.encode_sequence_latents` : concaténation normalisée
+    `[mean(contexte), mean(eos..action)]`, 50/50 entre contexte et conséquence
+    + action) — ignore les distracteurs exogènes (ex. balle) sans jamais
+    fusionner deux séquences à conséquence ou dénouement différent.
+  - Un doublon rafraîchit `vivacity = 1.0` et incrémente `count` du
+    représentant conservé.
 - **Pas de filtrage destructif par surprise** ni de remise en jeu d'un tiers du
   coreset (préserve les souvenirs sains maîtrisés et les paires
   contrefactuelles).
 - **Éviction à capacité par densité** (`commit_addendum`) : décroissance douce
   de la vivacité (`vivacity_decay = 0.95` par cycle), puis si `coreset >
-  pool_capacity`, éviction dans les **paires les plus proches** (distance RMSE
-  sur la séquence complète) en gardant le membre de plus haute priorité
-  `max(|relief|, impact_floor) · (0.5 + 0.5·vivacity)` — compresse les routines
-  denses tout en protégeant les comportements rares anciens.
+  pool_capacity`, éviction dans les **paires les plus proches** (même distance
+  latente complète si WM convergé, sinon RMSE par token) en gardant le membre
+  de plus haute priorité `max(|relief|, impact_floor) · (0.5 + 0.5·vivacity)`
+  et en transférant le `count` de la victime vers son voisin survivant —
+  compresse les routines denses tout en protégeant les comportements rares
+  anciens.
 
 ## Inférence (`Brain.sample_denouements` / `generate_from_denouement`)
 
@@ -117,8 +129,11 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
   normalisé par `F.layer_norm` sans paramètres (identique en éveil et en
   sommeil).
 - Cible = **action de décision générée** par le WM sous le dénouement élu.
-- Pondération par confiance et soulagement positif :
-  `w = p_elu.detach() * relu(relief_elu)`, `loss = Σ_i mse_i · w_i / Σ_i w_i`.
+- Pondération par confiance et **avantage** (façon AWR) :
+  `V_ctx = Σ_k π_k · relief(μ_k)`, `A = relief(élu) − V_ctx`,
+  `w = p_elu.detach() · relu(max(A, relief_elu))`,
+  `loss = Σ_i mse_i · w_i / Σ_i w_i`. Permet d'apprendre aussi le maintien
+  debout et l'évitement de chute (`élu = 0.0` face à `V_ctx < 0`).
 
 ## Sleep cycle (`Brain.sleep_cycle`)
 
