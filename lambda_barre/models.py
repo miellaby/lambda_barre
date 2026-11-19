@@ -11,9 +11,9 @@ de décision apprenant":
                  and is trained by reinforcement learning to minimize the cost
                  *predicted* by the world model, using imagined trajectories.
 
-Tokens come from ``tokenize`` as dense 25-float vectors (9-float structural
+Tokens come from ``tokenize`` as dense 29-float vectors (13-float structural
 prefix + 16 normalized signal slots). There are no learned embeddings: the
-world model projects the 25-dim token to ``d_model`` with a linear layer, adds
+world model projects the 29-dim token to ``d_model`` with a linear layer, adds
 a non-learned sinusoidal positional encoding keyed by *salve* index (all 16
 tokens of a salve share the same position — this encodes time, not intra-salve
 order), and regresses the 16 signal slots of the next token (MSE). The token
@@ -96,6 +96,10 @@ from .tokenize import (_COST_IDX, _REWARD_IDX, DENSE_DIM, N_SIGNAL, STATE_TOKENS
                        ACTION_TOKENS, TYPE_DIM, MOD_DIM, CANAL_DIM, N_POLICY_STATE,
                        _LAYOUT, _prefix, _N_SIGNALS)
 
+EOS_NSLOTS = 6      # cost-aggregate slots of the dénouement (EOS) token
+EOS_N_MODES = 8     # number of Gaussian mixture components in the MDN EOS head
+EOS_SIGMA_MIN = 0.02  # std floor for MDN components (prevents Dirac NLL blow-up)
+
 
 # --- actuator consigne ranges (mirror body.py) -------------------------------
 LIMB_MIN = 10.0
@@ -105,46 +109,18 @@ THETA_RANGE = math.pi   # limb / tail theta consignes in [-pi, +pi]
 _SALVE_MASK_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 
 
-def build_salve_mask(
-    L: int,
-    device,
-    ctx_len: int = 0,
-    boost: float = 0.0,
-) -> torch.Tensor:
-    """Classical (strictly causal) Transformer mask. Cached per (length,
-    device, ctx_len, boost): it is queried on every training step and every
-    rollout pass, and the allocation is pure overhead. Read-only — never mutate.
-
-    With ``boost > 0``, returns a float additive mask instead: -inf above the
-    diagonal (causal), plus a gain triangle on the key columns ``[0, ctx_len]``
-    — context columns ``[0, ctx_len)`` ramp linearly from 0 at S0 to ``boost``
-    at S_{n_ctx}, and the dénouement column ``ctx_len`` (eos_pos) gets the SUM
-    of all context-column biases (``1*dénouement = 1*contexte`` in
-    P(action, conséquence | contexte, dénouement)). Softmax weight of key c
-    is multiplied by ~exp(bias). With ``boost == 0``, returns the plain
-    bool causal mask (fast path preserved)."""
-    key = (L, str(device), ctx_len, boost)
+def build_salve_mask(L: int, device) -> torch.Tensor:
+    """Strictly causal Transformer mask (bool: True = masked, above the
+    diagonal). Cached per (length, device): it is queried on every training
+    step and every rollout pass, and the allocation is pure overhead.
+    Read-only — never mutate."""
+    key = (L, str(device))
     m = _SALVE_MASK_CACHE.get(key)
     if m is None:
-        causal = torch.triu(
+        m = torch.triu(
             torch.ones(L, L, dtype=torch.bool, device=device),
             diagonal=1,
         )
-        if boost > 0.0:
-            m = torch.zeros(L, L, dtype=torch.float32, device=device)
-            m.masked_fill_(causal, float("-inf"))
-            if ctx_len > 0:
-                # colonnes [0, ctx_len] : triangle contexte ; la colonne
-                # dénouement (ctx_len = eos_pos) porte à elle seule la SOMME
-                # des biais du contexte : 1*dénouement = 1*contexte
-                n_cols = min(ctx_len + 1, L)
-                salve_idx = torch.arange(n_cols, device=device) // SALVE_TOKENS
-                ramp = salve_idx.float() / float(max(1, (ctx_len - 1) // SALVE_TOKENS))
-                if ctx_len < n_cols:
-                    ramp[ctx_len] = ramp[:ctx_len].sum()
-                m[:, :n_cols] += boost * ramp.unsqueeze(0)
-        else:
-            m = causal
         _SALVE_MASK_CACHE[key] = m
     return m
 
@@ -207,17 +183,46 @@ class WorldModel(nn.Module):
     """
 
     def __init__(self, d_model: int = 64, nhead: int = 4, layers: int = 3,
-                 dim_ff: int = 384, dropout: float = 0.0):
+                 dim_ff: int = 384, dropout: float = 0.0,
+                 eos_n_modes: int = EOS_N_MODES,
+                 eos_sigma_min: float = EOS_SIGMA_MIN):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.dropout_p = dropout
+        self.eos_n_modes = eos_n_modes
+        self.eos_sigma_min = eos_sigma_min
         self.in_proj = nn.Linear(DENSE_DIM, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_ff, dropout=dropout,
             activation="gelu", batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, layers)
         self.head = nn.Linear(d_model, N_SIGNAL)
+        # Mixture Density Network (MDN) head for the dénouement token:
+        # predicts a multimodal joint distribution over the 6 continuous EOS
+        # slots as a mixture of K diagonal Gaussians conditioned on context.
+        # Inter-slot correlations are carried by the mixture components.
+        self.eos_pi = nn.Linear(d_model, eos_n_modes)
+        self.eos_mu = nn.Linear(d_model, eos_n_modes * EOS_NSLOTS)
+        self.eos_sigma = nn.Linear(d_model, eos_n_modes * EOS_NSLOTS)
+        # Direct conditioning projection: infuses the 6 EOS slots into every
+        # token embedding at position q >= eos_pos (never into the context
+        # 0..eos_pos-1, keeping MDN prediction and wake latent leak-free).
+        self.eos_cond_proj = nn.Linear(EOS_NSLOTS, d_model)
+        with torch.no_grad():
+            self.eos_pi.bias.zero_()
+            # Spread initial mode centers across logit space (~[0.18, 0.82]
+            # after sigmoid) to break symmetry and prevent initial mode collapse.
+            if eos_n_modes > 1:
+                base = torch.linspace(-1.5, 1.5, eos_n_modes).unsqueeze(1)
+                slot_off = torch.linspace(-0.25, 0.25, EOS_NSLOTS).unsqueeze(0)
+                signs = torch.tensor([(-1.0) ** (k + j) for k in range(eos_n_modes)
+                                      for j in range(EOS_NSLOTS)]).view(eos_n_modes, EOS_NSLOTS)
+                self.eos_mu.bias.copy_((base + signs * slot_off).reshape(-1))
+            else:
+                self.eos_mu.bias.zero_()
+            # Start with moderate std (~0.22) so all modes receive smooth NLL gradients.
+            self.eos_sigma.bias.fill_(-1.5)
         # Fixed next-state template: 13 state tokens with their structural
         # prefix and zeroed signal slots.
         tmpl = [_prefix(_LAYOUT[i]) + [0.0] * N_SIGNAL
@@ -280,28 +285,21 @@ class WorldModel(nn.Module):
         pe[:, 1::2] = torch.cos(pos_f * div)
         return pe
 
-    def forward(self, x: torch.Tensor,
-                attn_mask: torch.Tensor = None,
-                is_causal: bool | None = None,
-                salve_positions: torch.Tensor = None) -> torch.Tensor:
-        """x: [B, L, 25] float tokens. Returns predicted signal slots
-        [B, L, 16] (each position predicts the next token's 16 signals).
-
-        ``attn_mask`` defaults to the strictly causal salve mask. ``is_causal``
-        is only a fast-path hint for ``nn.TransformerEncoder`` (it skips the
-        per-call mask comparison): inferred from the mask when None, so a
-        non-causal mask (e.g. the EOS-lookahead mask) never takes the causal
-        fast path silently.
-
-        ``salve_positions`` ([L] long, salve indices) overrides the default
-        ``arange(L) // SALVE_TOKENS`` positional encoding. The encoding only
-        keys on the salve index, so a token can sit anywhere in the input and
-        still "be" at its temporal slot — used by hindsight generation to
-        append the terminal EOS token at salve ``SEQ_STEPS`` position of an
-        otherwise short context."""
+    def _encode(self, x: torch.Tensor,
+                attn_mask: torch.Tensor,
+                is_causal: bool | None,
+                salve_positions: torch.Tensor | None,
+                eos_cond: torch.Tensor | None = None,
+                eos_pos: int | None = None) -> torch.Tensor:
+        """Token stream -> transformer output h [B, L, d_model] (shared by
+        ``forward`` and ``forward_with_eos``)."""
         B, L, _ = x.shape
         device = x.device
         h = self.in_proj(x)                              # [B, L, d_model]
+        if eos_cond is not None and eos_pos is not None and L > eos_pos:
+            cond = self.eos_cond_proj(eos_cond.to(device)).unsqueeze(1)   # [B, 1, d_model]
+            pos_mask = (torch.arange(L, device=device) >= eos_pos).view(1, L, 1)
+            h = h + cond * pos_mask
         if salve_positions is None:
             salve_pos = torch.arange(L, device=device) // SALVE_TOKENS
         else:
@@ -313,7 +311,7 @@ class WorldModel(nn.Module):
         else:
             attn_mask = attn_mask.to(device)
             if attn_mask.dtype != torch.bool:
-                causal = False   # masque float additif (ex. boost contexte) : appliqué tel quel
+                causal = False
             elif is_causal is None:
                 causal = bool(torch.equal(attn_mask, build_salve_mask(L, device)))
             else:
@@ -321,9 +319,44 @@ class WorldModel(nn.Module):
         # strictly causal by construction: the is_causal hint skips the
         # per-call mask comparison (and its .item() graph break under
         # torch.compile) inside nn.TransformerEncoder
-        h = self.transformer(h, mask=attn_mask, is_causal=causal)
-        # self.head produit les logits bruts, la sigmoid les transforme en [0,1]
-        return self.head(h)                   # [B, L, 16]
+        return self.transformer(h, mask=attn_mask, is_causal=causal)
+
+    def _eos_mdn(self, h_row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project a single transformer row ``h_row`` [B, d_model] to MDN
+        parameters: (logits_pi [B, K], mu [B, K, 6], sigma [B, K, 6])."""
+        B = h_row.shape[0]
+        K = self.eos_n_modes
+        logits_pi = self.eos_pi(h_row)                                          # [B, K]
+        mu = torch.sigmoid(self.eos_mu(h_row)).view(B, K, EOS_NSLOTS)           # [B, K, 6]
+        sigma = (self.eos_sigma_min + F.softplus(self.eos_sigma(h_row))).view(
+            B, K, EOS_NSLOTS)                                                   # [B, K, 6]
+        return logits_pi, mu, sigma
+
+    def forward(self, x: torch.Tensor,
+                attn_mask: torch.Tensor = None,
+                is_causal: bool | None = None,
+                salve_positions: torch.Tensor = None,
+                eos_cond: torch.Tensor | None = None,
+                eos_pos: int | None = None) -> torch.Tensor:
+        """x: [B, L, 29] float tokens. Returns predicted signal slots
+        [B, L, 16] (each position predicts the next token's 16 signals)."""
+        h = self._encode(x, attn_mask, is_causal, salve_positions, eos_cond, eos_pos)
+        return torch.sigmoid(self.head(h))    # [B, L, 16]
+
+    def forward_with_eos(self, x: torch.Tensor,
+                         attn_mask: torch.Tensor = None,
+                         is_causal: bool | None = None,
+                         salve_positions: torch.Tensor = None,
+                         eos_row: int = -1,
+                         eos_cond: torch.Tensor | None = None,
+                         eos_pos: int | None = None
+                         ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Like ``forward``, but also returns the MDN parameters
+        ``(logits_pi [B, K], mu [B, K, 6], sigma [B, K, 6])`` at ``eos_row``
+        (the row that predicts the dénouement token: ``eos_pos - 1`` in
+        training, ``-1`` on a context-only prompt)."""
+        h = self._encode(x, attn_mask, is_causal, salve_positions, eos_cond, eos_pos)
+        return torch.sigmoid(self.head(h)), self._eos_mdn(h[:, eos_row, :])
 
     # --- cached inference path ------------------------------------------------
     # The cached path replicates the TransformerEncoder computation exactly
@@ -346,21 +379,16 @@ class WorldModel(nn.Module):
     @torch.inference_mode()
     def cache_forward(self, x: torch.Tensor, cache: KVCache,
                       positions: torch.Tensor = None,
-                      ctx_len: int = 0, ctx_boost: float = 0.0) -> torch.Tensor:
-        """Process a block of tokens [B, T, 25] through the cached attention
+                      eos_cond: torch.Tensor | None = None,
+                      eos_pos: int | None = None) -> torch.Tensor:
+        """Process a block of tokens [B, T, 29] through the cached attention
         path, extending ``cache`` in place. Returns the head predictions
         [B, T, 16] for the block — identical to ``forward`` on the
         concatenated stream (subject to float rounding).
 
         ``positions`` ([T] long, absolute salve indices) overrides the default
         ``arange // SALVE_TOKENS`` positional encoding — needed when the stream
-        uses explicit salve positions (refonte rétro-causale).
-
-        ``ctx_len`` / ``ctx_boost`` replicate the additive gain triangle of
-        ``build_salve_mask``: key column c < ``ctx_len`` gets
-        ``ctx_boost * (c // SALVE_TOKENS) / n_ctx``, and the dénouement column
-        ``ctx_len`` gets the sum of all context-column biases (must match the
-        training mask)."""
+        uses explicit salve positions (refonte rétro-causale)."""
         if self.training and self.dropout_p > 0:
             raise RuntimeError("cached inference path is only valid without dropout")
         B, T, _ = x.shape
@@ -369,6 +397,10 @@ class WorldModel(nn.Module):
         hd = d // nh
         device = x.device
         h = self.in_proj(x)                                     # [B, T, d]
+        if eos_cond is not None and eos_pos is not None and cache.pos + T > eos_pos:
+            cond = self.eos_cond_proj(eos_cond.to(device)).unsqueeze(1)   # [B, 1, d]
+            pos_abs = torch.arange(cache.pos, cache.pos + T, device=device)
+            h = h + cond * (pos_abs >= eos_pos).view(1, T, 1)
         if positions is None:
             salve_pos = torch.arange(cache.pos, cache.pos + T, device=device) // SALVE_TOKENS
         else:
@@ -384,29 +416,13 @@ class WorldModel(nn.Module):
             Kh = K.view(B, -1, nh, hd).transpose(1, 2)          # [B, nh, P+T, hd]
             Vh = V.view(B, -1, nh, hd).transpose(1, 2)
             P = K.shape[1] - T
-            if ctx_boost > 0.0 and ctx_len > 0:
-                # colonnes [0, ctx_len] : triangle contexte + dénouement (colonne
-                # ctx_len = eos_pos) à gain plein ; ctx_len//16 == n_ctx -> rampe 1.0
-                n_cols = min(ctx_len + 1, P + T)
-                keys = torch.arange(n_cols, device=device)
-                n_ctx_keys = max(1, (ctx_len - 1) // SALVE_TOKENS)
-                bias = ctx_boost * (keys // SALVE_TOKENS).float() / n_ctx_keys   # [n_cols]
-                if ctx_len < n_cols:
-                    # 1*dénouement = 1*contexte : colonne eos = somme des biais contexte
-                    bias[ctx_len] = bias[:ctx_len].sum()
             if T > 1:
                 # New token t attends to all P cached tokens and to new tokens <= t.
                 mask = torch.zeros(T, P + T, device=device)
                 mask[:, P:] = torch.full((T, T), float("-inf"), device=device).triu(diagonal=1)
-                if ctx_boost > 0.0 and ctx_len > 0:
-                    mask[:, :n_cols] += bias.unsqueeze(0)
-                out = F.scaled_dot_product_attention(qh, Kh, Vh, attn_mask=mask)
-            elif ctx_boost > 0.0 and ctx_len > 0:
-                # single token: all P+1 cached keys are past -> allowed; triangle + dénouement
-                mask = torch.zeros(1, P + 1, device=device)
-                mask[:, :n_cols] = bias.unsqueeze(0)
                 out = F.scaled_dot_product_attention(qh, Kh, Vh, attn_mask=mask)
             else:
+                # single token: all P+1 cached keys are past -> allowed
                 out = F.scaled_dot_product_attention(qh, Kh, Vh)
             out = out.transpose(1, 2).reshape(B, T, d)           # [B, T, d]
             h = h + layer.self_attn.out_proj(out)
@@ -414,7 +430,7 @@ class WorldModel(nn.Module):
             if i == self._mid_layer:
                 self._latent = h                                # same capture as the forward hook
         cache.pos += T
-        out = self.head(h)                                       # [B, T, 16]
+        out = torch.sigmoid(self.head(h))                        # [B, T, 16]
         cache.last_pred = out[:, -1, :]
         return out
 
@@ -440,14 +456,14 @@ class WorldModel(nn.Module):
         for i in range(1, n_tokens):
             preds.append(build(i, out[:, 0, :]))
             out = self.cache_forward(preds[-1].unsqueeze(1), cache)
-        return torch.stack(preds, dim=1)                         # [B, n_tokens, 25]
+        return torch.stack(preds, dim=1)                         # [B, n_tokens, 29]
 
     @torch.inference_mode()
     def predict_next_state_cached(self, cache: KVCache,
                                   extra_tokens: torch.Tensor | None = None) -> torch.Tensor:
         """Cached variant of ``predict_next_state``: continue a populated
-        ``cache``. If ``extra_tokens`` [B, T, 25] is given (typically the 3
-        action tokens), they are processed first. Returns [B, 13, 25]; the
+        ``cache``. If ``extra_tokens`` [B, T, 29] is given (typically the 3
+        action tokens), they are processed first. Returns [B, 13, 29]; the
         cache then ends with the generated state tokens."""
         if extra_tokens is not None:
             self.cache_forward(extra_tokens, cache)
@@ -460,7 +476,7 @@ class WorldModel(nn.Module):
 
         Sequentially generates tokens 0..12, feeding each predicted token
         back into the context with its known structural prefix and valid signal slots.
-        Returns [B, 13, 25]."""
+        Returns [B, 13, 29]."""
         B = ctx.shape[0]
         device = ctx.device
         curr = ctx
@@ -486,7 +502,7 @@ class WorldModel(nn.Module):
 
         Sequentially generates action tokens 0..2, feeding each predicted token
         back into the context with its known structural prefix and valid signal slots.
-        Returns [B, 3, 25]."""
+        Returns [B, 3, 29]."""
         B = ctx.shape[0]
         device = ctx.device
         curr = ctx
@@ -503,7 +519,7 @@ class WorldModel(nn.Module):
     @torch.inference_mode()
     def predict_next_salve(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict both next state (13 tokens) and next action (3 tokens).
-        Returns (state [B, 13, 25], action [B, 3, 25])."""
+        Returns (state [B, 13, 29], action [B, 3, 29])."""
         state = self.predict_next_state(ctx)
         ctx_with_state = torch.cat([ctx, state], dim=1)
         action = self.predict_next_action(ctx_with_state)

@@ -11,59 +11,92 @@ Une séquence est une **liste plate de `seq_len` tokens** ordonnés :
 contexte | dénouement | conséquence inversée | action de décision
 ```
 
+La **fenêtre temporelle** extraite du journal fait `seq_steps+1` salves avec un
+**saut** (`lookahead`) : `seq_steps` salves consécutives `s0..s_{seq_steps-1}`,
+puis la dernière salve à `+lookahead` ticks de la décision
+(`s_{n_ctx+lookahead}`) — on apprend le futur proche, le dénouement est lointain.
+
 - **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]` — `ctx_len` tokens ;
 - **dénouement** : 1 token EOS à `eos_pos = ctx_len`, ground truth calculé à
-  l'extraction (`_eos_slots_of_window`) : progrès par canal
-  `f = P − poids_chemin·A` sur les 6 canaux de coût, 0.5 = neutre ;
+  l'extraction (`_eos_slots_of_window`) : intégrale par canal de l'écart au
+  coût de la décision pondérée par la vraie position temporelle,
+  `r[j] = Σ_{k>d} eos_decay^(pos_k−d)·(c[k][j]−c[d][j])·p_k` avec `pos_k = k`
+  sauf dernière salve à `pos = n_ctx+lookahead`, et `p_k = lookahead` pour le
+  dernier état (prolongation fictive du coût final),
+  `slot[j] = 0.5 − 0.5·tanh(r[j])`, 0.5 = neutre ;
 - **conséquence inversée** : états seuls `s_{seq_steps} .. s_{n_ctx+1}`, du plus
   tardif au plus précoce — `conseq_len = n_imagine × 13` tokens ;
 - **action de décision** : `a_{n_ctx}`, 3 tokens, **dernier token** de la
   séquence (`action_pos`).
 
 Géométrie : `compute_seq_layout` ; positions temporelles (PE sinusoïdal keyed by
-salve index) : `compute_salve_positions` (conséquence inversée en positions
-décroissantes). Le journal de veille reste un flux de salves temporelles ;
-`build_sequence` réordonne une fenêtre de `seq_steps+1` salves à l'extraction
-(`ExperienceBuffer.extract_addendum`).
+salve index) : `compute_salve_positions(seq_steps, n_ctx, lookahead)` — la
+dernière salve de la fenêtre (unité 0 de la conséquence) a la vraie position
+`n_ctx + lookahead`, l'action `a_{k-1}` garde `k-1`, et le dénouement a un PE
+dédié `n_ctx + lookahead + 1` (hors fenêtre). Le journal de veille reste un flux
+de salves temporelles ; `build_sequence` réordonne une fenêtre de
+`seq_steps+1` salves (avec saut) à l'extraction
+(`ExperienceBuffer.extract_addendum` / `_window_at`).
 
 ## Entraînement du WM (`Brain._train_wm_batch`)
 
-Un seul masque (strictement causal sur `seq_len`), un seul forward par batch.
-La loss est une MSE masquée (`build_target_tables`) : **poids 0 sur le
-contexte** (prompt, non appris), **poids 1 sur tous les tokens à partir du
-dénouement**. Dans le même forward, le dénouement est prédit depuis le
-contexte, et la conséquence inversée puis l'action de décision sont prédites
-conditionnellement au dénouement. Aucun dénouement contrefactuel injecté.
-Toutes les sorties sont des régressions continues [0,1] (MSE), y compris le
-dénouement (vecteur 6 slots).
+Un seul masque (strictement causal bool sur `seq_len`), un seul forward par
+batch — sans scale multiplicatif d'entrée (`ctx_attn_boost` supprimé), remplacé
+par une **infusion directe du dénouement** (`eos_cond_proj : Linear(6, d_model)`)
+additionnée à l'embedding de chaque token `q >= eos_pos` (conséquence inversée
+et action de décision) sans jamais toucher au contexte `0..eos_pos-1` (zéro
+fuite sur le MDN et cohérence stricte avec l'éveil / KV-cache).
+La loss combine :
+
+- une MSE masquée (`build_target_tables`) : **poids 0 sur le contexte**
+  (prompt, non appris), **poids 1/3 par groupe** (dénouement, trajectoire,
+  action de décision), pondérée par token ;
+- une tête **MDN** (*Mixture Density Network*, `eos_n_modes` = 8 composantes
+  gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) lue à la
+  row `eos_pos - 1`, entraînée par **NLL exacte** non pondérée par l'impact
+  (préserve les vraies fréquences calibrées $P(\text{EOS}\mid\text{ctx})$,
+  décalée par son minimum théorique en `sigma_min` et normalisée par slot, donc
+  toujours $\ge 0$, poids `eos_nll_w`) — une vraie distribution **jointe
+  continue et multimodale** sur les 6 slots, sans codebook ni k-means.
+
+Dans le même forward, le dénouement est prédit depuis le contexte, et la
+conséquence inversée puis l'action de décision sont prédites conditionnellement
+au dénouement (teacher-forcing). Aucun dénouement contrefactuel injecté.
 
 `train_wm_phase` : vraies epochs (dataset balayé en batchs sans omission ni
 remise), `learn_count` +1 par epoch, `surprise` = loss du batch. L'optimisation
-du dataset (dedup, filtrage surprise, oubli actif, tri plateau, pondération
-d'impact) est **mise de côté** pour l'instant.
+du dataset (dedup, filtrage surprise, oubli actif, tri plateau) est **mise de
+côté** pour l'instant.
 
 ## Inférence (`Brain.sample_denouements` / `generate_from_denouement`)
 
-1. `predict_denouement(ctx)` : moyenne conditionnelle µ (6 slots) lue à la
-   dernière ligne du forward sur le contexte.
-2. Échantillonnage de K vecteurs `v ~ N(µ, T²)` (température `eos_temperature`),
-   top-p sur les tirages ; chaque tirage noté
-   `f = log p(v) + eos_w_fav · relief(v)` ; **le meilleur est élu** (pas
-   nécessairement le plus probable).
-3. Règle de l'observé : si `relief(eos_observé) >= eos_satisfying`, on reste sur
-   l'observé (p = 1) ; sinon on élit parmi les échantillonnés (extrapolation
-   cross-contexte).
-4. `generate_from_denouement(ctx, eos_elu)` : génération auto-régressive
-   depuis `[contexte, dénouement élu]` (masque causal, positions explicites),
-   déroule la conséquence inversée jusqu'à l'action de décision (dernier token).
+- `_denouement_dist(ctx)` : paramètres MDN `(logits_pi, mu, sigma)` lus à la
+  dernière row du forward sur le contexte (`world.eval()` restauré après
+  appel) ; `predict_denouement(ctx)` = centre $\mu$ du mode le **plus probable**
+  (`argmax(logits_pi)`).
+- Élection exacte sur les $K$ modes du MDN :
+  `probs = softmax(logits_pi / eos_temperature)`, noyau **nucleus exact**
+  (`(cum - sorted_p) < eos_top_p`, sans off-by-one ; `eos_top_n` optionnel) et
+  **plancher `eos_min_p`** (le mode argmax reste toujours éligible) ;
+  **élection du meilleur `relief_score(mu)`** dans ce noyau, avec
+  `p_elu = probs[elu]`.
+  `relief_score(slots) = tanh(Σ (W_j / W_max) · (2·slot_j - 1))` (additif,
+  symétrique autour de `0.5 = 0`, non dilué sur un canal isolé).
+- Règle de l'observé : si `eos_observed` est fourni, il remplace l'élu
+  uniquement quand son relief dépasse strictement celui de l'élu (`p_elu = 1`).
+- `generate_from_denouement(ctx, eos_elu)` : génération auto-régressive
+  depuis `[contexte, dénouement élu]` (masque causal, KV-cache, positions
+  explicites), déroule la conséquence inversée jusqu'à l'action de décision
+  (dernier token).
 
 ## Policy (`Brain.train_policy`)
 
-- Latent d'entrée = couche médiane du WM sur la **partie contexte** seule
-  (même latent qu'en éveil).
+- Latent d'entrée = couche médiane du WM sur la **partie contexte** seule,
+  normalisé par `F.layer_norm` sans paramètres (identique en éveil et en
+  sommeil).
 - Cible = **action de décision générée** par le WM sous le dénouement élu.
-- Pondération linéaire par la probabilité du dénouement élu :
-  `w = p`, `loss = Σ_i mse_i · p_i.detach() / Σ_i p_i.detach()`.
+- Pondération par confiance et soulagement positif :
+  `w = p_elu.detach() * relu(relief_elu)`, `loss = Σ_i mse_i · w_i / Σ_i w_i`.
 
 ## Sleep cycle (`Brain.sleep_cycle`)
 

@@ -132,14 +132,14 @@ def _eos_vignette(eos_slots, label: str) -> DreamStep:
                      label=label)
 
 
-def _gen_to_steps(brain, gen, real_steps, eos_slots) -> tuple[list[DreamStep], list[float]]:
+def _gen_to_steps(brain, gen, real_steps, eos_slots, b: int = 0) -> tuple[list[DreamStep], list[float]]:
     """Transforme une génération [contexte, dénouement] en rangée d'affichage :
     s0..s{n_ctx-1}+a, s{n_ctx}, dénouement (bargraph), s{n_ctx}+a*, puis la conséquence rétro-causale
     générée réordonnée en temporel s_{n_ctx+1}^..s_{seq_steps}^. Chaque unité
     de la conséquence générée est [s_k inversée (13 tokens), a_{k-1} (3)] ;
     la dernière unité n'a que s_{n_ctx+1} (a_dec est à part, dans gen["action"])."""
-    conseq = gen["conseq"][0]                                   # [conseq_len, 25]
-    a_star = brain._decode_action_batch(gen["action"])[0].tolist()
+    conseq = gen["conseq"][b]                                   # [conseq_len, 29]
+    a_star = brain._decode_action_batch(gen["action"])[b].tolist()
     n_im = brain.n_imagine
     units = [conseq[j * SALVE_TOKENS:(j + 1) * SALVE_TOKENS].tolist()
              for j in range(n_im - 1)]                          # unités complètes s_k+a_{k-1}
@@ -164,7 +164,9 @@ def _gen_to_steps(brain, gen, real_steps, eos_slots) -> tuple[list[DreamStep], l
     )
     for j, (s_toks, a_toks) in enumerate(blocks):
         a = None
-        if a_toks is not None:
+        # dernière salve générée (k=seq_steps) : pas d'action affichée, comme
+        # dans la rangée réelle (a_{seq_steps} n'existe pas dans la séquence)
+        if a_toks is not None and j < len(blocks) - 1:
             a_vals = brain._decode_action_batch(torch.tensor(
                 [a_toks], dtype=torch.float32, device=brain.device))[0].tolist()
             if any(abs(v) > 1e-9 for v in a_vals):
@@ -199,15 +201,20 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
     eos_obs = vals[:, brain.eos_pos, SIG_OFFSET:SIG_OFFSET + 6]
 
     mu = brain.predict_denouement(ctx)                          # dénouement le plus probable
-    gen_mu = brain.generate_from_denouement(ctx, mu)
     # dénouement élu : PAS de règle de l'observé ici — le manager montre le vrai
     # élu (max relief des tirages) ; la règle eos_observed reste réservée à
     # l'entraînement de la policy (_policy_step)
     eos_elu, p_elu = brain.sample_denouements(ctx)
-    gen_el = brain.generate_from_denouement(ctx, eos_elu)
+    # les deux générations (µ et élu) sont batchées en UNE seule passe incrémentale
+    # (le rollout token-par-token domine le temps d'affichage)
+    ctx2 = torch.cat([ctx, ctx], dim=0)
+    eos2 = torch.cat([mu, eos_elu], dim=0)
+    gen2 = brain.generate_from_denouement(ctx2, eos2)
+    gen_mu = {k: v[:1] for k, v in gen2.items()}
+    gen_el = {k: v[1:] for k, v in gen2.items()}
 
-    disp_argmax, a_mu = _gen_to_steps(brain, gen_mu, real_steps, mu[0].tolist())
-    disp_elected, a_el = _gen_to_steps(brain, gen_el, real_steps, eos_elu[0].tolist())
+    disp_argmax, a_mu = _gen_to_steps(brain, gen_mu, real_steps, mu[0].tolist(), b=0)
+    disp_elected, a_el = _gen_to_steps(brain, gen_el, real_steps, eos_elu[0].tolist(), b=0)
 
     a_dec_real = brain._decode_action_batch(
         vals[:, brain.action_pos:brain.action_pos + 3, :])[0].tolist()
@@ -243,8 +250,8 @@ def rollout_record(brain: Brain, seq, seq_idx: int, total_seqs: int, vivacity: f
         eos_elected=eos_elu[0].tolist(),
         p_elected=float(p_elu[0]),
         real_relief=float(relief_score(seq, eos_pos=brain.eos_pos)),
-        argmax_relief=float(relief_score(mu, p=brain.eos_max_p)[0]),
-        elected_relief=float(relief_score(eos_elu, p=brain.eos_max_p)[0]),
+        argmax_relief=float(relief_score(mu)[0]),
+        elected_relief=float(relief_score(eos_elu)[0]),
         cos_argmax=_cos(a_mu, a_dec_real),
         cos_elected=_cos(a_el, a_dec_real),
         rmse_posture_elected=sum(p_errs) / max(1, len(p_errs)),
@@ -595,15 +602,7 @@ class WMTheater:
 
 def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                 pol_path: str = "pol_ckpt.pt", initial_index: int = 0,
-                device: str = "cpu", initial_sort: str = "coreset",
-                d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
-                dim_ff: int = 384, wm_dropout: float = 0.0, pol_hidden: int = 256,
-                lr_wm: float = 3e-4, lr_pol: float = 2e-4, seed: int = 0,
-                buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
-                seq_steps: int = 10, n_ctx: int = 4,
-                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
-                eos_max_p: float = 8.0, compile_wm: bool = False,
-                **_ignored) -> None:
+                initial_sort: str = "coreset", **params) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Theater — refonte")
@@ -614,32 +613,27 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
     font_small = pygame.font.SysFont(FONT_NAME, 11)
     font_tiny = pygame.font.SysFont(FONT_NAME, 10)
 
-    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
-                  d_model=d_model, nhead=nhead, layers=wm_layers, dim_ff=dim_ff,
-                  dropout=wm_dropout, pol_hidden=pol_hidden, lr_wm=lr_wm, lr_pol=lr_pol,
-                  seed=seed, buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity,
-                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
-                  eos_poids_arrivee=eos_poids_arrivee, eos_max_p=eos_max_p)
+    brain = Brain(**CFG.brain_kwargs(params))
     if os.path.exists(wm_path):
-        brain.load_checkpoint(wm_path=wm_path,
-                              pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt")
+        if os.path.exists(pol_path):
+            brain.load_checkpoint(wm_path=wm_path, pol_path=pol_path)
+        else:
+            wm = torch.load(wm_path, weights_only=False)
+            brain.world.load_state_dict(wm["world"])
+            if "opt_wm" in wm:
+                brain.opt_wm.load_state_dict(wm["opt_wm"])
         print(f"Loaded World Model from {wm_path}")
     else:
         print("Warning: WM checkpoint not found, using initialized weights.")
 
-    buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
-                           seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed,
-                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
-                           eos_poids_arrivee=eos_poids_arrivee)
     if os.path.exists(buffer_path):
-        ok = buf.load(buffer_path)
-        print(f"Loaded {buf.coreset_size} sequences from {buffer_path}" if ok
+        ok = brain.buffer.load(buffer_path)
+        print(f"Loaded {brain.buffer.coreset_size} sequences from {buffer_path}" if ok
               else f"{buffer_path}: layout incompatible (legacy ?) — coreset vide")
     else:
         print(f"Warning: Buffer checkpoint {buffer_path} not found.")
 
-    theater = WMTheater(brain, buf, width=width, height=height, initial_sort=initial_sort)
+    theater = WMTheater(brain, brain.buffer, width=width, height=height, initial_sort=initial_sort)
     theater.set_seq_idx(initial_index)
 
     running = True
@@ -666,17 +660,9 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
 def main() -> None:
     cfg = CFG.load_config()
     params: dict = {
+        **CFG.BRAIN_DEFAULTS,
         "buffer_path": "buf_ckpt.pt", "wm_path": "wm_ckpt.pt", "pol_path": "pol_ckpt.pt",
-        "initial_index": 0,
-        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "initial_sort": "coreset", "accel": False,
-        "d_model": 64, "nhead": 4, "wm_layers": 3,
-        "dim_ff": 384, "wm_dropout": 0.0, "pol_hidden": 256,
-        "lr_wm": 3e-4, "lr_pol": 2e-4, "seed": 0,
-        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
-        "seq_steps": 10, "n_ctx": 4,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
-        "compile_wm": False,
+        "initial_index": 0, "initial_sort": "coreset",
     }
     CFG.apply_toml(params, cfg)
     p = argparse.ArgumentParser(description="WM Theater — coreset browser (refonte)")

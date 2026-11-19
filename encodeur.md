@@ -9,7 +9,7 @@ En amont de l'encodeur, le module de lissage temporel (`smoother.Smoother`) agr�
 ## Représentation continue
 
 * Chaque signal est normalisé sous forme de scalaire flottant continu dans l'intervalle $[0.0, 1.0]$.
-* Les scalaires sont injectés directement dans les slots de signaux du token dense correspondant (vecteur de 25 flottants).
+* Les scalaires sont injectés directement dans les slots de signaux du token dense correspondant (vecteur de 29 flottants).
 
 
 Pour le détail complet des 16 tokens et de leurs canaux, voir [tokens.md](tokens.md).
@@ -41,7 +41,7 @@ Le `Smoother` opère la **compression temporelle** entre la dynamique physique (
 
 ## Salve
 
-Une **salve** est la séquence complète des **16 tokens** ($13\text{ état} + 3\text{ action}$, soit $16 \times 25$ flottants) produite à chaque pas de décision du cerveau.
+Une **salve** est la séquence complète des **16 tokens** ($13\text{ état} + 3\text{ action}$, soit $16 \times 29$ flottants) produite à chaque pas de décision du cerveau.
 
 ---
 

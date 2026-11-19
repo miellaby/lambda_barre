@@ -101,8 +101,9 @@ invalidates existing checkpoints. Set them in `config.toml` instead.
 | `[transformer] dim_ff` | Feed-forward hidden dimension | `wm_ckpt.pt` |
 | `[transformer] dropout` | Dropout rate | `wm_ckpt.pt` (training behaviour) |
 | `[policy] hidden` | Policy hidden layer width | `pol_ckpt.pt` |
-| `[sequence] seq_steps` | Transitions per training sequence | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] seq_steps` | Consecutive salves per training window | `buf_ckpt.pt`, `wm_ckpt.pt` |
 | `[sequence] n_ctx` | Decision context length | `buf_ckpt.pt`, `wm_ckpt.pt` |
+| `[sequence] lookahead` | Jump of the last salve: `s_{n_ctx+lookahead}` (far denouement, close future learned) | `buf_ckpt.pt`, `wm_ckpt.pt` |
 | `[sequence] wm_hz` | World Model recording cadence (Hz) | `buf_ckpt.pt` (temporal semantics) |
 | `[sequence] pol_hz` | Policy cadence (Hz, typically 2× wm_hz) | `buf_ckpt.pt` (temporal semantics) |
 | `[buffer] capacity` | Session journal capacity (sequences) | `buf_ckpt.pt` (truncation) |
@@ -145,7 +146,7 @@ and start fresh:
 ```
 
 * **Physics & Sensors (60 Hz)**: Pymunk articulated skeleton and sensors: proprioception, exteroception and interoception.
-* **World Model (3 Hz)**: Dense tokenization of 16 tokens per salve and 25 dimensions per token. A causal autoregressive model that imagines a 2-second horizon.
+* **World Model (3 Hz)**: Dense tokenization of 16 tokens per salve and 29 dimensions per token. A causal autoregressive model that imagines a 2-second horizon.
 * **Policy (6 Hz)**: Selects the motor action from 45 sensory scalars and the latent state extracted from the World Model.
 
 During the **Sleep phase (`S`)**: offline training of the World Model (self-supervised prediction of the future) and of the Policy (candidate tournament guided by the futures imagined by the World Model).

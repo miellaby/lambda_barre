@@ -57,13 +57,14 @@ def test_salve_positions():
     sp = compute_salve_positions(SEQ_STEPS, N_CTX)
     layout = compute_seq_layout(SEQ_STEPS, N_CTX)
     assert len(sp) == layout["seq_len"]
-    assert sp[layout["eos_pos"]] == SEQ_STEPS
+    assert sp[layout["eos_pos"]] == SEQ_STEPS + 1     # PE dédié du dénouement (hors fenêtre)
     # conséquence rétro-causale : unités de 16 tokens, k = seq_steps..n_ctx+1
     conseq = sp[layout["conseq_start"]:layout["action_pos"]]
     n_im = SEQ_STEPS - N_CTX
     for j in range(n_im - 1):
         k = SEQ_STEPS - j
-        assert all(conseq[j * SALVE_TOKENS + t] == k for t in range(STATE_TOKENS))
+        t0 = 1 if j == 0 else 0     # unité 0 : le token 0 est le dénouement (PE dédié)
+        assert all(conseq[j * SALVE_TOKENS + t] == k for t in range(t0, STATE_TOKENS))
         assert all(conseq[j * SALVE_TOKENS + STATE_TOKENS + t] == k - 1
                    for t in range(ACTION_TOKENS))
     # dernière unité : s_{n_ctx+1} seule (sans action)
@@ -208,24 +209,13 @@ def test_batch_tensors_shape_and_intero_mask(brain, rng):
 
 def test_wm_single_mask_is_causal(brain):
     from lambda_barre.models import build_salve_mask
-    from lambda_barre.brain import compute_seq_layout
-    layout = compute_seq_layout(brain.seq_steps, brain.n_ctx)
-    m = build_salve_mask(brain.seq_len, brain.device,
-                         ctx_len=layout["ctx_len"], boost=brain.ctx_attn_boost)
+    m = build_salve_mask(brain.seq_len, brain.device)
+    assert m.dtype == torch.bool
     assert torch.equal(brain.mask, m)
-    # causalité : au-dessus de la diagonale tout est masqué (True en bool, -inf en float)
+    # causalité : au-dessus de la diagonale tout est masqué, rien en dessous
     upper = torch.triu(torch.ones_like(m, dtype=torch.bool), diagonal=1)
-    if m.dtype == torch.bool:
-        assert m[upper].all()
-    else:
-        assert torch.isinf(m[upper]).all() and (m[upper] < 0).all()
-        # 1*dénouement = 1*contexte : la colonne eos (ctx_len) porte la somme des
-        # biais de toutes les colonnes contexte [0, ctx_len)
-        ctx_len = layout["ctx_len"]
-        assert torch.isclose(m[ctx_len, ctx_len],
-                             m[ctx_len, :ctx_len].sum())
-        # la colonne eos n'est visible que pour les lignes >= ctx_len (causal)
-        assert torch.isinf(m[:ctx_len, ctx_len]).all()
+    assert m[upper].all()
+    assert not m[~upper].any()
 
 
 def test_wm_train_step_decreases_loss(brain, rng):
@@ -250,14 +240,16 @@ def test_sample_denouements_shapes_and_election(brain, rng):
     seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(4)]
     vals = brain._batch_tensors(seqs)
     ctx = vals[:, :brain.ctx_len]
-    eos_elu, p = brain.sample_denouements(ctx, k=16, temperature=0.1, top_n=4)
+    eos_elu, p = brain.sample_denouements(ctx, temperature=0.5, top_n=4)
     assert eos_elu.shape == (4, 6) and p.shape == (4,)
     assert ((eos_elu >= 0.0) & (eos_elu <= 1.0)).all()
-    # élection par relief restreinte au noyau top-n
-    assert ((p >= 0.0) & (p <= 1.0)).all()
-    # top_n=1 -> l'élu est forcément le tirage le plus probable, donc p_elu = 1
-    _, p1 = brain.sample_denouements(ctx, k=16, temperature=0.1, top_n=1)
-    assert torch.allclose(p1, torch.ones(4))
+    assert ((p > 0.0) & (p <= 1.0)).all()
+    # top_n=1 -> l'élu est le mode le plus probable (= predict_denouement),
+    # et p_elu = probabilité exacte de ce mode (vaut 1.0 à température -> 0)
+    mu_best = brain.predict_denouement(ctx)
+    eos1, p1 = brain.sample_denouements(ctx, temperature=1e-3, top_n=1)
+    assert torch.allclose(eos1, mu_best, atol=1e-5)
+    assert torch.allclose(p1, torch.ones(4, device=brain.device), atol=1e-4)
 
 
 def test_sample_denouements_observed_wins_only_if_better_relief(brain, rng):
@@ -289,20 +281,26 @@ def test_generate_from_denouement(brain, rng):
 
 
 def test_kv_cache_matches_full_forward_with_positions(brain, rng):
-    # le KV-cache (positions explicites) doit être identique au forward complet
+    # le KV-cache (positions explicites + infusion EOS >= eos_pos) doit être
+    # identique au forward complet, y compris à travers la frontière eos_pos
     from lambda_barre.models import KVCache, build_salve_mask
     seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
     vals = brain._batch_tensors([seq])
-    L = 60
+    eos_cond = vals[:, brain.eos_pos, SIG_OFFSET:SIG_OFFSET + 6]
+    L = brain.eos_pos + 20
     x = vals[:, :L]
     full = brain.world(x, attn_mask=build_salve_mask(L, brain.device), is_causal=True,
-                       salve_positions=brain.salve_positions[:L])
+                       salve_positions=brain.salve_positions[:L],
+                       eos_cond=eos_cond, eos_pos=brain.eos_pos)
     cache = KVCache(len(brain.world.transformer.layers), brain.world.d_model, 1,
                     brain.device)
-    out1 = brain.world.cache_forward(x[:, :30], cache,
-                                     positions=brain.salve_positions[:30])
-    out2 = brain.world.cache_forward(x[:, 30:], cache,
-                                     positions=brain.salve_positions[30:L])
+    split = brain.eos_pos + 1
+    out1 = brain.world.cache_forward(x[:, :split], cache,
+                                     positions=brain.salve_positions[:split],
+                                     eos_cond=eos_cond, eos_pos=brain.eos_pos)
+    out2 = brain.world.cache_forward(x[:, split:], cache,
+                                     positions=brain.salve_positions[split:L],
+                                     eos_cond=eos_cond, eos_pos=brain.eos_pos)
     cat = torch.cat([out1, out2], dim=1)
     assert torch.allclose(cat, full, atol=1e-5)
 
@@ -346,3 +344,247 @@ def test_sleep_cycle_smoke(brain, rng):
         labels.append(lbl)
     assert "wm_addendum" in labels and "pol" in labels and labels[-1] == "done"
     assert brain.buffer.coreset_size > 0
+
+
+# --- lookahead (saut de la dernière salve de la fenêtre) -------------------------
+def test_lookahead_positions():
+    LA = 8
+    layout = compute_seq_layout(SEQ_STEPS, N_CTX)
+    sp = compute_salve_positions(SEQ_STEPS, N_CTX, lookahead=LA)
+    assert sp[layout["eos_pos"]] == N_CTX + LA + 1                    # PE dédié du dénouement
+    assert sp[layout["conseq_start"] + 1] == N_CTX + LA               # états de la dernière salve (saut)
+    assert sp[layout["conseq_start"] + STATE_TOKENS] == SEQ_STEPS - 1  # son action garde sa vraie position
+    assert sp[layout["conseq_start"] + SALVE_TOKENS + 1] == SEQ_STEPS - 1  # unité 1 = s_{seq_steps-1}
+    # défaut = pas de saut (comportement historique)
+    sp0 = compute_salve_positions(SEQ_STEPS, N_CTX)
+    assert sp0[layout["eos_pos"]] == SEQ_STEPS + 1
+    assert sp0[layout["conseq_start"] + 1] == SEQ_STEPS
+
+
+def test_wm_reproduces_learned_sequences(rng):
+    # Pas de test sur la loss : on entraîne jusqu'à convergence sur n séquences
+    # quasi-statiques, puis on vérifie que le WM reproduit EXACTEMENT les tokens
+    # appris (dénouement + conséquence + décision) — si la loss est mal calculée
+    # ou décalée, ce test le voit.
+    def static_window():
+        base = [rng.random() for _ in range(53)]
+        base_a = [rng.random() for _ in range(5)]
+        return [make_salve([v + rng.uniform(-0.01, 0.01) for v in base],
+                           [v + rng.uniform(-0.01, 0.01) for v in base_a])
+                for _ in range(SEQ_STEPS + 1)]
+
+    torch.manual_seed(0)
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=128, nhead=8, layers=1,
+              dim_ff=256, pol_hidden=64, lr_wm=1e-3)
+    seqs = [build_sequence(static_window(), n_ctx=N_CTX) for _ in range(3)]
+    layout = compute_seq_layout(SEQ_STEPS, N_CTX)
+    b.world.train()
+    for _ in range(10000):
+        b._train_wm_batch(seqs)
+    b.world.eval()
+    with torch.no_grad():
+        vals = b._batch_tensors(seqs)
+        eos_cond = vals[:, b.eos_pos, SIG_OFFSET:SIG_OFFSET + 6]
+        pred = b.world(vals, attn_mask=b.mask, is_causal=True,
+                       salve_positions=b.salve_positions,
+                       eos_cond=eos_cond, eos_pos=b.eos_pos)
+    p = slice(layout["ctx_len"] - 1, layout["seq_len"] - 1)   # partie apprise
+    err = (pred[:, p, :] - vals[:, 1:, SIG_OFFSET:][:, p, :]).abs()
+    valid = b.target_valid[p].unsqueeze(0).expand_as(err)
+    assert err[valid].max().item() < 0.1
+
+
+def test_lookahead_window_extraction(rng):
+    LA = 8
+    buf = ExperienceBuffer(seq_len=SEQ_STEPS + 1, n_ctx=N_CTX, lookahead=LA,
+                           capacity=50, pool_capacity=50, seed=0)
+    seg = []
+    for i in range(SEQ_STEPS + LA + 5):
+        s = _rand_salve(rng)
+        s[0][SIG_OFFSET] = float(i)          # marqueur de salve
+        seg.append(s)
+    buf._segments.append(seg)
+    assert buf.extract_addendum() > 0
+    layout = compute_seq_layout(SEQ_STEPS, N_CTX)
+    cs = layout["conseq_start"]
+    seq0 = buf._addendum[0]
+    # unité 0 = dernière salve de la fenêtre = s_{n_ctx+lookahead} (saut +lookahead)
+    assert seq0[cs + STATE_TOKENS - 1][SIG_OFFSET] == float(N_CTX + LA)
+    # unité 1 = s_{seq_steps-1} (partie consécutive)
+    assert seq0[cs + SALVE_TOKENS + STATE_TOKENS - 1][SIG_OFFSET] == float(SEQ_STEPS - 1)
+
+
+def test_confort_encoding_and_eos_sign(brain):
+    from lambda_barre.tokenize import (_BY_KEY, _REWARD_IDX, _denormalize,
+                                       _normalize, salve_cost)
+    spec = _BY_KEY["confort"]
+    assert spec.first_val == 0.0 and spec.last_val == -1.0
+    assert abs(_normalize(0.0, spec) - 0.0) < 1e-6
+    assert abs(_normalize(-0.3, spec) - 0.3) < 1e-6
+    assert abs(_normalize(-1.0, spec) - 1.0) < 1e-6
+    assert abs(_denormalize(0.3, spec) - (-0.3)) < 1e-6
+
+    # salve_cost == _salve_cost_batch avec confort actif
+    s_comfy = make_salve([0.0] * 53, [0.5] * 5)
+    s_comfy[_REWARD_IDX][SIG_OFFSET] = 0.3   # confort = -0.3
+    s_flat = make_salve([0.0] * 53, [0.5] * 5)
+    t_comfy = torch.tensor([s_comfy], dtype=torch.float32, device=brain.device)
+    assert abs(salve_cost(s_comfy) - (-0.3)) < 1e-5
+    assert abs(float(brain._salve_cost_batch(t_comfy)[0]) - salve_cost(s_comfy)) < 1e-5
+
+    # relèvement (0.0 -> -0.3) donne slot EOS confort > 0.5 ; perte (-0.3 -> 0.0) donne < 0.5
+    win_gain = [s_flat] * (N_CTX + 1) + [s_comfy] * (SEQ_STEPS - N_CTX)
+    win_loss = [s_comfy] * (N_CTX + 1) + [s_flat] * (SEQ_STEPS - N_CTX)
+    seq_gain = build_sequence(win_gain, n_ctx=N_CTX)
+    seq_loss = build_sequence(win_loss, n_ctx=N_CTX)
+    eos_pos = compute_seq_layout(SEQ_STEPS, N_CTX)["eos_pos"]
+    assert seq_gain[eos_pos][SIG_OFFSET + 5] > 0.5
+    assert seq_loss[eos_pos][SIG_OFFSET + 5] < 0.5
+
+
+def test_relief_score_tanh_symmetry_and_dominance():
+    neutral = torch.tensor([0.5] * 6)
+    assert abs(float(relief_score(neutral))) < 1e-6
+    pain_gain = torch.tensor([0.5, 1.0, 0.5, 0.5, 0.5, 0.5])
+    pain_loss = torch.tensor([0.5, 0.0, 0.5, 0.5, 0.5, 0.5])
+    assert abs(float(relief_score(pain_gain)) + float(relief_score(pain_loss))) < 1e-6
+    assert float(relief_score(pain_gain)) > 0.7
+    # douleur max + petit gain d'effort reste fortement négatif
+    mixed = torch.tensor([0.75, 0.0, 0.5, 0.5, 0.5, 0.5])
+    assert float(relief_score(mixed)) < -0.5
+    # 5 coûts au pire + confort élevé reste très négatif
+    catastrophic = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.95])
+    assert float(relief_score(catastrophic)) < -0.9
+
+
+def test_mdn_learns_multimodal_75_25_and_exact_p(rng):
+    torch.manual_seed(0)
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=64, nhead=4, layers=1,
+              dim_ff=128, pol_hidden=32, lr_wm=3e-3, wm_input_noise=0.0,
+              eos_n_modes=4, eos_nll_w=1.0)
+    base_win = _rand_window(rng)
+    eos_pos = b.eos_pos
+    seq_neutral = build_sequence(base_win, n_ctx=N_CTX)
+    seq_fall = [list(t) for t in seq_neutral]
+    # même contexte exact, deux dénouements distincts : 75% neutre / 25% chute
+    eos_a = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    eos_b = [0.2, 0.05, 0.5, 0.1, 0.1, 0.2]
+    seq_neutral[eos_pos] = seq_neutral[eos_pos][:SIG_OFFSET] + eos_a + [0.0] * (N_SIGNAL - 6)
+    seq_fall[eos_pos] = seq_fall[eos_pos][:SIG_OFFSET] + eos_b + [0.0] * (N_SIGNAL - 6)
+    batch = [seq_neutral] * 15 + [seq_fall] * 5
+    b.world.train()
+    for _ in range(300):
+        b._train_wm_batch(batch)
+    ctx = b._batch_tensors([seq_neutral])[:, :b.ctx_len]
+    mu_best = b.predict_denouement(ctx)[0]
+    eos_elu, p_elu = b.sample_denouements(ctx, top_p=0.95, min_p=0.05)
+    # le plus probable est le neutre (~0.5), et sa proba apprise est ~0.75 (pas 1/K !)
+    assert (mu_best - torch.tensor(eos_a, device=b.device)).abs().max().item() < 0.1
+    assert (eos_elu[0] - torch.tensor(eos_a, device=b.device)).abs().max().item() < 0.1
+    assert 0.55 < float(p_elu[0]) < 0.90
+
+
+def test_inference_preserves_training_flag_with_dropout(rng):
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, dropout=0.1)
+    seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    ctx = b._batch_tensors([seq])[:, :b.ctx_len]
+    b.world.train()
+    mu = b.predict_denouement(ctx)
+    assert b.world.training
+    eos_elu, _ = b.sample_denouements(ctx)
+    assert b.world.training
+    gen = b.generate_from_denouement(ctx, eos_elu)
+    assert gen["full"].shape == (1, b.seq_len, DENSE_DIM)
+    assert b.world.training
+
+
+def test_experience_buffer_window_span_with_lookahead(rng):
+    # seq_steps=12, n_ctx=6, lookahead=10 -> window_span=17 (pas seq_len=13)
+    buf = ExperienceBuffer(seq_len=13, n_ctx=6, lookahead=10,
+                           capacity=50, pool_capacity=50, seed=0)
+    assert buf.window_span == 17
+    for _ in range(15):
+        buf.push(_rand_salve(rng))
+    assert buf.journal_len == 0
+    assert buf.sample(4) == []
+    buf.boundary()
+    assert len(buf._segments) == 0    # segment de 15 < 17 non scellé
+    for _ in range(17):
+        buf.push(_rand_salve(rng))
+    assert buf.journal_len == 1
+    assert len(buf.sample(4)) == 1
+    assert buf.extract_addendum() == 1
+
+
+def test_dream_record_uses_generated_consequence(brain, rng):
+    for _ in range(SEQ_STEPS + 5):
+        brain.record_tick(_rand_salve(rng))
+    brain.buffer.extract_addendum()
+    list(brain.train_policy(steps=1, batch=2))
+    rec = brain.last_dream_record
+    assert rec is not None
+    # les états imaginés dans predicted_steps proviennent de generate_from_denouement,
+    # pas de la copie directe des vrais états vécus
+    imagined_s = rec.predicted_steps[brain.n_ctx].state_tokens
+    real_s = rec.lived_steps[brain.n_ctx + 1].state_tokens
+    assert imagined_s != real_s
+
+
+def test_train_wm_phase_waits_out_adam_slingshot(brain, rng, monkeypatch):
+    seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    brain.buffer._coreset.append(seq)
+    brain.buffer._coreset_meta.append(ExperienceBuffer._default_meta("coreset"))
+    # Simule une loss qui descend, puis un slingshot à l'epoch 4 (juste avant
+    # quota=5) qui ne retombe et ne se stabilise qu'aux epochs 7, 8, 9.
+    losses = iter([0.10, 0.05, 0.02, 0.08, 0.05, 0.03, 0.02, 0.018, 0.017, 0.016])
+    monkeypatch.setattr(brain, "_train_wm_batch", lambda batch: next(losses))
+    epochs_seen = [ep for _, ep, _ in brain.train_wm_phase(
+        epochs=5, batch=8, target_loss=0.06, source="coreset",
+        slingshot_ratio=1.30, slingshot_settle=3, slingshot_max_extra=20)]
+    # Ne s'arrête PAS à l'epoch 5 (0.05 <= target 0.06 mais en plein slingshot),
+    # attend la retombée (ep 7) + 3 epochs calmes (ep 7, 8, 9).
+    assert epochs_seen == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert not brain.sleep_wm_slingshot
+
+
+def test_input_noise_mask_preserves_prefix_padding_intero_and_eos(brain):
+    from lambda_barre.tokenize import _INTERO_IDX, _N_SIGNALS
+    m = brain.input_noise_mask[0]                       # [seq_len, DENSE_DIM]
+    # préfixe structurel intact partout
+    assert (m[:, :SIG_OFFSET] == 0.0).all()
+    # token dénouement intact
+    assert (m[brain.eos_pos] == 0.0).all()
+    # tokens intero masqués (contexte + conséquence) intacts
+    intero_pos = [k * SALVE_TOKENS + _INTERO_IDX for k in range(brain.n_ctx + 1)]
+    intero_pos += [brain.conseq_start + j * SALVE_TOKENS for j in range(1, brain.n_imagine)]
+    assert (m[intero_pos] == 0.0).all()
+    # padding intact sur REWARD (1 slot valide) et ACT_TAIL (1 slot valide)
+    assert m[11, SIG_OFFSET].item() == 1.0
+    assert (m[11, SIG_OFFSET + 1:] == 0.0).all()
+    assert m[brain.action_pos + 2, SIG_OFFSET].item() == 1.0
+    assert (m[brain.action_pos + 2, SIG_OFFSET + 1:] == 0.0).all()
+    # VISION (16 slots valides) entièrement bruité sur ses 16 slots signaux
+    assert (m[4, SIG_OFFSET:SIG_OFFSET + _N_SIGNALS[4]] == 1.0).all()
+
+
+def test_eos_cond_infusion_zero_leak_on_context(brain, rng):
+    seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    vals = brain._batch_tensors([seq])
+    eos_lo = torch.zeros(1, 6, device=brain.device)
+    eos_hi = torch.ones(1, 6, device=brain.device)
+    brain.world.eval()
+    with torch.no_grad():
+        p_lo, mdn_lo = brain.world.forward_with_eos(
+            vals, attn_mask=brain.mask, is_causal=True,
+            salve_positions=brain.salve_positions, eos_row=brain.eos_pos - 1,
+            eos_cond=eos_lo, eos_pos=brain.eos_pos)
+        p_hi, mdn_hi = brain.world.forward_with_eos(
+            vals, attn_mask=brain.mask, is_causal=True,
+            salve_positions=brain.salve_positions, eos_row=brain.eos_pos - 1,
+            eos_cond=eos_hi, eos_pos=brain.eos_pos)
+    # Zéro fuite causale sur le contexte (0..eos_pos-1) et sur les sorties MDN !
+    assert torch.equal(p_lo[:, :brain.eos_pos], p_hi[:, :brain.eos_pos])
+    for t_lo, t_hi in zip(mdn_lo, mdn_hi):
+        assert torch.equal(t_lo, t_hi)
+    # Effet direct immédiat sur la conséquence et l'action (q >= eos_pos)
+    assert (p_lo[:, brain.eos_pos:] - p_hi[:, brain.eos_pos:]).abs().max().item() > 1e-3

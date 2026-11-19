@@ -47,13 +47,14 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 ## Tokenisation & mémoire vive
 
 - Salve dense de 16 tokens (13 états + 3 actions) produite à chaque tick du World Model. L'action répond à l'état.
+- Token dense de 29 flottants : type(1) + modalité one-hot(6, bit 6 dédié au dénouement EOS) + canal one-hot(6, ids réutilisés entre modalités) + 16 signaux. Le préfixe structurel n'est jamais prédit en rollout (copié des templates) ni appris (loss sur les 16 signaux seuls).
+- PE sinusoïdal non appris keyed by indice de salve (tous les tokens d'une salve partagent la position) ; le token EOS a un PE dédié `seq_steps+1` (hors fenêtre, token de synthèse). Dans la conséquence rétro-causale, les positions temporelles restent décroissantes (26→14).
 - Token d'état = le champ sensoriel dont les coûts
 - Tokens d'action = consigne pour les actuateurs.
 - Agencement causal dans la salve : perception → coûts → confort → intéroception, coupant tout raccourci intra-salve.
 - Séquence = fenêtre glissante de salves consécutives
 - `seq_steps` 26 salves par séquence, paramétrable. Les n_ctx premières salves de la séquence (hors décision) forment le contexte de décision. L'action à n_ctx est la décision. Les salves suivantes forment la fenêtre de conséquence.
-- Le token EOS est le dernier token de la dernière salve d'une séquence. Il porte le dénouement. C'est le delta des coûts entre l'état à n_ctx (à la décision) et l'état final, pondérée par le chemin emprunté.
-- Le dénouement est pondéré par les coûts intermédiaires. Il est meilleur si les coûts intermédiaires sont faibles et se produisent tôt dans la séquence.
+- Le token EOS siège à `eos_pos` (premier token après le contexte, remplaçant le token 12 de la dernière salve), modalité dédiée. Il porte le dénouement : intégrale par canal de l'écart au coût de la décision `r[j] = Σ_{k>d} eos_decay^(k−d)·(c[k][j]−c[d][j])·p_k`, dernier état `p_k = L−d` (prolongation fictive du coût final), `slot = 0.5 − 0.5·tanh(r)`.
 - Le taux de soulagement `sequence_relief` est un score basé sur le dénouement. >0 amélioration; <0 détérioration.
 - Journalisation linéaire des salves. Journal segmenté sur les discontinuités physiques (retournement, reset).
 

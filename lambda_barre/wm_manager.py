@@ -5,8 +5,9 @@ plus une boucle d'entraînement live sur la séquence sélectionnée.
 - 3 rangées comme WM Theater : RÉEL / WM µ / WM ÉLU.
 - [T] toggles training: chaque epoch = un step WM sur la séquence seule, les
   rangées sont recalculées (inférence visible après chaque epoch).
-- [Space] une epoch, [W] phase WM complète (coreset + séquence courante dans
-  chaque batch), [R] reset historique, [ / ] lr, [↑/↓] epochs/frame, [V] save.
+- [Space] une epoch, [W] phase WM amplifiée (séquence courante dans chaque
+  batch), [S] phase WM complète (tout le coreset, batchs normaux),
+  [R] reset historique, [ / ] lr, [↑/↓] epochs/frame, [V] save.
 
 Usage:
     python -m lambda_barre.wm_manager
@@ -42,6 +43,7 @@ class WMManager(WMTheater):
         self.wm_path = wm_path
         self.training = False
         self.phase_gen = None
+        self._phase_amplified = False
         self.phase_epochs = phase_epochs
         self.phase_batch = phase_batch
         self.phase_target = phase_target
@@ -49,9 +51,10 @@ class WMManager(WMTheater):
         self.losses: list[tuple[int, float]] = []
         self.epf = 1
         self.saved_flash: float | None = None
-        self.footer_hints = ("Nav: [← / →] / glider  |  [F] Ctx-filter  |  [S] Sort  |  [T] Train seq  |  [W] Phase WM  |  "
-                             "[Space] 1 epoch  |  [R] Reset  |  [ / ] lr  |  "
-                             "[↑/↓] epf  |  [V] Save WM  |  [Esc] Quit")
+        self.footer_hints = ("[←/→] Nav | [F]ilter | [O]rder | "
+                             "[T]/[W]/[S] Train seq/++/all | "
+                             "[Space] epoch | [R]eset | [/] lr | "
+                             "[↑/↓] epf | [V] Save | [Esc] Quit")
         self.title_str = "WM MANAGER"
 
     # --- training -----------------------------------------------------------
@@ -70,15 +73,17 @@ class WMManager(WMTheater):
         self.cache.pop(self.seq_idx, None)
         return loss
 
-    def start_phase(self) -> None:
-        """Phase WM complète (train_wm_phase sur le coreset), avec la séquence
-        courante pré-sélectionnée dans chaque batch."""
+    def start_phase(self, amplified: bool = True) -> None:
+        """Phase WM complète (train_wm_phase sur le coreset). ``amplified=True``
+        ([W]) : la séquence courante est pré-sélectionnée dans chaque batch ;
+        ``amplified=False`` ([S]) : batchs normaux sur tout le coreset."""
+        self._phase_amplified = amplified
         self.phase_gen = self.brain.train_wm_phase(
             self.phase_epochs, self.phase_batch, self.phase_target,
             source="coreset",
             fixed_seq=(lambda: self.buffer._coreset[self.seq_idx]
-                       if self.buffer._coreset else None),
-            label="wm_phase")
+                       if amplified and self.buffer._coreset else None),
+            label="wm_phase+seq" if amplified else "wm_phase")
 
     def update(self) -> None:
         super().update()   # debounce de la navigation (glider / flèches)
@@ -118,9 +123,19 @@ class WMManager(WMTheater):
                 return True
             elif ev.key == pygame.K_w:
                 if self.phase_gen is None:
-                    self.start_phase()
+                    self.start_phase(amplified=True)
                 else:
                     self.phase_gen = None
+                return True
+            elif ev.key == pygame.K_s:
+                # phase WM sur tout le coreset (sans la séquence courante forcée)
+                if self.phase_gen is None:
+                    self.start_phase(amplified=False)
+                else:
+                    self.phase_gen = None
+                return True
+            elif ev.key == pygame.K_o:
+                self.cycle_sort()
                 return True
             elif ev.key == pygame.K_SPACE:
                 self.train_one_epoch()
@@ -172,7 +187,11 @@ class WMManager(WMTheater):
         pygame.draw.rect(screen, active_c, rect, 2 if self.training else 1, border_radius=4)
         x = rect.x + 10
         if self.phase_gen is not None:
-            badge, badge_c = "PHASE WM (coreset + seq courante)", (255, 210, 90)
+            badge = ("WM PHASE (coreset + current seq)" if self._phase_amplified
+                     else "WM PHASE (full coreset)")
+            if getattr(self.brain, "sleep_wm_slingshot", False):
+                badge += " [SLINGSHOT]"
+            badge_c = (255, 160, 80) if getattr(self.brain, "sleep_wm_slingshot", False) else (255, 210, 90)
         elif self.training:
             badge, badge_c = "TRAINING", (100, 245, 160)
         else:
@@ -214,18 +233,10 @@ class WMManager(WMTheater):
 
 def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
                 pol_path: str = "pol_ckpt.pt", initial_index: int = 0,
-                device: str = "cpu", initial_sort: str = "coreset",
-                ctx_eps: float = 1e-3,
-                d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
-                dim_ff: int = 384, wm_dropout: float = 0.0, pol_hidden: int = 256,
-                lr_wm: float = 3e-4, lr_pol: float = 2e-4, seed: int = 0,
-                buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
-                seq_steps: int = 10, n_ctx: int = 4,
+                initial_sort: str = "coreset", ctx_eps: float = 1e-3,
                 wm_batch: int = 64, wm_coreset_epoch: int = 512,
                 wm_target_loss: float = 0.004,
-                eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
-                eos_max_p: float = 8.0,
-                compile_wm: bool = False, **_ignored) -> None:
+                **params) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     pygame.init()
     pygame.display.set_caption("WM Manager — refonte")
@@ -236,32 +247,27 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
     font_small = pygame.font.SysFont(FONT_NAME, 11)
     font_tiny = pygame.font.SysFont(FONT_NAME, 10)
 
-    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
-                  d_model=d_model, nhead=nhead, layers=wm_layers, dim_ff=dim_ff,
-                  dropout=wm_dropout, pol_hidden=pol_hidden, lr_wm=lr_wm, lr_pol=lr_pol,
-                  seed=seed, buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity,
-                  eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
-                  eos_poids_arrivee=eos_poids_arrivee, eos_max_p=eos_max_p)
+    brain = Brain(**CFG.brain_kwargs(params))
     if os.path.exists(wm_path):
-        brain.load_checkpoint(wm_path=wm_path,
-                              pol_path=pol_path if os.path.exists(pol_path) else "nonexistent.pt")
+        if os.path.exists(pol_path):
+            brain.load_checkpoint(wm_path=wm_path, pol_path=pol_path)
+        else:
+            wm = torch.load(wm_path, weights_only=False)
+            brain.world.load_state_dict(wm["world"])
+            if "opt_wm" in wm:
+                brain.opt_wm.load_state_dict(wm["opt_wm"])
         print(f"Loaded World Model from {wm_path}")
     else:
         print("Warning: WM checkpoint not found, using initialized weights.")
 
-    buf = ExperienceBuffer(capacity=buffer_capacity, pool_capacity=buffer_pool_capacity,
-                           seq_len=seq_steps + 1, n_ctx=n_ctx, seed=seed,
-                           eos_decay=eos_decay, eos_poids_chemin=eos_poids_chemin,
-                           eos_poids_arrivee=eos_poids_arrivee)
     if os.path.exists(buffer_path):
-        ok = buf.load(buffer_path)
-        print(f"Loaded {buf.coreset_size} sequences from {buffer_path}" if ok
+        ok = brain.buffer.load(buffer_path)
+        print(f"Loaded {brain.buffer.coreset_size} sequences from {buffer_path}" if ok
               else f"{buffer_path}: layout incompatible (legacy ?) — coreset vide")
     else:
         print(f"Warning: Buffer checkpoint {buffer_path} not found.")
 
-    manager = WMManager(brain, buf, wm_path=wm_path, width=width, height=height,
+    manager = WMManager(brain, brain.buffer, wm_path=wm_path, width=width, height=height,
                         initial_sort=initial_sort, ctx_eps=ctx_eps,
                         phase_epochs=wm_coreset_epoch, phase_batch=wm_batch,
                         phase_target=wm_target_loss)
@@ -291,18 +297,9 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
 def main() -> None:
     cfg = CFG.load_config()
     params: dict = {
+        **CFG.BRAIN_DEFAULTS,
         "buffer_path": "buf_ckpt.pt", "wm_path": "wm_ckpt.pt", "pol_path": "pol_ckpt.pt",
-        "initial_index": 0,
-        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "initial_sort": "coreset", "ctx_eps": 1e-3, "accel": False,
-        "d_model": 64, "nhead": 4, "wm_layers": 3,
-        "dim_ff": 384, "wm_dropout": 0.0, "pol_hidden": 256,
-        "lr_wm": 3e-4, "lr_pol": 2e-4, "seed": 0,
-        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
-        "seq_steps": 10, "n_ctx": 4,
-        "wm_batch": 64, "wm_coreset_epoch": 512, "wm_target_loss": 0.004,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
-        "compile_wm": False,
+        "initial_index": 0, "initial_sort": "coreset", "ctx_eps": 1e-3,
     }
     CFG.apply_toml(params, cfg)
     p = argparse.ArgumentParser(description="WM Manager — coreset browser + training (refonte)")

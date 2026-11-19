@@ -50,7 +50,7 @@ REGIME_NAMES = ["Kalman", "Policy"]
 
 @dataclass
 class DreamStep:
-    state_tokens: list[list[float]]  # 13 tokens × 25 floats
+    state_tokens: list[list[float]]  # 13 tokens × 29 floats
     action: list[float] | None        # [tf, df, tb, db, tq]
     step_cost: float = 0.0
     label: str = ""

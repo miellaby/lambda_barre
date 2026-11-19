@@ -142,45 +142,13 @@ def _platform_hit(space, world_pos):
 
 
 def run(headless: bool = False, steps: int = 0,
-        device: str | None = None, bootstrap_dataset: int = 0,
+        bootstrap_dataset: int = 0,
         pol_steps: int = 64, wm_coreset_epoch: int = 5, wm_addendum_epoch: int = 5,
-        eos_force_amp_lo: float = 0.1, eos_force_amp_hi: float = 0.5,
-        eos_decay: float = 0.9, eos_poids_chemin: float = 0.1, eos_poids_arrivee: float = 2.0,
-        eos_max_p: float = 8.0,
-        eos_force_amplify: float = 1.0,
-        eos_force_amplify_threshold: float = 0.95,
-        wm_impact_floor: float = 0.25,
-        lookahead_relief_mult: float = 1.0,
-        wm_w_state_post: float = 1.0,
-        wm_w_act_post: float = 1.0,
-        wm_w_eos: float = 16.0,
-        wm_w_a4_lookahead: float = 1.0,
+        wm_batch: int = 64, wm_target_loss: float = 0.004,
         freeze_physics: bool = False, no_smooth: bool = False,
-        wm_target_loss: float = 0.004,
-        prune_pct: float = 0.33, surprise_factor: float = 0.5,
-        prune_min_fill: float = 0.75, prune_beta: float = 2.0,
-        dedup_eps: float = 0.02, surprise_floor: float = 0.001,
-        use_kv_cache: bool = True,
-        pol_eos_lookahead: bool = True,
-        compile_wm: bool = False,
-        seq_steps: int = 10,
-        n_ctx: int = 4,
-        wm_hz: float = 3.0,
-        pol_hz: float = 6.0,
-        # Transformer architecture (from config.toml or defaults)
-        d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
-        dim_ff: int = 384, wm_dropout: float = 0.0,
-        pol_hidden: int = 256,
-        # Training hyperparameters
-        lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-        act_std: float = 0.0,
+        wm_hz: float = 4.0, pol_hz: float = 8.0,
         act_conseq_shift: int = 1,
-        tri_w_det: float = 1.0, tri_w_cons: float = 1.0,
-        tri_w_viv: float = 1.0, tri_vivacity_pow: float = 1.0,
-        wm_batch: int = 64,
-        seed: int = 0,
-        # Buffer capacities
-        buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000) -> None:
+        **params) -> None:
     if headless:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
@@ -192,16 +160,6 @@ def run(headless: bool = False, steps: int = 0,
     pygame.init()
     flags = pygame.SCALED | pygame.RESIZABLE
     screen = pygame.display.set_mode((R.WIDTH, R.HEIGHT), flags) if not headless else None
-    # if screen is not None:
-    #     try:
-    #         import warnings
-    #         with warnings.catch_warnings():
-    #             warnings.simplefilter("ignore", DeprecationWarning)
-    #             win = pygame.Window.from_display_module()
-    #             win.size = (R.WIDTH, R.HEIGHT)
-    #             win.position = pygame.WINDOWPOS_CENTERED
-    #     except Exception:
-    #         pass
     font = pygame.font.SysFont(R.FONT_NAME, 13) if screen else None
     font_small = pygame.font.SysFont(R.FONT_NAME, 11) if screen else None
     clock = pygame.time.Clock()
@@ -219,33 +177,8 @@ def run(headless: bool = False, steps: int = 0,
     touch = E.Touch(space, skel)
     intero = I.Intero()
     encoder = DenseEncoder()
-    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
-                  d_model=d_model, nhead=nhead, layers=wm_layers,
-                  dim_ff=dim_ff, dropout=wm_dropout,
-                  pol_hidden=pol_hidden,
-                  lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std,
-                  seed=seed,
-                  buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity,
-                  eos_force_amp_lo=eos_force_amp_lo,
-                  eos_force_amp_hi=eos_force_amp_hi,
-                  eos_decay=eos_decay,
-                  eos_poids_chemin=eos_poids_chemin, eos_poids_arrivee=eos_poids_arrivee,
-                  eos_max_p=eos_max_p,
-                  eos_force_amplify=eos_force_amplify,
-                  eos_force_amplify_threshold=eos_force_amplify_threshold,
-                  wm_impact_floor=wm_impact_floor,
-                  lookahead_relief_mult=lookahead_relief_mult,
-                  wm_w_state_post=wm_w_state_post,
-                  wm_w_act_post=wm_w_act_post,
-                  wm_w_eos=wm_w_eos,
-                  wm_w_a4_lookahead=wm_w_a4_lookahead)
-    brain.act_conseq_shift = act_conseq_shift  # démarre en manual (auto=False) → k appliqué
-    brain.tri_w_det = tri_w_det
-    brain.tri_w_cons = tri_w_cons
-    brain.tri_w_viv = tri_w_viv
-    brain.tri_vivacity_pow = tri_vivacity_pow
+    b_kw = CFG.brain_kwargs({**params, "act_conseq_shift": act_conseq_shift})
+    brain = Brain(**b_kw)
     auto = False                 # brain drives the consignes when True
     try:
         brain.load_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
@@ -257,8 +190,13 @@ def run(headless: bool = False, steps: int = 0,
     if bootstrap_dataset > 0:
         from .dataset import generate_balance_dataset
         print(f"[bootstrap] Generating {bootstrap_dataset} transitions of physical experience...")
-        brain.buffer = generate_balance_dataset(target_transitions=bootstrap_dataset,
-                                               seq_steps=seq_steps, n_ctx=n_ctx)
+        brain.buffer = generate_balance_dataset(
+            target_transitions=bootstrap_dataset,
+            seq_steps=brain.seq_steps, n_ctx=brain.n_ctx,
+            lookahead=brain.lookahead, eos_decay=brain.eos_decay,
+            wm_hz=wm_hz,
+            buffer_capacity=brain.buffer.capacity,
+            buffer_pool_capacity=brain.buffer.pool_capacity)
         brain.buffer.save(_BUF_CKPT)
         status = f"dataset bootstrapped ({len(brain.buffer)} seqs)"
     WM_DT = 1.0 / wm_hz       # world model cadence
@@ -482,7 +420,13 @@ def run(headless: bool = False, steps: int = 0,
                     # affichage : epoch réelle (overtime visible), batch courant
                     ep_disp = wm_step
                     overtime = wm_step - wm_total
-                    ot_str = f" (+{overtime} overtime)" if overtime > 0 else ""
+                    sling = getattr(brain, "sleep_wm_slingshot", False)
+                    if overtime > 0:
+                        ot_str = f" (+{overtime} overtime, slingshot)" if sling else f" (+{overtime} overtime)"
+                    elif sling:
+                        ot_str = " (slingshot)"
+                    else:
+                        ot_str = ""
                     # barre globale epoch × batch, NON cappée : en overtime on
                     # refait tous les batchs, la progression continue au-delà du quota
                     g_total = wm_total * wB
@@ -675,41 +619,11 @@ def run(headless: bool = False, steps: int = 0,
 def main() -> None:
     cfg = CFG.load_config()
 
-    # Defaults matching run() signature
     params: dict = {
+        **CFG.BRAIN_DEFAULTS,
         "headless": False, "steps": 0, "reset": False,
-        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "accel": False,
         "bootstrap_dataset": 0,
-        "pol_steps": 32, "wm_coreset_epoch": 5, "wm_addendum_epoch": 5, "wm_batch": 64,
-        "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
-        "eos_decay": 0.9, "eos_poids_chemin": 0.1, "eos_poids_arrivee": 2.0, "eos_max_p": 8.0,
-        "eos_force_amplify": 1.0,
-        "eos_force_amplify_threshold": 0.95,
-        "wm_impact_floor": 0.25,
-        "lookahead_relief_mult": 1.0,
-        "wm_w_state_post": 1.0,
-        "wm_w_act_post": 1.0,
-        "wm_w_eos": 16.0,
-        "wm_w_a4_lookahead": 1.0,
         "freeze_physics": False, "no_smooth": False,
-        "wm_target_loss": 0.004,
-        "prune_pct": 0.33, "surprise_factor": 0.5,
-        "prune_min_fill": 0.75, "prune_beta": 2.0,
-        "dedup_eps": 0.02, "surprise_floor": 0.001,
-        "use_kv_cache": True, "pol_eos_lookahead": True,
-        "compile_wm": False,
-        "seq_steps": 10, "n_ctx": 4,
-        "wm_hz": 3.0, "pol_hz": 6.0,
-        "d_model": 64, "nhead": 4, "wm_layers": 3,
-        "dim_ff": 384, "wm_dropout": 0.0,
-        "pol_hidden": 256,
-        "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.0,
-        "act_conseq_shift": 1,
-        "tri_w_det": 1.0, "tri_w_cons": 1.0, "tri_w_viv": 1.0, "tri_vivacity_pow": 1.0,
-        "seed": 0,
-        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
     }
 
     # Override with config.toml
@@ -743,22 +657,14 @@ def main() -> None:
                    help="freeze physics simulation (for debugging token recordings)")
     p.add_argument("--no-smooth", action="store_true", default=argparse.SUPPRESS,
                    help="bypass IIR sensor smoother (use raw snapshots)")
-    p.add_argument("--no-kv-cache", action="store_true", default=argparse.SUPPRESS,
-                   help="disable the persistent KV-cache for imagined policy rollouts")
-    p.add_argument("--no-eos-lookahead", action="store_true", default=argparse.SUPPRESS,
-                   help="disable EOS-lookahead policy supervision (fall back to stochastic candidates)")
     p.add_argument("--compile", action="store_true", default=argparse.SUPPRESS,
                    dest="compile_wm",
                    help="torch.compile the World Model training step")
     # NOTE: checkpoint-structure options (--seq-steps, --n-ctx, --wm-hz,
     # --pol-hz, --d-model, --nhead, --wm-layers, --dim-ff, --wm-dropout,
     # --pol-hidden, --buffer-capacity, --buffer-pool-capacity) are
-    # intentionally NOT exposed on the CLI.  They define the shape of
-    # wm_ckpt.pt, pol_ckpt.pt and buf_ckpt.pt — changing any of them
-    # invalidates existing checkpoints.  Set them in config.toml instead;
-    # after a change, run with --reset to discard old checkpoints and
-    # start fresh.
-    # Training hyperparameters
+    # intentionally NOT exposed on the CLI.  Set them in config.toml instead;
+    # after a change, run with --reset to discard old checkpoints.
     p.add_argument("--lr-wm", type=float, default=argparse.SUPPRESS,
                    help="World Model learning rate")
     p.add_argument("--lr-pol", type=float, default=argparse.SUPPRESS,
@@ -767,14 +673,6 @@ def main() -> None:
                    help="action sampling std during wake")
     p.add_argument("--act-conseq-shift", type=int, default=argparse.SUPPRESS,
                    help="brain-off action/consequence shift k: recorded pair is (s_{n-k} ; a_n), default 1")
-    p.add_argument("--tri-w-det", type=float, default=argparse.SUPPRESS,
-                   help="poids du déterminisme dans le min-flou de tri du coreset (plateau WM)")
-    p.add_argument("--tri-w-cons", type=float, default=argparse.SUPPRESS,
-                   help="poids de la consonance dans le min-flou de tri du coreset")
-    p.add_argument("--tri-w-viv", type=float, default=argparse.SUPPRESS,
-                   help="poids de la vivacité dans le min-flou de tri du coreset")
-    p.add_argument("--tri-vivacity-pow", type=float, default=argparse.SUPPRESS,
-                   help="exposant appliqué à la vivacité normalisée dans le tri")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS,
                    help="random seed")
 

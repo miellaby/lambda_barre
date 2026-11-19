@@ -1,0 +1,226 @@
+# Revue critique — Gemini (`Revue_gemini.md`)
+
+Journal de revue des problèmes signalés lors de l'audit du projet.
+Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis la décision retenue est consignée ici.
+
+## Todolist de revue
+
+### Apprentissage, mathématiques et signal de renforcement
+
+- [x] Signe du canal `confort` inversé dans le token dénouement (`brain.py:240`)
+- [x] Asymétrie de `relief_score` (max flou $L_8$ vers `1.0`) (`brain.py:330-344`)
+- [x] Mismatch éveil vs entraînement dans `Brain._wm_forward` (`brain.py:817`)
+- [x] `latent_norm` exécuté sous `torch.inference_mode()` et jamais entraîné (`brain.py:1411`)
+- [x] Probabilités faussées dans `sample_denouements` (tirage avec remise + `softmax(logp)`) (`brain.py:1244-1281`)
+- [x] Codebook EOS réinitialisé/permuté à chaque phase WM et lignes `M..31` aléatoires (`brain.py:1031-1070`)
+- [x] `build_ctx_input_scale` neutralisé en attention par `norm_first=True` mais présent dans le flux résiduel (`models.py:136-161`)
+
+### Outils, buffer d'expérience et configuration
+
+- [x] `wm_manager.py` : `brain.buffer` reste vide (`[S]` ne fait rien, `[W]` ignore le coreset) (`wm_manager.py:268-281`)
+- [x] `wm_theater.py` : `rollout_record` n'appelle pas `brain.world.eval()` avant `cache_forward` (`wm_theater.py:181-212`)
+- [x] Longueur de fenêtre `lookahead` incohérente dans `ExperienceBuffer` et `Brain.record` (`brain.py:445-507`, `604-650`, `891`)
+- [x] Paramètres désynchronisés entre `config.toml`, `config.py`, `dataset.py` et `dream_theater.py`
+- [x] `_build_dream_record` affiche la fenêtre réelle sous le label `(imaginé)` (`brain.py:1473-1476`)
+
+---
+
+## Détail des points et journal des décisions
+
+### Signe du canal `confort` inversé dans le token dénouement
+
+- **Références** : `proprio.py:266-269`, `tokenize.py:116`, `tokenize.py:169-172`, `brain.py:239-249`
+- **Constat avancé** :
+  - `proprio.py:267` produit `confort` négatif quand l'animat est confortable (`-0.3`, contre `0.0` sinon).
+  - `tokenize.py:116` déclare `confort` en `signed=True` (`max_val=1.0`), donc `_normalize` mappe `-0.3 → 0.35` et `0.0 → 0.50` (plus bas = meilleur, même sens que les 5 coûts).
+  - `_eos_slots_of_window` (`brain.py:240`) ajoute `-salve[_REWARD_IDX][SIG_OFFSET]`. Passer de couché (`0.50`) à confortable (`0.35`) donne `c[k] - c[d] = (-0.35) - (-0.50) = +0.15 > 0`, donc `slot[5] < 0.5` (pénalisé).
+- **Point à vérifier en discussion** : confirmer si `salve[_REWARD_IDX][SIG_OFFSET]` doit être pris tel quel (sans signe `-`), et si la mise à l'échelle (amplitude `0.15` en normalisé vs `0.30` en physique) est voulue.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — le bug de signe/échelle dans le dénouement était réel, et la cause racine vient de l'encodage du token `confort` lui-même (`signed=True` qui mettait `0.0` à `0.5` et gaspillait `(0.5, 1.0]`).
+- **Discussion** : plutôt que de corriger `brain.py:240` ou d'ajouter un flag `invert`, on remplace `min_val` / `max_val` / `signed` dans `TokenSpec` (`tokenize.py:48`) par `first_val` / `last_val` avec une seule formule affine `t = (raw - first_val) / (last_val - first_val)` (et inverse `first_val + t * (last_val - first_val)`). Pour `confort` : `(first_val=0.0, last_val=-1.0)` → `0.0 → 0.0`, `-0.3 → 0.3`, `-1.0 → 1.0`. `brain.py:240` (`-salve[_REWARD_IDX][SIG_OFFSET]`) devient alors exact en signe et en échelle 1:1.
+- **Décision** :
+  - Refactoriser `TokenSpec` (`tokenize.py`) : remplacer `(min_val, max_val, signed)` par `(first_val, last_val)`, encoder `confort` (et `reward_pos`) en `(0.0, -1.0)`.
+  - Adapter `_salve_cost_batch` (`brain.py:391-395`, `1141-1147`) à la formule affine `first + t * (last - first)` et `_ACT_SIGNED` (`brain.py:377`) à `first_val < 0 < last_val`.
+  - Régénérer/réentraîner les checkpoints après application (changement d'encodage du token 11).
+
+---
+
+### Asymétrie de `relief_score` (max flou $L_8$)
+
+- **Références** : `brain.py:330-344`, `brain.py:1269-1279`, `brain.py:1428-1429`
+- **Constat avancé** :
+  - `mf = ((w * slots ** p).sum(dim=-1)) ** (1.0 / p)` avec `p = 8.0`, puis `2.0 * (mf - 0.5)`.
+  - Une norme $L_p$ avec $p=8$ fait un max flou vers `1.0` et ignore presque les valeurs proches de `0.0`.
+  - Exemples : `[0.5, 0.0, 0.5, 0.5, 0.5, 0.5]` (douleur maximale, poids `4/13`) donne `relief = -0.045`. `[0.75, 0.0, 0.5, 0.5, 0.5, 0.5]` donne `relief = +0.126` (positif malgré douleur maximale). `[0.0, 0.0, 0.0, 0.0, 0.0, 0.95]` donne `relief = +0.38`.
+- **Point à vérifier en discussion** : quel comportement souhaité pour l'agrégation des 6 canaux du dénouement (symétrie gain/perte autour de `0.5`, priorité à éviter la douleur via un min flou ou une différence de max flous sur gains vs pertes, ou moyenne pondérée) ?
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — le max flou $L_8$ sur `[0, 1]` écrasait les dégradations vers `0.0` (asymétrie ~16×) et masquait les autres canaux dès qu'un canal saturait.
+- **Discussion** : remplacement du max flou $L_8$ par un vrai score additif, symétrique autour de `0.5 = 0`, fidèle aux poids `W = [1, 4, 2, 2, 3, 1]` et non dilué sur un canal isolé : `tanh(Σ (W_j / W_max) · (2·slot_j - 1))` avec `W_max = 4`. Strictement croissant sur chaque canal (départage toujours même en saturation), symétrique (`douleur 1.0 → +0.76`, `douleur 0.0 → -0.76`), borné dans `(-1, +1)`, et supprime l'hyperparamètre `eos_max_p`.
+- **Décision** :
+  - Remplacer `relief_score` (`brain.py:330-344`) par `torch.tanh(((W / W.max()) * (2.0 * slots - 1.0)).sum(dim=-1))`.
+  - Supprimer/nettoyer le paramètre `eos_max_p` devenu inutile (et les appels incohérents qui l'omettaient).
+
+---
+
+### Mismatch éveil vs entraînement dans `Brain._wm_forward`
+
+- **Références** : `brain.py:810-818` vs `brain.py:1407-1411`
+- **Constat avancé** :
+  - Pendant `_policy_step` (`brain.py:1407-1410`), le WM reçoit `ctx_len=self.ctx_len, ctx_boost=self.ctx_attn_boost` (et `salve_positions=self.salve_positions[:self.ctx_len]`).
+  - Pendant l'éveil (`_wm_forward`, `brain.py:817`), le WM est appelé par `self.world(ctx)` sans `ctx_len` ni `ctx_boost` (`ctx_boost=0.0` par défaut). Le latent intermédiaire passé à la policy en éveil n'a donc pas la même distribution qu'à l'entraînement.
+  - Secondaire : tant que `_wake_history` n'est pas rempli (`len < n_ctx`), `ctx` est plus court que `ctx_len`.
+- **Point à vérifier en discussion** : aligner `_wm_forward` sur les mêmes arguments que `_policy_step` (ou supprimer `ctx_boost` selon la décision sur `build_ctx_input_scale`).
+- **Statut** : validé (résolu conjointement avec `build_ctx_input_scale`)
+- **Verdict (diagnostic valide ?)** : oui — `_policy_step` (`brain.py:1410`) passait `ctx_boost=self.ctx_attn_boost` alors que `_wm_forward` (`brain.py:817`) passait `0.0`.
+- **Discussion** : la suppression complète de `ctx_attn_boost` / `build_ctx_input_scale` (voir point dédié) élimine la divergence entre éveil et entraînement policy. Garder un appel WM identique (masque causal + `salve_positions`) aux deux endroits pour éviter toute dérive future.
+- **Décision** :
+  - Supprimer `ctx_len`/`ctx_boost` des appels WM ; aligner `_wm_forward` et `_policy_step` sur le même appel (masque causal bool + `salve_positions[:L]`).
+
+---
+
+### `latent_norm` exécuté sous `torch.inference_mode()` et jamais entraîné
+
+- **Références** : `brain.py:714-718`, `brain.py:1406-1420`
+- **Constat avancé** :
+  - `self.latent_norm` est inclus dans `self.opt_pol` (`brain.py:717`), mais `self.latent_norm(self.world.last_latent().detach())` est exécuté dans le bloc `with torch.inference_mode():` (`brain.py:1411`), puis cloné (`brain.py:1418`).
+  - Ses poids affines (`weight`, `bias`) ne reçoivent jamais de gradient.
+- **Point à vérifier en discussion** : déplacer `self.latent_norm(...)` hors du bloc `inference_mode` (sur le latent brut détaché et cloné), ou retirer `latent_norm` d'`opt_pol` (`elementwise_affine=False`) si seule la normalisation fixe est voulue.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `latent_norm` était dans `opt_pol` mais exécuté dans `torch.inference_mode()`, donc ses poids affines ne recevaient jamais de gradient.
+- **Discussion** : la normalisation elle-même est bien utile (la couche médiane du Transformer `norm_first=True` sort le flux résiduel brut non normé, dont l'échelle peut dériver face aux 51 scalaires `[0, 1]`), mais les paramètres affines `weight`/`bias` sont redondants avec le `nn.Linear(51 + d_model, hidden)` immédiat de `Policy`.
+- **Décision** :
+  - Remplacer `self.latent_norm` par une normalisation sans paramètres (`F.layer_norm(x, (d_model,))` ou `nn.LayerNorm(d_model, elementwise_affine=False)`), et la retirer d'`opt_pol`, `state_dict` et `pol_ckpt.pt`.
+
+---
+
+### Probabilités faussées dans `sample_denouements`
+
+- **Références** : `brain.py:1240-1282`, `test_brain.py:246-258`
+- **Constat avancé** :
+  - On tire `K=64` échantillons avec remise dans un codebook de `32` prototypes, puis on fait `probs_k = torch.softmax(logp, dim=1)` (`brain.py:1252`) et `p_elu = torch.softmax(logp, dim=1)[b_idx, elu]` (`brain.py:1275`).
+  - À cause des doublons du tirage avec remise, un prototype de probabilité $p$ pèse proportionnellement à $p^2$ dans `cum`, et la probabilité individuelle d'un tirage est divisée par son nombre d'occurrences : sur un Dirac ($P(A)=1$), `p_elu ≈ 1/58 ≈ 0.017` au lieu de `1.0`, alors que `eos_observed` reçoit `p_elu = 1.0` (`brain.py:1281`).
+  - Avec `eos_vocab = 32`, on peut opérer directement sur la distribution exacte `probs [B, 32]` sans tirage Monte Carlo avec remise.
+- **Point à vérifier en discussion** : veut-on une élection déterministe exacte sur les 32 prototypes (top-p + min-p + argmax relief sur le codebook, `p_elu = probs[b, elu]`) ou garder une part d'aléatoire à l'échantillonnage ?
+- **Statut** : validé (résolu conjointement avec le point codebook EOS par passage au MDN)
+- **Verdict (diagnostic valide ?)** : oui — le tirage avec remise de `K=64` échantillons + `softmax(logp)` biaisait les probabilités en $p^2$, divisait `p_elu` par ~K (ex. `0.017` sur un Dirac vs `1.0` pour `eos_observed`), et `cum < p` avait un off-by-one sur le noyau top-p.
+- **Discussion** : abandon du codebook k-means et du tirage Monte Carlo avec remise au profit d'un **Mixture Density Network (MDN)** à $K$ composantes (ex. $K=8$) prédit directement par la tête EOS : poids $\pi_k$ (`softmax`), centres continus $\mu_k \in [0, 1]^6$ (`sigmoid`), écarts-types $\sigma_k \ge \sigma_{\min}$ (`softplus + sigma_min`). En inférence : `WM µ` = $\mu_{\arg\max \pi}$, `WM ÉLU` = noyau top-p exact `(cum - sorted_pi) < p` + plancher `pi >= min_p` sur les $K$ modes, élection par meilleur `relief_score(mu_k)`, et **`p_elu = pi[elu]`**.
+- **Décision** :
+  - Remplacer `sample_denouements` et `predict_denouement` par l'élection exacte sur les $K$ modes du MDN (noyau top-p sans off-by-one + `min_p` + argmax relief, `p_elu = pi[elu]`, règle de l'observé conservée).
+  - Nettoyer tous les anciens paramètres/code liés au tirage sur codebook (`eos_top_k`, `proto_mask`, `eos_w_fav` mort, etc.).
+
+---
+
+### Codebook EOS réinitialisé/permuté à chaque phase WM et lignes aléatoires
+
+- **Références** : `models.py:242-244`, `brain.py:998-1002`, `brain.py:1031-1054`, `brain.py:1070`, `brain.py:1541-1555`
+- **Constat avancé** :
+  - `train_wm_phase` (`brain.py:1070`) appelle `_fit_eos_codebook(list(seqs_all))` au début de chaque phase (`wm_coreset`, puis `wm_addendum`).
+  - `randperm` renumérote arbitrairement les 32 prototypes à chaque fit, cassant l'alignement des poids déjà appris de `eos_head`.
+  - En phase `wm_addendum`, le codebook est écrasé par les seuls EOS de l'addendum (oubliant le coreset), juste avant `train_policy` qui échantillonne sur coreset + addendum.
+  - Si `N < 32` (`M = min(M, N)`, `brain.py:1043`), les lignes `M..31` gardent leurs valeurs aléatoires `torch.rand(32, 6)` d'initialisation (ou des prototypes périmés) et restent éligibles dans `cdist` et `sample_denouements`.
+  - Si `N > 512`, `sequences[:max_samples]` (`brain.py:1038`) ne prend que le début du coreset (qui est ordonné, non shufflé).
+- **Point à vérifier en discussion** : stratégie de mise à jour du codebook (fit une fois / EMA / warm-start depuis le codebook courant sans permutation, fit sur coreset + addendum, masquage des prototypes inutilisés quand `N < M`, échantillonnage uniforme si `N > max_samples`).
+- **Statut** : validé (résolu par passage au MDN)
+- **Verdict (diagnostic valide ?)** : oui — le codebook k-means global était structurellement fragile entre coreset et addendum (permutations d'indices, écrasement par l'addendum, lignes non initialisées).
+- **Discussion** : remplacé par le **MDN** ($K$ gaussiennes diagonales par composante, entraîné par log-vraisemblance négative exacte `-logsumexp(log_pi + log_N(tgt | mu, sigma))`). Chaque contexte prédit ses propres modes continus, et l'addendum peut apporter de nouveaux dénouements sans jamais casser `eos_head`.
+- **Décision** :
+  - Supprimer complètement `eos_codebook`, `EOS_VOCAB`, `eos_vocab`, `_fit_eos_codebook` et la cross-entropy codebook (`eos_ce_w`).
+  - Remplacer `eos_head` par une tête MDN ($K$ modes, `eos_sigma_min`, NLL décalée $\ge 0$ normalisée par slot, init diversifiée des biais $\mu_k$ pour éviter le mode collapse) et nettoyer tous les anciens paramètres/docs associés.
+  - **Point découvert aux tests** : la NLL MDN reste **non pondérée** par `_seq_impact` (`nll.mean()`), tandis que la MSE trajectoire/action garde la pondération par impact — sinon `_seq_impact` (rapport jusqu'à ~10× entre chute et neutre) biaise les probabilités $\pi_k$ apprises vers $Q \propto \text{impact}\cdot P$ au lieu des vraies fréquences $P(\text{EOS}\mid\text{ctx})$.
+
+---
+
+### `build_ctx_input_scale` dans un Transformer `norm_first=True`
+
+- **Références** : `models.py:136-161`, `models.py:231`, `models.py:317-326`, `models.py:428-441`
+- **Constat avancé** :
+  - Avec `n_ctx=6` (`ctx_len=109`) et `boost=log(2)`, `ramp[:109].sum() = 53.0` → `s[eos_pos] ≈ 37.74`.
+  - En pré-normalisation (`norm_first=True`), `layer.norm1(h)` renormalise `h[eos_pos]` avant `Q, K, V` : les autres tokens n'accordent pas davantage d'attention au dénouement.
+  - Effets réels du facteur `37.74` : écrasement du PE dédié du token EOS (amplitude ~1) et domination du flux résiduel (`h = h + attn_out`) à `eos_pos`, empêchant ce token d'intégrer efficacement le contexte.
+- **Point à vérifier en discussion** : vérifier expérimentalement si ce scale aide ou nuit ; décider s'il faut le retirer (`ctx_attn_boost = 0.0`) ou implémenter autrement la pondération souhaitée.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — avec `norm_first=True` (`models.py:231`), le scale d'entrée `1..1.693` (et `37.74` sur `eos_pos`) est annulé par `norm1` avant l'attention tout en écrasant le PE et en dominant le flux résiduel.
+- **Discussion** : le besoin d'un prior de récence (passé proche > passé lointain) est légitime en soi (façon ALiBi), mais se ferait proprement par biais additif d'attention (masque float modéré/par tête), jamais par scale sur `in_proj(x)`. À l'échelle actuelle (`n_ctx=6`, 8 têtes × 4 couches, PE par salve + bit one-hot `_M_EOS`), le Transformer peut l'apprendre seul tout en gardant le fast path SDPA causal bool.
+- **Décision** :
+  - Supprimer `build_ctx_input_scale`, `_CTX_SCALE_CACHE`, `ctx_attn_boost` et les paramètres `ctx_len`/`ctx_boost` de `WorldModel` (`models.py`, `brain.py`, `test_brain.py`). Garder l'idée d'un biais additif façon ALiBi en réserve uniquement si un diagnostic ultérieur le justifie.
+
+---
+
+### `wm_manager.py` : `brain.buffer` vide (`[S]` et `[W]`)
+
+- **Références** : `wm_manager.py:75-85`, `wm_manager.py:268-281`, `brain.py:1064-1070`
+- **Constat avancé** :
+  - `run_manager` charge `buf_ckpt.pt` dans un objet local `buf` passé à `WMManager(brain, buf)`, sans l'assigner à `brain.buffer`.
+  - `start_phase` appelle `self.brain.train_wm_phase(..., source="coreset")` qui lit `self.brain.buffer._coreset` (vide). Conséquence : `[S]` ne fait aucun step et `[W]` n'entraîne que sur `fixed_seq` seule, sans le coreset ni `_fit_eos_codebook`.
+- **Point à vérifier en discussion** : assigner `brain.buffer = buf` dans `run_manager` (et vérifier le libellé du badge `[S]` vs `[W]` dans `_draw_train_strip`, `wm_manager.py:187-188`).
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `brain.buffer` restait vide dans `run_manager`, rendant `[S]` inopérant et `[W]` identique à `[T]`.
+- **Discussion** : solution directe retenue (charger dans `brain.buffer` / assigner `brain.buffer = buf`) + corriger le libellé du badge `[S]` vs `[W]`.
+- **Décision** :
+  - Charger le buffer directement dans `brain.buffer` (et le passer à `WMManager` / `WMTheater`) dans `wm_manager.py:268-281` et `wm_theater.py:638-648`.
+  - Corriger le badge de `_draw_train_strip` (`wm_manager.py:187-188`) pour distinguer `[W]` (amplified) et `[S]` (full coreset), en anglais conformément à `AGENTS.md`.
+
+---
+
+### `rollout_record` sans `brain.world.eval()` avant `cache_forward`
+
+- **Références** : `wm_theater.py:181-212`, `wm_manager.py:67`, `models.py:420-421`
+- **Constat avancé** :
+  - `WMManager.train_one_epoch` et `train_wm_phase` passent `brain.world.train()`, puis `rollout_record` appelle `generate_from_denouement` → `cache_forward` sans repasser en `eval()`.
+  - Tant que `dropout = 0.0` cela passe inaperçu, mais dès que `dropout > 0`, `cache_forward` lève `RuntimeError("cached inference path is only valid without dropout")`.
+- **Point à vérifier en discussion** : appeler `brain.world.eval()` en début de `rollout_record` (ou dans `generate_from_denouement` / `_denouement_dist`).
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `rollout_record` appelait `cache_forward` en mode `train()` (crash `RuntimeError` dès `dropout > 0`), et un simple `eval()` sans restauration aurait coupé `train()` pour la suite de `train_wm_phase`.
+- **Discussion** : sauvegarder/restaurer l'état `self.world.training` autour des méthodes d'inférence WM (`_denouement_dist`, `generate_from_denouement`) règle les deux sens proprement.
+- **Décision** :
+  - Dans `_denouement_dist` et `generate_from_denouement` (`brain.py`), encadrer le forward par `was_training = self.world.training` / `self.world.eval()` / `finally: if was_training: self.world.train()`.
+
+---
+
+### Longueur de fenêtre `lookahead` incohérente dans `ExperienceBuffer` et `Brain.record`
+
+- **Références** : `brain.py:445-507`, `brain.py:604-650`, `brain.py:891`
+- **Constat avancé** :
+  - `_n_windows` (`brain.py:497`) utilise `need = max(self.seq_steps, self.n_ctx + self.lookahead + 1)` (`17` en config actuelle `12 / 6 / 10`).
+  - `_valid_segments`, `journal_len`, `boundary`, `_enforce_capacity` et la pause statique dans `Brain.record` (`brain.py:891`) utilisent encore `self.seq_len` (`13`).
+  - Des segments de longueur 13..16 sont comptés dans `journal_len` et scellés, mais produisent `_n_windows < 0`, ce qui corrompt `ExperienceBuffer.sample()` (`brain.py:638-646`) quand coreset + addendum sont vides.
+- **Point à vérifier en discussion** : introduire une propriété `_window_span = max(self.seq_steps, self.n_ctx + self.lookahead + 1)` et l'utiliser partout dans `ExperienceBuffer` et `Brain.record`.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `ExperienceBuffer` et `Brain.record` utilisaient `self.seq_len` (`13`) au lieu de la vraie portée de fenêtre avec saut `need = 17`, causant des fenêtres fantômes dans `journal_len`, un `_n_windows` négatif dans `sample()`, et une pause d'enregistrement prématurée.
+- **Discussion** : uniformiser sur `self.window_span = max(self.seq_steps, self.n_ctx + self.lookahead + 1)` partout.
+- **Décision** :
+  - Ajouter `self.window_span = max(self.seq_steps, self.n_ctx + self.lookahead + 1)` dans `ExperienceBuffer.__init__` et l'utiliser dans `_valid_segments`, `journal_len`, `boundary`, `_n_windows` (`max(0, ...)`), `_enforce_capacity` et `Brain.record` (`brain.py:891`).
+  - Sauvegarder aussi `lookahead` dans `ExperienceBuffer.save` pour traçabilité.
+
+---
+
+### Paramètres désynchronisés entre `config.toml`, `config.py`, `dataset.py` et `dream_theater.py`
+
+- **Références** : `config.toml:22-48`, `config.py:41-95`, `dataset.py:205-212`, `dream_theater.py:84-102`, `dream_theater.py:137-140`
+- **Constat avancé** :
+  - `act_conseq_shift` (et `tri_w_*`) présents dans `config.toml:22-27` sont absents de `TOML_TO_PARAM` (`config.py:41-95`), donc ignorés depuis `config.toml`.
+  - Une quinzaine d'anciens paramètres legacy restent dans `config.toml` et sont absorbés par `**_legacy` dans `Brain.__init__`, alors que les nouveaux paramètres refonte (`eos_temperature`, `eos_ce_w`, `eos_top_p`, `eos_min_p`, `eos_vocab`, `ctx_attn_boost`) ne sont pas câblés dans `config.py`.
+  - `dataset.py:205-212` ne passe pas `lookahead` à `generate_balance_dataset`.
+  - `dream_theater.py:84-102, 137-140` ne passe ni `wm_batch`, ni `eos_decay`, `eos_max_p`, `wm_input_noise`.
+- **Point à vérifier en discussion** : quels paramètres exposer dans `config.toml` / `config.py`, quels anciens paramètres nettoyer, et uniformiser le câblage entre `main.py`, `dataset.py`, `dream_theater.py`, `wm_theater.py`, `wm_manager.py`.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `act_conseq_shift` ignoré depuis `config.toml`, une quinzaine de paramètres legacy morts avalés par `**_legacy`, paramètres refonte/MDN non exposés, et oublis dans `dataset.py` / `dream_theater.py` / `wm_manager.py` / `wm_theater.py`.
+- **Discussion** : aucun legacy à conserver sur la branche `refonte` (l'ancien état est archivé dans git). Retirer `**_legacy` de `Brain.__init__` pour attraper immédiatement tout paramètre inconnu ou oublié, et centraliser le câblage `config.py` → `Brain`.
+- **Décision** :
+  - Supprimer tous les paramètres legacy morts de `config.toml`, `config.example.toml`, `config.py`, `main.py`, `dream_theater.py`, `Brain.__init__` (y compris `**_legacy`, les flags CLI morts `--no-eos-lookahead` / `--no-kv-cache` / `--tri-w-*`, et les clés `[buffer]` non branchées).
+  - Câbler `act_conseq_shift` et les paramètres MDN/élection (`eos_n_modes`, `eos_sigma_min`, `eos_nll_w`, `eos_temperature`, `eos_top_p`, `eos_min_p`) dans `config.py` / `config.toml` / `config.example.toml`.
+  - Centraliser la construction des kwargs `Brain` (helper dans `config.py`) pour `main.py`, `dream_theater.py`, `wm_theater.py`, `wm_manager.py`, et passer `lookahead`/`eos_decay` dans `dataset.py` et `wm_batch` dans `dream_theater.py`.
+
+---
+
+### `_build_dream_record` affiche la fenêtre réelle sous le label `(imaginé)`
+
+- **Références** : `brain.py:1416`, `brain.py:1436-1439`, `brain.py:1473-1476`
+- **Constat avancé** :
+  - `_policy_step` ne récupère que `gen["action"]` (`brain.py:1416`) et `_build_dream_record` (`brain.py:1473-1476`) remplit `predicted_steps` (`label=f"s{k} (imaginé)"`) avec `window[n_ctx + 1:]` (les vrais états vécus).
+- **Point à vérifier en discussion** : passer `gen["conseq"]` à `_build_dream_record` pour afficher la vraie conséquence rétro-causale générée par le WM, ou renommer le label si ce n'est qu'un placeholder provisoire.
+- **Statut** : validé
+- **Verdict (diagnostic valide ?)** : oui — `_policy_step` jetait `gen["conseq"]` / `gen["full"]` et `_build_dream_record` affichait les vrais états `window[n_ctx + 1:]` sous le label `(imaginé)`.
+- **Discussion** : la génération est déjà calculée dans `_policy_step`, il suffit d'utiliser `gen["full"][0]` via `sequence_to_window` à coût nul.
+- **Décision** :
+  - Passer `gen["full"][:1]` de `_policy_step` à `_build_dream_record` et construire `predicted_steps` à partir de `sequence_to_window(...)` (vrais états imaginés par le WM), avec labels UI en anglais.

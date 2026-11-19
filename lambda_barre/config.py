@@ -7,7 +7,6 @@ Precedence: CLI arguments > config.toml > built-in defaults.
 """
 from __future__ import annotations
 
-import argparse
 import os
 import tomllib
 
@@ -40,59 +39,129 @@ def load_config(path: str = _CONFIG_PATH) -> dict:
 # used across all entry points.
 TOML_TO_PARAM: dict[str, str] = {
     # transformer section
-    "transformer_d_model":   "d_model",
-    "transformer_nhead":     "nhead",
-    "transformer_layers":    "wm_layers",
-    "transformer_dim_ff":    "dim_ff",
-    "transformer_dropout":   "wm_dropout",
+    "transformer_d_model":         "d_model",
+    "transformer_nhead":           "nhead",
+    "transformer_layers":          "wm_layers",
+    "transformer_dim_ff":          "dim_ff",
+    "transformer_dropout":         "wm_dropout",
     # policy section
-    "policy_hidden":         "pol_hidden",
+    "policy_hidden":               "pol_hidden",
     # training section
-    "training_lr_wm":          "lr_wm",
-    "training_lr_pol":         "lr_pol",
-    "training_act_std":        "act_std",
+    "training_lr_wm":              "lr_wm",
+    "training_lr_pol":             "lr_pol",
+    "training_act_std":            "act_std",
+    "training_act_conseq_shift":   "act_conseq_shift",
     "training_wm_coreset_epoch":   "wm_coreset_epoch",
     "training_wm_addendum_epoch":  "wm_addendum_epoch",
-    "training_wm_batch":       "wm_batch",
-    "training_wm_target_loss": "wm_target_loss",
-    "training_pol_steps":      "pol_steps",
-    "training_eos_force_amp_lo": "eos_force_amp_lo",
-    "training_eos_force_amp_hi": "eos_force_amp_hi",
-    "training_eos_decay":        "eos_decay",
-    "training_eos_poids_chemin": "eos_poids_chemin",
-    "training_eos_poids_arrivee": "eos_poids_arrivee",
-    "training_eos_max_p":        "eos_max_p",
-    "training_eos_force_amplify": "eos_force_amplify",
-    "training_eos_force_amplify_threshold": "eos_force_amplify_threshold",
-    "training_wm_impact_floor":  "wm_impact_floor",
-    "training_lookahead_relief_mult": "lookahead_relief_mult",
-    "training_wm_w_state_post":  "wm_w_state_post",
-    "training_wm_w_act_post":    "wm_w_act_post",
-    "training_wm_w_eos":         "wm_w_eos",
-    "training_wm_w_a4_lookahead": "wm_w_a4_lookahead",
+    "training_wm_batch":           "wm_batch",
+    "training_wm_target_loss":     "wm_target_loss",
+    "training_pol_steps":          "pol_steps",
+    "training_eos_decay":          "eos_decay",
+    "training_eos_n_modes":        "eos_n_modes",
+    "training_eos_sigma_min":      "eos_sigma_min",
+    "training_eos_nll_w":          "eos_nll_w",
+    "training_eos_temperature":    "eos_temperature",
+    "training_eos_top_p":          "eos_top_p",
+    "training_eos_min_p":          "eos_min_p",
+    "training_wm_impact_floor":    "wm_impact_floor",
+    "training_wm_input_noise":     "wm_input_noise",
     # buffer section
-    "buffer_capacity":         "buffer_capacity",
-    "buffer_pool_capacity":    "buffer_pool_capacity",
-    "buffer_prune_pct":        "prune_pct",
-    "buffer_prune_min_fill":   "prune_min_fill",
-    "buffer_prune_beta":       "prune_beta",
-    "buffer_dedup_eps":        "dedup_eps",
-    "buffer_surprise_factor":  "surprise_factor",
-    "buffer_surprise_floor":   "surprise_floor",
+    "buffer_capacity":             "buffer_capacity",
+    "buffer_pool_capacity":        "buffer_pool_capacity",
     # sequence section
-    "sequence_seq_steps": "seq_steps",
-    "sequence_n_ctx":     "n_ctx",
-    "sequence_wm_hz":     "wm_hz",
-    "sequence_pol_hz":    "pol_hz",
+    "sequence_seq_steps":          "seq_steps",
+    "sequence_n_ctx":              "n_ctx",
+    "sequence_lookahead":          "lookahead",
+    "sequence_wm_hz":              "wm_hz",
+    "sequence_pol_hz":             "pol_hz",
     # runtime section
-    "runtime_device":            "device",
-    "runtime_accel":             "accel",
-    "runtime_seed":              "seed",
-    "runtime_compile_wm":        "compile_wm",
-    "runtime_use_kv_cache":      "use_kv_cache",
-    "runtime_pol_eos_lookahead": "pol_eos_lookahead",
-    "runtime_no_smooth":         "no_smooth",
+    "runtime_device":              "device",
+    "runtime_accel":               "accel",
+    "runtime_seed":                "seed",
+    "runtime_compile_wm":          "compile_wm",
+    "runtime_no_smooth":           "no_smooth",
 }
+
+
+# Canonical Brain-related parameter defaults shared by all entry points.
+BRAIN_DEFAULTS: dict = {
+    "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
+    "accel": False,
+    "seed": 0,
+    "compile_wm": False,
+    "d_model": 64,
+    "nhead": 4,
+    "wm_layers": 3,
+    "dim_ff": 384,
+    "wm_dropout": 0.0,
+    "pol_hidden": 256,
+    "lr_wm": 3e-4,
+    "lr_pol": 2e-4,
+    "act_std": 0.0,
+    "act_conseq_shift": 1,
+    "seq_steps": 12,
+    "n_ctx": 6,
+    "lookahead": 10,
+    "wm_hz": 4.0,
+    "pol_hz": 8.0,
+    "buffer_capacity": 1000,
+    "buffer_pool_capacity": 1000,
+    "eos_decay": 0.8706,
+    "eos_n_modes": 8,
+    "eos_sigma_min": 0.02,
+    "eos_nll_w": 0.1,
+    "eos_temperature": 1.0,
+    "eos_top_p": 0.9,
+    "eos_min_p": 1e-3,
+    "wm_impact_floor": 0.25,
+    "wm_input_noise": 0.015,
+    "wm_coreset_epoch": 300,
+    "wm_addendum_epoch": 300,
+    "wm_batch": 64,
+    "wm_target_loss": 0.004,
+    "pol_steps": 32,
+}
+
+
+# Maps canonical entry-point param keys -> Brain.__init__ keyword argument names.
+_PARAM_TO_BRAIN_KWARG: dict[str, str] = {
+    "device":               "device",
+    "seed":                 "seed",
+    "compile_wm":           "compile_wm",
+    "seq_steps":            "seq_steps",
+    "n_ctx":                "n_ctx",
+    "lookahead":            "lookahead",
+    "d_model":              "d_model",
+    "nhead":                "nhead",
+    "wm_layers":            "layers",
+    "dim_ff":               "dim_ff",
+    "wm_dropout":           "dropout",
+    "pol_hidden":           "pol_hidden",
+    "lr_wm":                "lr_wm",
+    "lr_pol":               "lr_pol",
+    "act_std":              "act_std",
+    "act_conseq_shift":     "act_conseq_shift",
+    "buffer_capacity":      "buffer_capacity",
+    "buffer_pool_capacity": "buffer_pool_capacity",
+    "eos_decay":            "eos_decay",
+    "eos_n_modes":          "eos_n_modes",
+    "eos_sigma_min":        "eos_sigma_min",
+    "eos_nll_w":            "eos_nll_w",
+    "eos_temperature":      "eos_temperature",
+    "eos_top_p":            "eos_top_p",
+    "eos_min_p":            "eos_min_p",
+    "wm_impact_floor":      "wm_impact_floor",
+    "wm_input_noise":       "wm_input_noise",
+}
+
+
+def brain_kwargs(params: dict) -> dict:
+    """Extract a clean kwargs dict for ``Brain(...)`` from a merged params dict."""
+    return {
+        brain_key: params[param_key]
+        for param_key, brain_key in _PARAM_TO_BRAIN_KWARG.items()
+        if param_key in params
+    }
 
 
 def apply_toml(params: dict, cfg: dict) -> dict:
@@ -104,16 +173,7 @@ def apply_toml(params: dict, cfg: dict) -> dict:
 
 
 def merge_cli(params: dict, cli: dict) -> dict:
-    """Merge CLI arguments (from argparse with SUPPRESS defaults) into params.
-
-    Handles negated flags (``no_kv_cache`` → ``use_kv_cache = False``,
-    ``no_eos_lookahead`` → ``pol_eos_lookahead = False``).
-    """
+    """Merge CLI arguments (from argparse with SUPPRESS defaults) into params."""
     for key, val in cli.items():
-        if key == "no_kv_cache":
-            params["use_kv_cache"] = not val
-        elif key == "no_eos_lookahead":
-            params["pol_eos_lookahead"] = not val
-        else:
-            params[key] = val
+        params[key] = val
     return params

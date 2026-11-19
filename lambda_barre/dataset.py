@@ -27,9 +27,11 @@ def generate_balance_dataset(
     target_transitions: int = 3000,
     seed: int = 42,
     progress_callback: callable | None = None,
-    seq_steps: int = 10,
-    n_ctx: int = 4,
-    wm_hz: float = 3.0,
+    seq_steps: int = 12,
+    n_ctx: int = 6,
+    lookahead: int | None = 10,
+    eos_decay: float = 0.8706,
+    wm_hz: float = 4.0,
     buffer_capacity: int = 1000,
     buffer_pool_capacity: int = 1000,
 ) -> ExperienceBuffer:
@@ -55,8 +57,8 @@ def generate_balance_dataset(
     intero = I.Intero()
     encoder = DenseEncoder()
 
-    buffer = ExperienceBuffer(seq_len=seq_steps + 1, n_ctx=n_ctx,
-                              capacity=buffer_capacity,
+    buffer = ExperienceBuffer(seq_len=seq_steps + 1, n_ctx=n_ctx, lookahead=lookahead,
+                              eos_decay=eos_decay, capacity=buffer_capacity,
                               pool_capacity=buffer_pool_capacity, seed=seed)
 
     collected = 0
@@ -164,14 +166,10 @@ def main() -> None:
 
     # Built-in defaults
     params: dict = {
+        **CFG.BRAIN_DEFAULTS,
         "transitions": 3000,
         "out": default_out,
         "seed": 42,
-        "seq_steps": 10,
-        "n_ctx": 4,
-        "wm_hz": 3.0,
-        "buffer_capacity": 1000,
-        "buffer_pool_capacity": 1000,
     }
 
     # Override with config.toml
@@ -206,6 +204,8 @@ def main() -> None:
                                   progress_callback=on_progress,
                                   seq_steps=params["seq_steps"],
                                   n_ctx=params["n_ctx"],
+                                  lookahead=params["lookahead"],
+                                  eos_decay=params["eos_decay"],
                                   wm_hz=params["wm_hz"],
                                   buffer_capacity=params["buffer_capacity"],
                                   buffer_pool_capacity=params["buffer_pool_capacity"])

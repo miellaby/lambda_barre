@@ -1,23 +1,24 @@
 """Dense token encoder for λ̄'s world model.
 
 Each salve is a list of 16 dense tokens (13 sensory + 3 motor). A token is a
-vector of 25 floats concatenating:
+vector of 29 floats concatenating:
 
     type      (1)   0.0 = sensory, 1.0 = motor
-    modality  (4)   hand-picked orthogonal code (intero, somato, visual, motiv)
-    canal     (4)   hand-picked code within the modality
+    modality  (6)   one-hot: one bit per class (intero, proprio, extero,
+                    renforcement, action, dénouement/EOS) — exactly one lit
+    canal     (6)   one-hot within the modality (ids reused across modalities)
     signals   (16)  one normalized [0,1] scalar per slot, zero-padded if < 16
 
 There are no learned embeddings and no separator tokens — the structural prefix
 (type + modality + canal) is a fixed hand-encoded label that identifies the
 channel, and the 16 signal slots carry the normalized values directly. A salve
-is thus ``list[list[float]]`` of length 16, each inner list length 25.
+is thus ``list[list[float]]`` of length 16, each inner list length 29.
 
 Usage::
 
     enc = DenseEncoder()
     salve = enc.encode(proprio, touch, ball, vision, intero, reward, skel)
-    # salve: 16 tokens x 25 floats
+    # salve: 16 tokens x 29 floats
 """
 from __future__ import annotations
 
@@ -29,10 +30,10 @@ from lambda_barre.body import LIMB_MAX, LIMB_MIN
 
 # --- dense token geometry -----------------------------------------------------
 TYPE_DIM = 1
-MOD_DIM = 4
-CANAL_DIM = 4
+MOD_DIM = 6
+CANAL_DIM = 6
 N_SIGNAL = 16
-DENSE_DIM = TYPE_DIM + MOD_DIM + CANAL_DIM + N_SIGNAL  # 25
+DENSE_DIM = TYPE_DIM + MOD_DIM + CANAL_DIM + N_SIGNAL  # 29
 
 STATE_TOKENS = 13     # sensory tokens (indices 0..12)
 ACTION_TOKENS = 3     # motor tokens (indices 13..15)
@@ -47,81 +48,77 @@ VAL_MAX = 8
 class TokenSpec:
     key: str
     code: str          # 2-3 letter code for display
-    max_val: float       # maximum value
-    signed: bool       # whether the value can be negative
-    min_val: float = 0.0  # optional minimum value
+    first_val: float   # physical value mapped to 0.0
+    last_val: float    # physical value mapped to 1.0
 
 
 def _build_specs() -> dict[str, TokenSpec]:
     specs: dict[str, TokenSpec] = {}
 
-    def add(key, code, max_val, signed, min_val=None):
-        if min_val is None:
-            min_val = -max_val if signed else 0.0
-        specs[key] = TokenSpec(key, code, max_val, signed, min_val)
+    def add(key: str, code: str, first_val: float, last_val: float) -> None:
+        specs[key] = TokenSpec(key, code, first_val, last_val)
 
     # Proprioception (11)
-    add("tronc_angle",              "TA", math.radians(345.0), False, -math.radians(15.0))
-    add("membre_angle_avant",       "AA", math.pi,          True)
-    add("membre_distance_avant",    "DA", LIMB_MAX,         False)
-    add("force_actuateur_avant",    "FA", 2000.0,           True)
-    add("membre_angle_arriere",     "AR", math.pi,          True)
-    add("membre_distance_arriere",  "DR", LIMB_MAX,         False)
-    add("force_actuateur_arriere",  "FR", 2000.0,           True)
-    add("queue_angle",             "QA", math.pi,          True)
-    add("couple_queue",            "CQ", 200000.0,         True)
-    add("accel_tete_avant",        "XA", 2000.0,           True)
-    add("accel_tete_haut",         "YA", 2000.0,           True)
+    add("tronc_angle",              "TA", -math.radians(15.0), math.radians(345.0))
+    add("membre_angle_avant",       "AA", -math.pi,            math.pi)
+    add("membre_distance_avant",    "DA", 0.0,                 LIMB_MAX)
+    add("force_actuateur_avant",    "FA", -2000.0,             2000.0)
+    add("membre_angle_arriere",     "AR", -math.pi,            math.pi)
+    add("membre_distance_arriere",  "DR", 0.0,                 LIMB_MAX)
+    add("force_actuateur_arriere",  "FR", -2000.0,             2000.0)
+    add("queue_angle",              "QA", -math.pi,            math.pi)
+    add("couple_queue",             "CQ", -200000.0,           200000.0)
+    add("accel_tete_avant",         "XA", -2000.0,             2000.0)
+    add("accel_tete_haut",          "YA", -2000.0,             2000.0)
 
     # Vision (16: 16 cells × 1 brightness)
     for i in range(1, 17):
-        add(f"vis_c{i}", f"V{i}", 1.0, False)
+        add(f"vis_c{i}", f"V{i}", 0.0, 1.0)
     # Optical flow (3)
-    add("flux_surface", "FS", 5000.0, False)
-    add("flux_x",       "FX", 150.0,  True)
-    add("flux_y",       "FY", 150.0,  True)
+    add("flux_surface", "FS", 0.0,    5000.0)
+    add("flux_x",       "FX", -150.0, 150.0)
+    add("flux_y",       "FY", -150.0, 150.0)
 
     # Env / ball (9)
-    add("ball_dir",  "BD", math.pi, True)
-    add("ball_prox", "BP", 1.0,     False)
-    add("ball_vr",   "BR", 1500.0,  True)
-    add("ball_va",   "BW", 10.0,    True)
-    add("son_0",        "S0", 1.0,     False)
-    add("son_1",        "S1", 1.0,     False)
-    add("son_2",        "S2", 1.0,     False)
-    add("son_3",        "S3", 1.0,     False)
-    add("son_4",        "S4", 1.0,     False)
+    add("ball_dir",  "BD", -math.pi, math.pi)
+    add("ball_prox", "BP", 0.0,      1.0)
+    add("ball_vr",   "BR", -1500.0,  1500.0)
+    add("ball_va",   "BW", -10.0,    10.0)
+    add("son_0",     "S0", 0.0,      1.0)
+    add("son_1",     "S1", 0.0,      1.0)
+    add("son_2",     "S2", 0.0,      1.0)
+    add("son_3",     "S3", 0.0,      1.0)
+    add("son_4",     "S4", 0.0,      1.0)
 
     # Touch (6)
-    add("contact_sol_avant",    "SA", 1500.0, False)
-    add("contact_sol_arriere",  "SR", 1500.0, False)
-    add("collision_tronc_x",    "TX", 1500.0, True)
-    add("collision_tronc_y",    "TY", 1500.0, True)
-    add("collision_tronc_cx",   "TC", 200.0,  True)
-    add("collision_tronc_cy",   "TD", 200.0,  True)
+    add("contact_sol_avant",   "SA", 0.0,     1500.0)
+    add("contact_sol_arriere", "SR", 0.0,     1500.0)
+    add("collision_tronc_x",   "TX", -1500.0, 1500.0)
+    add("collision_tronc_y",   "TY", -1500.0, 1500.0)
+    add("collision_tronc_cx",  "TC", -200.0,  200.0)
+    add("collision_tronc_cy",  "TD", -200.0,  200.0)
 
-    # Interoception (2) — absolute levels in [0, 1]: the carrier (onde
-    # porteuse) that the S4->S10 delta subtracts (see the dedicated EOS token
-    # in brain.py); masked from the WM inputs.
-    add("fatigue",     "FT", 1.0, True)
-    add("souffrance",  "SF", 1.0, True)
+    # Interoception (2) — absolute levels in [0, 1], masked from WM inputs.
+    add("fatigue",    "FT", 0.0, 1.0)
+    add("souffrance", "SF", 0.0, 1.0)
 
-    # Reward (8)
-    add("effort",      "EF", 1.0, False)
-    add("douleur",     "DO", 1.0, False)
-    add("courbature",  "CO", 1.0, False)
-    add("instabilite", "IN", 1.0, False)
-    add("vertige",     "VE", 1.0, False)
-    add("confort",     "CF", 1.0, True)   # signed: reward (negative)
-    add("reward_pos",  "RP", 1.0, True)
-    add("reward_neg",  "RN", 1.0, False)
+    # Reward (8) — costs in [0, 1]; confort & reward_pos are negative costs
+    # (0.0 = absent -> 0.0, -1.0 = max reward -> 1.0).
+    add("effort",      "EF", 0.0, 1.0)
+    add("douleur",     "DO", 0.0, 1.0)
+    add("courbature",  "CO", 0.0, 1.0)
+    add("instabilite", "IN", 0.0, 1.0)
+    add("vertige",     "VE", 0.0, 1.0)
+    add("confort",     "CF", 0.0, -1.0)
+    add("reward_pos",  "RP", 0.0, -1.0)
+    add("reward_neg",  "RN", 0.0, 1.0)
 
     # Actions (5)
-    add("membre_avant_theta", "FT", math.pi, True)
-    add("membre_avant_d",     "FD", LIMB_MAX,    False, LIMB_MIN)
-    add("membre_arriere_theta", "RT", math.pi, True)
-    add("membre_arriere_d",     "RD"    , LIMB_MAX,    False, LIMB_MIN)
-    add("queue_theta",   "QT", math.pi, True)
+    add("membre_avant_theta",   "FT", -math.pi, math.pi)
+    add("membre_avant_d",       "FD", LIMB_MIN, LIMB_MAX)
+    add("membre_arriere_theta", "RT", -math.pi, math.pi)
+    add("membre_arriere_d",     "RD", LIMB_MIN, LIMB_MAX)
+    add("queue_theta",          "QT", -math.pi, math.pi)
 
     return specs
 
@@ -131,25 +128,15 @@ _BY_KEY: dict[str, TokenSpec] = _SPECS
 
 
 def _quantize(raw: float, spec: TokenSpec) -> int:
-    if spec.signed:
-        t = raw / spec.max_val
-        t = max(-1.0, min(1.0, t))
-        return int(round((t + 1.0) / 2.0 * VAL_MAX))
-    else:
-        t = (raw - spec.min_val) / (spec.max_val - spec.min_val)
-        t = max(0.0, min(1.0, t))
-        return int(round(t * VAL_MAX))
+    t = (raw - spec.first_val) / (spec.last_val - spec.first_val)
+    t = max(0.0, min(1.0, t))
+    return int(round(t * VAL_MAX))
 
 
 def _dequantize(val: int, spec: TokenSpec) -> float:
     val = max(0, min(VAL_MAX, val))
-
-    if spec.signed:
-        t = (val / VAL_MAX) * 2.0 - 1.0
-        return t * spec.max_val
-    else:
-        t = val / VAL_MAX
-        return spec.min_val + t * (spec.max_val - spec.min_val)
+    t = val / VAL_MAX
+    return spec.first_val + t * (spec.last_val - spec.first_val)
 
 
 def dequantize(val: int, key: str) -> float:
@@ -165,22 +152,14 @@ def quantize_value(raw: float, key: str) -> int:
 # --- normalization for the dense (float) format --------------------------------
 def _normalize(raw: float, spec: TokenSpec) -> float:
     """Map a raw physical value to a [0,1] float slot value."""
-    if spec.signed:
-        t = raw / spec.max_val
-        t = max(-1.0, min(1.0, t))
-        return (t + 1.0) / 2.0
-    else:
-        t = (raw - spec.min_val) / (spec.max_val - spec.min_val)
-        return max(0.0, min(1.0, t))
+    t = (raw - spec.first_val) / (spec.last_val - spec.first_val)
+    return max(0.0, min(1.0, t))
+
 
 def _denormalize(t: float, spec: TokenSpec) -> float:
     """Inverse of ``_normalize`` — recover the physical value from [0,1]."""
     t = max(0.0, min(1.0, t))
-
-    if spec.signed:
-        return (t * 2.0 - 1.0) * spec.max_val
-    else:
-        return spec.min_val + t * (spec.max_val - spec.min_val)
+    return spec.first_val + t * (spec.last_val - spec.first_val)
 
 
 # --- dense channel layout -----------------------------------------------------
@@ -196,61 +175,69 @@ class ChannelSpec:
     label: str = ""                # short id of the channel (FORCE, VISION, ...)
 
 
-# Modality codes (4d, hand-picked orthogonal-ish)
-_M_INTERO = (1.0, 0.0, 0.0, 0.0)
-_M_PROPRIO = (0.0, 1.0, 0.0, 0.0)
-_M_EXTERO = (0.0, 0.0, 1.0, 0.0)
-_M_RENF  = (1.0, 0.0, 0.0, 1.0)
-_M_ACTION = (0.0, 0.0, 0.0, 0.0)
+# Modality codes: one-hot on 6 bits, exactly one lit per token
+# (intero, proprio, extero, renforcement, action, dénouement)
+_M_INTERO = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_M_PROPRIO = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+_M_EXTERO  = (0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+_M_RENF    = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+_M_ACTION  = (0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+_M_EOS     = (0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+
+def _canal(i: int) -> tuple:
+    """One-hot canal code on CANAL_DIM bits. Ids are per-modality and reused
+    across modalities (the one-hot modality already separates them)."""
+    return tuple(1.0 if j == i else 0.0 for j in range(CANAL_DIM))
 
 
 def _build_layout() -> list[ChannelSpec]:
     return [
         # --- sensory (0..12) ---
-        ChannelSpec(0, False, _M_PROPRIO, (0.0, 0.0, 0.0, 1.0),
+        ChannelSpec(0, False, _M_PROPRIO, _canal(0),
                     ["force_actuateur_avant", "force_actuateur_arriere",
                      "couple_queue"], "proprio", label="FORCE"),
-        ChannelSpec(1, False, _M_PROPRIO, (0.0, 0.0, 1.0, 0.0),
+        ChannelSpec(1, False, _M_PROPRIO, _canal(1),
                     ["tronc_angle", "queue_angle", "accel_tete_avant",
                      "accel_tete_haut"], "proprio", label="POSTURE"),
-        ChannelSpec(2, False, _M_PROPRIO, (0.0, 1.0, 0.0, 0.0),
+        ChannelSpec(2, False, _M_PROPRIO, _canal(2),
                     ["membre_angle_avant", "membre_distance_avant"], "proprio",
                     label="LIMB_F"),
-        ChannelSpec(3, False, _M_PROPRIO, (1.0, 0.0, 0.0, 0.0),
+        ChannelSpec(3, False, _M_PROPRIO, _canal(3),
                     ["membre_angle_arriere", "membre_distance_arriere"],
                     "proprio", label="LIMB_B"),
-        ChannelSpec(4, False, _M_EXTERO, (1.0, 1.0, 1.0, 1.0),
+        ChannelSpec(4, False, _M_EXTERO, _canal(0),
                     [f"vis_c{i}" for i in range(1, 17)], "vision", label="VISION"),
-        ChannelSpec(5, False, _M_EXTERO, (0.0, 0.0, 0.0, 1.0),
+        ChannelSpec(5, False, _M_EXTERO, _canal(1),
                     ["ball_dir", "ball_prox", "ball_vr",
                      "ball_va"], "ball", label="BALL"),
-        ChannelSpec(6, False, _M_EXTERO, (0.0, 0.0, 1.0, 0.0),
+        ChannelSpec(6, False, _M_EXTERO, _canal(2),
                     ["flux_surface", "flux_x", "flux_y"], "vision", label="FLOW"),
-        ChannelSpec(7, False, _M_EXTERO, (0.0, 1.0, 0.0, 0.0),
+        ChannelSpec(7, False, _M_EXTERO, _canal(3),
                     ["son_0", "son_1", "son_2", "son_3", "son_4"], "ball",
                     label="SOUND"),
-        ChannelSpec(8, False, _M_EXTERO, (1.0, 0.0, 0.0, 0.0),
+        ChannelSpec(8, False, _M_EXTERO, _canal(4),
                     ["contact_sol_avant", "contact_sol_arriere"], "touch",
                     label="TOUCH_FOOT"),
-        ChannelSpec(9, False, _M_EXTERO, (1.0, 0.0, 1.0, 0.0),
+        ChannelSpec(9, False, _M_EXTERO, _canal(5),
                     ["collision_tronc_x", "collision_tronc_y",
                      "collision_tronc_cx", "collision_tronc_cy"], "touch",
                     label="TOUCH_TRUNK"),
-        ChannelSpec(10, False, _M_RENF, (0.0, 0.0, 0.0, 0.0),
+        ChannelSpec(10, False, _M_RENF, _canal(0),
                     ["effort", "douleur", "courbature", "instabilite",
                      "vertige"], "reward", label="COSTS"),
-        ChannelSpec(11, False, _M_RENF, (1.0, 0.0, 0.0, 0.0),
+        ChannelSpec(11, False, _M_RENF, _canal(1),
                     ["confort"], "reward", label="REWARD"),
-        ChannelSpec(12, False, _M_INTERO, (0.0, 0.0, 0.0, 1.0),
+        ChannelSpec(12, False, _M_INTERO, _canal(0),
                     ["fatigue", "souffrance"], "intero", label="METAB"),
         # --- motor (13..15) ---
-        ChannelSpec(13, True, _M_ACTION, (0.0, 0.0, 0.0, 1.0),
+        ChannelSpec(13, True, _M_ACTION, _canal(0),
                     ["membre_avant_theta", "membre_avant_d"], "action",
                     label="ACT_F"),
-        ChannelSpec(14, True, _M_ACTION, (0.0, 0.0, 1.0, 0.0),
+        ChannelSpec(14, True, _M_ACTION, _canal(1),
                     ["membre_arriere_theta", "membre_arriere_d"], "action",
                     label="ACT_B"),
-        ChannelSpec(15, True, _M_ACTION, (0.0, 1.0, 0.0, 0.0),
+        ChannelSpec(15, True, _M_ACTION, _canal(2),
                     ["queue_theta"], "action", label="ACT_TAIL"),
     ]
 
@@ -266,8 +253,8 @@ _COST_IDX = 10        # "Coûts"  (effort, douleur, courbature, instabilite, ver
 _REWARD_IDX = 11      # "Récompense" (confort)
 _INTERO_IDX = 12      # "Intéroception" (fatigue, souffrance — niveaux absolus)
 
-# Signal-slot offset within a 25-dim token (type + modality + canal = 9).
-SIG_OFFSET = TYPE_DIM + MOD_DIM + CANAL_DIM   # 9
+# Signal-slot offset within a 29-dim token (type + modality + canal = 13).
+SIG_OFFSET = TYPE_DIM + MOD_DIM + CANAL_DIM   # 13
 
 # Keys of the 5 innate cost signals (token 10), in slot order.
 _COST_KEYS = ("effort", "douleur", "courbature", "instabilite", "vertige")
@@ -318,12 +305,12 @@ _EOS_CHANNEL_W = ([_COST_WEIGHTS[k] for k in _COST_KEYS]
 
 
 def _prefix(ch: ChannelSpec) -> list[float]:
-    """The 9-float structural prefix (type + modality + canal)."""
+    """The 13-float structural prefix (type + modality + canal)."""
     return [1.0 if ch.is_motor else 0.0] + list(ch.modality) + list(ch.canal)
 
 
 def _signal_slot(token: list[float], k: int) -> float:
-    """Read the k-th signal slot (0..15) of a 25-dim token."""
+    """Read the k-th signal slot (0..15) of a 29-dim token."""
     return token[TYPE_DIM + MOD_DIM + CANAL_DIM + k]
 
 
@@ -419,7 +406,7 @@ def make_salve(state_signals: list[float],
 class DenseEncoder:
     """Encodes a full sensor snapshot into a salve of 16 dense tokens.
 
-    A salve is a list of 16 tokens, each a 25-float vector.
+    A salve is a list of 16 tokens, each a 29-float vector.
     """
 
     def encode(self, proprio: dict, touch: dict, ball: dict,

@@ -31,41 +31,14 @@ _POL_CKPT = os.path.join(_CKPT_DIR, "pol_ckpt.pt")
 _BUF_CKPT = os.path.join(_CKPT_DIR, "buf_ckpt.pt")
 
 
-def run(device: str | None = None,
-        pol_steps: int = 32,
+def run(pol_steps: int = 32,
         wm_coreset_epoch: int = 512, wm_addendum_epoch: int = 128,
-        wm_target_loss: float = 0.004,
-        prune_pct: float = 0.33, surprise_factor: float = 0.5,
-        prune_min_fill: float = 0.75, prune_beta: float = 2.0,
-        dedup_eps: float = 0.08, surprise_floor: float = 0.001,
-        use_kv_cache: bool = True,
-        pol_eos_lookahead: bool = True,
-        compile_wm: bool = False,
-        seq_steps: int = 10,
-        n_ctx: int = 4,
+        wm_batch: int = 64, wm_target_loss: float = 0.004,
         save: bool = True,
         wm_path: str = _WM_CKPT,
         pol_path: str = _POL_CKPT,
         buf_path: str = _BUF_CKPT,
-        # Architecture / training params (from config.toml or defaults)
-        d_model: int = 64, nhead: int = 4, wm_layers: int = 3,
-        dim_ff: int = 384, wm_dropout: float = 0.0,
-        pol_hidden: int = 256,
-        lr_wm: float = 3e-4, lr_pol: float = 2e-4,
-        act_std: float = 0.05,
-        wm_batch: int = 64,
-        seed: int = 0,
-        buffer_capacity: int = 1000, buffer_pool_capacity: int = 1000,
-        eos_force_amp_lo: float = 0.1, eos_force_amp_hi: float = 0.5,
-        eos_force_amplify: float = 1.0,
-        wm_impact_floor: float = 0.25,
-        lookahead_relief_mult: float = 1.0,
-        wm_w_state_post: float = 1.0,
-        wm_w_act_post: float = 1.0,
-        wm_w_eos: float = 16.0,
-        wm_w_a4_lookahead: float = 1.0,
-        wm_hz: float = 3.0, pol_hz: float = 6.0,
-        **_ignored) -> None:
+        **params) -> None:
     os.environ["SDL_HINT_RENDER_SCALE_QUALITY"] = "1"
     try:
         import ctypes
@@ -80,24 +53,7 @@ def run(device: str | None = None,
     font = pygame.font.SysFont(R.FONT_NAME, 13)
     font_small = pygame.font.SysFont(R.FONT_NAME, 11)
 
-    brain = Brain(device=device, compile_wm=compile_wm, seq_steps=seq_steps, n_ctx=n_ctx,
-                  d_model=d_model, nhead=nhead, layers=wm_layers,
-                  dim_ff=dim_ff, dropout=wm_dropout,
-                  pol_hidden=pol_hidden,
-                  lr_wm=lr_wm, lr_pol=lr_pol,
-                  act_std=act_std,
-                  seed=seed,
-                  buffer_capacity=buffer_capacity,
-                  buffer_pool_capacity=buffer_pool_capacity,
-                  eos_force_amp_lo=eos_force_amp_lo,
-                  eos_force_amp_hi=eos_force_amp_hi,
-                  eos_force_amplify=eos_force_amplify,
-                  wm_impact_floor=wm_impact_floor,
-                  lookahead_relief_mult=lookahead_relief_mult,
-                  wm_w_state_post=wm_w_state_post,
-                  wm_w_act_post=wm_w_act_post,
-                  wm_w_eos=wm_w_eos,
-                  wm_w_a4_lookahead=wm_w_a4_lookahead)
+    brain = Brain(**CFG.brain_kwargs(params))
     try:
         brain.load_checkpoint(wm_path, pol_path, buf_path)
         status = f"brain restored (coreset {brain.buffer.coreset_size})"
@@ -134,6 +90,7 @@ def run(device: str | None = None,
                 dream_theater.set_sleep_progress("prune", 0, 0)
                 sleep_gen = brain.sleep_cycle(wm_coreset_epoch=wm_coreset_epoch,
                                         wm_addendum_epoch=wm_addendum_epoch,
+                                        wm_batch=wm_batch,
                                         pol_steps=pol_steps,
                                         wm_target_loss=wm_target_loss)
                 status = "sleeping..."
@@ -203,30 +160,8 @@ def run(device: str | None = None,
 def main() -> None:
     cfg = CFG.load_config()
 
-    # Built-in defaults (same as run() signature)
     params: dict = {
-        "device": os.environ.get("LAMBDA_DEVICE", "cpu"),
-        "accel": False,
-        "pol_steps": 32, "wm_coreset_epoch": 512, "wm_addendum_epoch": 128, "wm_target_loss": 0.004,
-        "prune_pct": 0.33, "surprise_factor": 0.5,
-        "prune_min_fill": 0.75, "prune_beta": 2.0,
-        "dedup_eps": 0.08, "surprise_floor": 0.001,
-        "use_kv_cache": True, "pol_eos_lookahead": True,
-        "compile_wm": False,
-        "seq_steps": 10, "n_ctx": 4,
-        "d_model": 64, "nhead": 4, "wm_layers": 3,
-        "dim_ff": 384, "wm_dropout": 0.0,
-        "pol_hidden": 256,
-        "lr_wm": 3e-4, "lr_pol": 2e-4,
-        "act_std": 0.05,
-        "wm_batch": 64,
-        "seed": 0,
-        "buffer_capacity": 1000, "buffer_pool_capacity": 1000,
-        "eos_force_amp_lo": 0.015, "eos_force_amp_hi": 0.0375,
-        "eos_force_amplify": 1.0,
-        "wm_impact_floor": 0.25,
-        "lookahead_relief_mult": 1.0,
-        # CLI-only
+        **CFG.BRAIN_DEFAULTS,
         "save": True,
         "wm_path": _WM_CKPT, "pol_path": _POL_CKPT, "buf_path": _BUF_CKPT,
     }
@@ -246,18 +181,9 @@ def main() -> None:
                    help="world model training epochs per sleep cycle (Addendum phase)")
     p.add_argument("--wm-target-loss", type=float, default=argparse.SUPPRESS,
                    help="target loss for World Model coreset training")
-    p.add_argument("--no-kv-cache", action="store_true", default=argparse.SUPPRESS,
-                   help="disable the persistent KV-cache for the imagined policy rollouts")
-    p.add_argument("--no-eos-lookahead", action="store_true", default=argparse.SUPPRESS,
-                   help="disable the EOS-lookahead (hindsight) policy supervision "
-                        "and fall back to the legacy stochastic candidates")
     p.add_argument("--compile", action="store_true", default=argparse.SUPPRESS,
                    dest="compile_wm",
                    help="torch.compile the World Model training step")
-    p.add_argument("--seq-steps", type=int, default=argparse.SUPPRESS,
-                   help="number of multi-step transitions per sequence")
-    p.add_argument("--n-ctx", type=int, default=argparse.SUPPRESS,
-                   help="decision context step index")
     p.add_argument("--no-save", action="store_true", default=argparse.SUPPRESS,
                    help="do not write the trained checkpoints back at the end of "
                         "the sleep cycle (view-only)")
@@ -270,33 +196,14 @@ def main() -> None:
     p.add_argument("--buffer", type=str, default=argparse.SUPPRESS,
                    dest="buf_path",
                    help="Path to ExperienceBuffer checkpoint (default: repo buf_ckpt.pt)")
-    # Architecture / training params (also settable via config.toml)
-    p.add_argument("--d-model", type=int, default=argparse.SUPPRESS,
-                   help="transformer latent dimension")
-    p.add_argument("--nhead", type=int, default=argparse.SUPPRESS,
-                   help="transformer attention heads")
-    p.add_argument("--wm-layers", type=int, default=argparse.SUPPRESS,
-                   help="transformer encoder layers")
-    p.add_argument("--dim-ff", type=int, default=argparse.SUPPRESS,
-                   help="transformer feed-forward hidden dimension")
-    p.add_argument("--wm-dropout", type=float, default=argparse.SUPPRESS,
-                   help="transformer dropout rate")
-    p.add_argument("--pol-hidden", type=int, default=argparse.SUPPRESS,
-                   help="policy network hidden layer width")
     p.add_argument("--lr-wm", type=float, default=argparse.SUPPRESS,
                    help="World Model learning rate")
     p.add_argument("--lr-pol", type=float, default=argparse.SUPPRESS,
                    help="Policy learning rate")
-    p.add_argument("--act-std", type=float, default=argparse.SUPPRESS,
-                   help="action sampling std during wake")
     p.add_argument("--wm-batch", type=int, default=argparse.SUPPRESS,
                    help="World Model training batch size")
     p.add_argument("--seed", type=int, default=argparse.SUPPRESS,
                    help="random seed")
-    p.add_argument("--buffer-capacity", type=int, default=argparse.SUPPRESS,
-                   help="session journal capacity (sequences)")
-    p.add_argument("--buffer-pool-capacity", type=int, default=argparse.SUPPRESS,
-                   help="coreset long-term capacity (sequences)")
 
     args = p.parse_args()
     cli = vars(args)

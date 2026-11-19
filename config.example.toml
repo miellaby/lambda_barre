@@ -14,7 +14,7 @@ d_model   = 64    # latent dimension (must be divisible by nhead)
 nhead     = 4     # number of attention heads
 layers    = 3     # number of transformer encoder layers
 dim_ff    = 384   # feed-forward hidden dimension (typically 4-6x d_model)
-dropout   = 0.0   # dropout rate (0 = disabled; only active during training)
+dropout   = 0.05  # light dropout during WM training (0 = disabled; only active during training)
 
 # ---------------------------------------------------------------------------
 # Policy network architecture
@@ -26,31 +26,28 @@ hidden    = 256   # width of each hidden layer (3 hidden layers)
 # Optimizer and exploration hyperparameters
 # ---------------------------------------------------------------------------
 [training]
-lr_wm         = 3.0e-4   # World Model learning rate (Adam)
-lr_pol        = 2.0e-4   # Policy learning rate (Adam)
-act_std       = 0.0      # action sampling std during wake (0 = pas de bruit)
+lr_wm            = 3.0e-4   # World Model learning rate (Adam)
+lr_pol           = 2.0e-4   # Policy learning rate (Adam)
+act_std          = 0.0      # action sampling std during wake (0 = no noise)
+act_conseq_shift = 1        # manual mode: pair (s_{n-k}, a_n) to cancel human reaction latency (0 in brain-on)
 
 # Sleep cycle training
 wm_coreset_epoch   = 300    # World Model training epochs per sleep cycle (Coreset phase)
 wm_addendum_epoch  = 300    # World Model training epochs per sleep cycle (Addendum phase)
-wm_batch        = 64     # World Model training batch size
-wm_target_loss  = 0.004  # early-stop target loss for WM coreset training (overtime palier)
-pol_steps       = 256    # Policy training steps per sleep cycle
-eos_force_eps_lo = 0.015  # hindsight forcing: lower bound of eps ~ U(lo, hi) — keep the forced EOS within the realized favorable tail
-eos_force_eps_hi = 0.0375
-eos_decay = 0.9          # décroissance temporelle de l écart au but dans l EOS
-eos_poids_chemin = 0.1  # poids du coût du chemin dans le progrès par canal
-eos_max_p = 8.0         # exposant du max flou agrégeant les canaux (relief_score)
-eos_force_amplify = 1.0  # hindsight action amplification toward extremes (1.0 = off)
-eos_force_amplify_threshold = 0.95  # only amplify actions already near extremes (|v| >= threshold)
-wm_impact_floor  = 0.10  # additive floor on the per-sequence impact weight (neutral windows learn at a trickle)
-lookahead_relief_mult = 4.0  # relief contrast multiplier on the lookahead (hindsight) loss passes — outcome-carrying sequences weigh more in the inversion
-# Causal-pass loss row weights, relative to the context baseline 1.0 (defaults = "full" mode,
-# i.e. every row trained as before):
-wm_w_state_post  = 1.0   # rows predicting a STATE token of a post-decision salve (k > n_ctx) — keep at 1.0 to preserve the dynamics used by imagined rollouts
-wm_w_act_post    = 1.0   # rows predicting an ACTION token of a post-decision salve — no consumer reads them (0.0 is safe)
-wm_w_eos         = 16.0  # terminal denouement rows (last salve cost/reward slots + EOS token)
-wm_w_a4_lookahead = 1.0  # multiplier on the whole hindsight (EOS-lookahead) loss pass
+wm_batch           = 64     # World Model training batch size
+wm_target_loss     = 0.004  # early-stop target loss for WM training (overtime palier)
+pol_steps          = 256    # Policy training steps per sleep cycle
+
+# Outcome (EOS) & MDN head
+eos_decay        = 0.8706   # EOS integral decay: 0.25^(1/lookahead) = 0.25^(1/10)
+eos_n_modes      = 8        # number of Gaussian mixture components in the MDN EOS head
+eos_sigma_min    = 0.02     # std floor for MDN components
+eos_nll_w        = 0.1      # weight of shifted per-slot MDN NLL (>= 0) in WM loss
+eos_temperature  = 1.0      # softmax temperature on MDN mixture logits at election
+eos_top_p        = 0.9      # nucleus cumulative mass on MDN modes
+eos_min_p        = 1.0e-3   # minimum probability floor for an eligible mode
+wm_impact_floor  = 0.10     # additive floor on per-sequence impact |relief|
+wm_input_noise   = 0.015    # light Gaussian noise on valid signal slots during training (prefix/padding/intero/EOS intact)
 
 # ---------------------------------------------------------------------------
 # Experience buffer capacities (in number of sequences)
@@ -58,32 +55,23 @@ wm_w_a4_lookahead = 1.0  # multiplier on the whole hindsight (EOS-lookahead) los
 [buffer]
 capacity        = 1000   # session journal: max extractable sequences during wake
 pool_capacity   = 1000   # coreset: max long-term consolidated sequences
-# Active forgetting (sleep): prune Coreset only past this fill level, then
-# exactly back down to it (n_pruned = coreset_size - prune_min_fill * pool_capacity)
-prune_pct        = 0.33  # master switch for pruning (>0 = enabled)
-prune_min_fill   = 0.75  # no pruning before the coreset reaches 75% of pool_capacity
-prune_beta       = 2.0   # vivacity bias of the stochastic prune sampling
-dedup_eps        = 0.08  # similarity ceiling: sequences closer than eps are duplicates
-surprise_factor  = 0.5   # surprise threshold = last WM coreset loss * this factor (lower = eject less)
-surprise_floor   = 0.001 # floor on the surprise threshold (lower = eject less)
 
 # ---------------------------------------------------------------------------
 # Sequence geometry
 # ---------------------------------------------------------------------------
 [sequence]
-seq_steps = 16   # number of transitions (salves) per training sequence (fenêtre de conséquence doublée : 12 salves)
-n_ctx     = 13   # decision context length, milieu de la fenetre — must be strictly less than seq_steps
-                 # The policy decides at step n_ctx; consequences are evaluated
-                 # from n_ctx+1 to seq_steps.
+seq_steps = 12   # consecutive salves in the window (s0..s11)
+n_ctx     = 6    # decision context length (must be strictly less than seq_steps)
+lookahead = 10   # jump of the last salve: s_{n_ctx+lookahead} (far outcome, close future learned)
+wm_hz     = 4    # World Model recording cadence (Hz)
+pol_hz    = 8    # Policy cadence (Hz, typically 2x wm_hz)
 
 # ---------------------------------------------------------------------------
 # Runtime options
 # ---------------------------------------------------------------------------
 [runtime]
-device            = "cpu"     # cpu | cuda | auto | cpu-fast
-accel             = false     # true = auto (CUDA if available, else CPU)
-seed              = 0         # random seed (0 = default)
-compile_wm        = false     # torch.compile the WM training step (faster, one-time warm-up)
-use_kv_cache      = true      # persistent KV-cache for imagined policy rollouts (faster)
-pol_eos_lookahead = true      # hindsight (EOS-lookahead) policy supervision
-no_smooth         = false     # bypass IIR sensor smoother (use raw snapshots)
+device      = "cpu"     # cpu | cuda | auto | cpu-fast
+accel       = false     # true = auto (CUDA if available, else CPU)
+seed        = 0         # random seed (0 = default)
+compile_wm  = false     # torch.compile the WM training step
+no_smooth   = false     # bypass IIR sensor smoother (use raw snapshots)

@@ -111,7 +111,7 @@ les anciens checkpoints et repartir à zéro :
 ```
 
 * **Physique & Capteurs (60 Hz)** : Squelette articulé Pymunk et capteurs: proprioception, extéroception et intéroception.
-* **World Model (3 Hz)** : Tokenisation dense de 16 tokens par salve et 25 dimensions par token. Modèle autorégressif causal qui imagine un horizon de 2 secondes.
+* **World Model (3 Hz)** : Tokenisation dense de 16 tokens par salve et 29 dimensions par token. Modèle autorégressif causal qui imagine un horizon de 2 secondes.
 * **Policy (6 Hz)** : Sélectionne l'action motrice via 45 scalaires sensoriels et l'état latent extrait du World Model.
 
 Pendant la **phase de Sommeil (`S`)** : Entraînement hors-ligne du World Model (prédiction auto-supervisée du futur) et de la Policy (tournoi de candidats guidé par les futurs imaginés par le World Model).
