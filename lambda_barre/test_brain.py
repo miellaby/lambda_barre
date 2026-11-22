@@ -4,6 +4,7 @@ masque causal, loss à poids 0 sur le contexte, inférence par échantillonnage 
 dénouement + élection f(probable, favorable), policy pondérée par p.detach()."""
 from __future__ import annotations
 
+import math
 import random
 
 import pytest
@@ -523,9 +524,10 @@ def test_dream_record_uses_generated_consequence(brain, rng):
     list(brain.train_policy(steps=1, batch=2))
     rec = brain.last_dream_record
     assert rec is not None
-    # les états imaginés dans predicted_steps proviennent de generate_from_denouement,
-    # pas de la copie directe des vrais états vécus
-    imagined_s = rec.predicted_steps[brain.n_ctx].state_tokens
+    # predicted_steps est aligné 1-à-1 avec lived_steps : s{n_ctx}+a* en position
+    # n_ctx, puis les états imaginés de generate_from_denouement à partir de n_ctx+1
+    assert len(rec.predicted_steps) == len(rec.lived_steps)
+    imagined_s = rec.predicted_steps[brain.n_ctx + 1].state_tokens
     real_s = rec.lived_steps[brain.n_ctx + 1].state_tokens
     assert imagined_s != real_s
 
@@ -760,3 +762,249 @@ def test_policy_advantage_learns_fall_avoidance(brain, rng, monkeypatch):
     loss = brain._policy_step([seq], step_idx=0, total_steps=1)
     assert loss > 0.0
     assert any(not torch.equal(a, b) for a, b in zip(before, brain.policy.parameters()))
+
+
+def test_policy_equal_gradient_scale_theta_and_d(brain):
+    # Même erreur relative (+0.2 en espace [0,1]) sur th_f (col 0) et d_f (col 1)
+    # à partir de raw=0 : les gradients sur raw doivent être strictement égaux.
+    raw = torch.zeros(1, 5, device=brain.device, requires_grad=True)
+    pred = brain.policy._squash(raw)
+    pred_u = torch.where(brain._act_signed, 0.5 * (pred + 1.0), pred)
+    target_u = torch.tensor([[0.7, 0.7, 0.5, 0.5, 0.5]], device=brain.device)
+    loss = ((pred_u - target_u) ** 2).mean()
+    loss.backward()
+    assert torch.isclose(raw.grad[0, 0], raw.grad[0, 1], atol=1e-6)
+    assert abs(raw.grad[0, 0].item()) > 0.0
+
+
+def test_eos_vq_bottleneck_ema_and_stats(rng):
+    torch.manual_seed(0)
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=32, nhead=4, layers=1,
+              dim_ff=64, pol_hidden=32, eos_vq_codes=4, eos_vq_dim=6,
+              eos_vq_beta=0.25, eos_vq_decay=0.9)
+    seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(8)]
+    assert not bool(b.world.eos_vq_ready)
+    b.world.train()
+    loss = b._train_wm_batch(seqs)
+    assert loss >= 0.0
+    assert bool(b.world.eos_vq_ready)
+    assert b.world.last_vq is None
+    cb_after_1 = b.world.eos_vq_codebook.clone()
+    b._train_wm_batch(seqs)
+    assert not torch.equal(cb_after_1, b.world.eos_vq_codebook)
+    # Diagnostic stats + garantie structurelle : deux séquences de même code
+    # produisent exactement la même distribution MDN.
+    stats = b.eos_situation_stats(seqs)
+    assert stats["n"] == len(seqs)
+    assert 1 <= stats["codes_used"] <= 4
+    assert stats["perplexity"] >= 1.0
+    assert 0.0 <= stats["elu_eq_mu"] <= 1.0
+    vals = b._batch_tensors(seqs)[:, :b.ctx_len]
+    logits_pi, mu, sigma = b._denouement_dist(vals)
+    codes = stats["codes"]
+    for i in range(len(seqs)):
+        for j in range(i + 1, len(seqs)):
+            if codes[i] == codes[j]:
+                assert torch.allclose(logits_pi[i], logits_pi[j], atol=1e-6)
+                assert torch.allclose(mu[i], mu[j], atol=1e-6)
+                assert torch.allclose(sigma[i], sigma[j], atol=1e-6)
+
+
+def test_eos_vq_disabled_and_tolerant_checkpoint_load(rng):
+    torch.manual_seed(0)
+    b_novq = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=32, nhead=4, layers=1,
+                   dim_ff=64, pol_hidden=32, eos_vq_codes=0)
+    assert not hasattr(b_novq.world, "eos_vq_enc")
+    seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(4)]
+    b_novq.world.train()
+    b_novq._train_wm_batch(seqs)
+    stats = b_novq.eos_situation_stats(seqs)
+    assert stats["codes"] == [-1] * 4 and stats["codes_used"] == 0
+    # Charger un checkpoint sans VQ dans un modèle avec VQ restaure le tronc
+    # transformer et signale la réinitialisation de la tête EOS (exact=False).
+    b_vq = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=32, nhead=4, layers=1,
+                 dim_ff=64, pol_hidden=32, eos_vq_codes=8, eos_vq_dim=6)
+    exact = b_vq.load_world_state(b_novq.world.state_dict())
+    assert exact is False
+    assert torch.equal(b_vq.world.in_proj.weight, b_novq.world.in_proj.weight)
+    assert torch.equal(b_vq.world.head.weight, b_novq.world.head.weight)
+    # Même architecture -> exact=True
+    b_vq2 = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=32, nhead=4, layers=1,
+                  dim_ff=64, pol_hidden=32, eos_vq_codes=8, eos_vq_dim=6)
+    assert b_vq2.load_world_state(b_vq.world.state_dict()) is True
+
+
+def test_wm_loss_reports_mse_without_mdn_nll_floor(rng):
+    # Même avec eos_nll_w très élevé (plancher entropique NLL >> target_loss),
+    # _train_wm_batch retourne la MSE pure (pas le total), z_e reste normalisé
+    # par LayerNorm (std ~ 1), et last_batch_nll/commit sont exposés à part.
+    torch.manual_seed(0)
+    b = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX, d_model=32, nhead=4, layers=1,
+              dim_ff=64, pol_hidden=32, eos_vq_codes=4, eos_vq_dim=6,
+              eos_nll_w=10.0)
+    seqs = [build_sequence(_rand_window(rng), n_ctx=N_CTX) for _ in range(6)]
+    b.world.train()
+    ret = b._train_wm_batch(seqs)
+    assert ret == pytest.approx(b.last_batch_mse)
+    assert b.last_batch_nll > 0.0
+    assert b.last_batch_commit >= 0.0
+    assert b.last_batch_vq_act > 0.0
+    # MSE sur signaux [0, 1] est <= 1.0, alors que eos_nll_w * nll est >> 1.0
+    assert ret < 1.0
+    assert ret < b.eos_nll_w * b.last_batch_nll
+
+
+def test_policy_uses_real_action_on_observed_win_with_margin(brain, rng, monkeypatch):
+    # Quand la séquence observée gagne la règle de l'observé (ici relief_obs = +1.0,
+    # ou dans la marge obs_margin = 0.10), _policy_step doit viser a_real
+    # directement au lieu d'une action générée par le WM.
+    seq = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    seq[brain.eos_pos] = seq[brain.eos_pos][:SIG_OFFSET] + [1.0] * 6 + [0.0] * (N_SIGNAL - 6)
+    vals = brain._batch_tensors([seq])
+    a_real = brain._decode_action_batch(vals[:, brain.action_pos:brain.action_pos + 3])
+    # Force le générateur WM à renvoyer une action opposée (a_opp)
+    # pour vérifier que _policy_step l'ignore quand use_obs=True.
+    a_opp = torch.where(brain._act_signed, -a_real, 1.0 - a_real)
+    fake_act_toks = brain._encode_action_batch(a_opp)
+    orig_gen = brain.generate_from_denouement
+
+    def poisoned_gen(ctx, eos_vec):
+        g = orig_gen(ctx, eos_vec)
+        g["action"] = fake_act_toks.expand(ctx.shape[0], -1, -1).clone()
+        return g
+
+    monkeypatch.setattr(brain, "generate_from_denouement", poisoned_gen)
+    # Entraîne 30 pas sur cette séquence : la policy doit converger vers a_real, pas a_opp
+    for _ in range(30):
+        brain._policy_step([seq], step_idx=0, total_steps=30)
+    assert brain.last_pol_stats["obs"] == 1 and brain.last_pol_stats["wm"] == 0
+    ctx = vals[:, :brain.ctx_len]
+    with torch.inference_mode():
+        brain.world(ctx, attn_mask=brain.mask[:brain.ctx_len, :brain.ctx_len],
+                    is_causal=True, salve_positions=brain.salve_positions[:brain.ctx_len])
+        lat = brain._normalize_latent(brain.world.last_latent())
+        sc = brain._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
+        pred = brain.policy(torch.cat([sc, lat], dim=1))
+    assert (pred - a_real).abs().mean().item() < (pred - a_opp).abs().mean().item()
+
+
+def test_checkpoint_persists_last_wm_loss(brain, tmp_path):
+    wm_p = str(tmp_path / "wm.pt")
+    pol_p = str(tmp_path / "pol.pt")
+    brain.last_wm_loss = 0.0042
+    brain.save_checkpoint(wm_p, pol_p)
+    b2 = Brain(seq_steps=SEQ_STEPS, n_ctx=N_CTX,
+               buffer_capacity=200, buffer_pool_capacity=200)
+    assert math.isnan(b2.last_wm_loss)
+    b2.load_checkpoint(wm_p, pol_p)
+    assert b2.last_wm_loss == pytest.approx(0.0042)
+
+
+def test_dedup_guards_action_and_relief_and_keeps_best_relief(rng):
+    buf = ExperienceBuffer(seq_len=SEQ_STEPS + 1, n_ctx=N_CTX,
+                           dedup_eps=0.10, capacity=50, pool_capacity=50, seed=0)
+    layout = compute_seq_layout(SEQ_STEPS, N_CTX)
+    ep = layout["eos_pos"]
+    ap = layout["action_pos"]
+    seq_idle = build_sequence(_rand_window(rng), n_ctx=N_CTX)
+    seq_idle[ep] = seq_idle[ep][:SIG_OFFSET] + [0.55] * 6 + [0.0] * (N_SIGNAL - 6)
+    seq_idle[ap][SIG_OFFSET] = 0.20
+
+    # Vrai doublon qui arrive APRES mais avec un légèrement meilleur relief (~+0.03 <= 0.08)
+    seq_better_dup = [list(t) for t in seq_idle]
+    seq_better_dup[ep] = seq_better_dup[ep][:SIG_OFFSET] + [0.555] * 6 + [0.0] * (N_SIGNAL - 6)
+
+    # Tick de déclenchement : tout identique sauf a_dec qui saute de 0.30 (> 0.05) -> protégé !
+    seq_trigger = [list(t) for t in seq_idle]
+    seq_trigger[ap][SIG_OFFSET] = 0.50
+
+    # Paire contrefactuelle : tout identique sauf relief qui diffère franchement (> 0.08) -> protégée !
+    seq_cf = [list(t) for t in seq_idle]
+    seq_cf[ep] = seq_cf[ep][:SIG_OFFSET] + [0.20] * 6 + [0.0] * (N_SIGNAL - 6)
+
+    buf._addendum = [seq_idle, seq_better_dup, seq_trigger, seq_cf]
+    buf._addendum_meta = [ExperienceBuffer._default_meta() for _ in range(4)]
+    dropped = buf.deduplicate_addendum(eps=0.10)
+    assert dropped == 1
+    assert len(buf._addendum) == 3
+    # Le représentant conservé entre seq_idle et seq_better_dup doit être seq_better_dup (meilleur relief)
+    assert buf._addendum[0][ep][SIG_OFFSET] == pytest.approx(0.555)
+    assert buf._addendum_meta[0]["count"] == 2
+    # Le tick de déclenchement et la paire contrefactuelle sont tous deux préservés
+    assert buf._addendum[1][ap][SIG_OFFSET] == pytest.approx(0.50)
+    assert buf._addendum[2][ep][SIG_OFFSET] == pytest.approx(0.20)
+
+    # Même garde-fou contre le coreset
+    buf.commit_addendum()
+    buf._addendum = [[list(t) for t in seq_idle]]
+    buf._addendum[0][ap][SIG_OFFSET] = 0.85   # nouvelle action -> ne doit PAS être dédupliquée
+    buf._addendum_meta = [ExperienceBuffer._default_meta()]
+    assert buf.deduplicate_against_coreset(eps=0.10) == 0
+    assert len(buf._addendum) == 1
+
+
+def test_facing_flip_somersault_and_tronc_angle_range():
+    """Facing flips symmetrically at -15° (backward) and +195° (forward past
+    upside-down), even across full multi-turn somersaults, keeping tronc_angle
+    strictly within [-15°, +195°]."""
+    from lambda_barre import body as B, proprio as S, world as W
+    from lambda_barre.tokenize import _BY_KEY
+
+    spec = _BY_KEY["tronc_angle"]
+    assert spec.first_val == pytest.approx(-B.FACING_DEADZONE)
+    assert spec.last_val == pytest.approx(math.pi + B.FACING_DEADZONE)
+
+    space = W.make_space()
+    skel = B.build_skeleton(space)
+    proprio = S.Proprio(space, skel)
+
+    # 1. Forward somersault from facing=+1 (torso.angle decreases: 0 -> -380°)
+    skel.facing = 1
+    expected_forward = [
+        (0.0,    1,   0.0),
+        (-90.0,  1,  90.0),
+        (-180.0, 1, 180.0),
+        (-190.0, 1, 190.0),   # still in bottom deadzone [180°, 195°]
+        (-196.0, -1, 164.0),  # crossed +195° -> flips to facing=-1 at +164°
+        (-270.0, -1,  90.0),  # back on its feet in the new facing
+        (-360.0, -1,   0.0),  # upright after full turn
+        (-376.0,  1,  16.0),  # leans backward past -15° -> flips back to +1
+    ]
+    for deg, exp_facing, exp_ego_deg in expected_forward:
+        skel.torso.angle = math.radians(deg)
+        B.apply_consignes(skel, dt=0.0)
+        assert skel.facing == exp_facing, f"at torso={deg}°: facing={skel.facing} != {exp_facing}"
+        sig = proprio.update(skel, 1 / 60.0)
+        assert math.degrees(sig["tronc_angle"]) == pytest.approx(exp_ego_deg, abs=1e-4)
+        assert -B.FACING_DEADZONE - 1e-6 <= sig["tronc_angle"] <= math.pi + B.FACING_DEADZONE + 1e-6
+
+    # 2. Symmetric forward somersault from facing=-1 (torso.angle increases: 0 -> +270°)
+    skel.facing = -1
+    for deg, exp_facing, exp_ego_deg in [
+        (0.0,   -1,   0.0),
+        (190.0, -1, 190.0),
+        (196.0,  1, 164.0),
+        (270.0,  1,  90.0),
+    ]:
+        skel.torso.angle = math.radians(deg)
+        B.apply_consignes(skel, dt=0.0)
+        assert skel.facing == exp_facing
+        sig = proprio.update(skel, 1 / 60.0)
+        assert math.degrees(sig["tronc_angle"]) == pytest.approx(exp_ego_deg, abs=1e-4)
+
+    # 3. Backward lean hysteresis around 0°
+    skel.facing = 1
+    skel.torso.angle = math.radians(10.0)
+    B.apply_consignes(skel, dt=0.0)
+    assert skel.facing == 1
+    assert math.degrees(proprio.update(skel, 1 / 60.0)["tronc_angle"]) == pytest.approx(-10.0, abs=1e-4)
+
+    skel.torso.angle = math.radians(16.0)
+    B.apply_consignes(skel, dt=0.0)
+    assert skel.facing == -1
+    assert math.degrees(proprio.update(skel, 1 / 60.0)["tronc_angle"]) == pytest.approx(16.0, abs=1e-4)
+
+
+
+
+

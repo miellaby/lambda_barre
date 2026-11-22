@@ -24,6 +24,9 @@ from . import render as R
 
 # --- layout ------------------------------------------------------------------
 JOY_RADIUS = 64
+JOY_INNER_R = 14     # inner retraction ring: r <= JOY_INNER_R maps to d=0.0
+                     # so full retraction is easy to reach while keeping angle
+                     # well-defined away from the (0, 0) center singularity
 JOY_L_CENTRE = (96, 300)
 JOY_R_CENTRE = (R.WIDTH - 96, 300)
 
@@ -96,7 +99,7 @@ class Joystick:
 
     # --- consigne <-> handle geometry ----------------------------------------
     def _handle_dist(self) -> float:
-        return self.d * self.radius
+        return JOY_INNER_R + self.d * (self.radius - JOY_INNER_R)
 
     def handle_pos(self) -> tuple[int, int]:
         r = self._handle_dist()
@@ -112,7 +115,7 @@ class Joystick:
             dx *= self.radius / r
             dy *= self.radius / r
             r = self.radius
-        if r > 0.5:
+        if r > 3.0:
             m = math.atan2(-dx, dy)
             if teleport or self._last_mouse_angle is None:
                 # fresh grab: start unwrapped tracking from the click
@@ -129,8 +132,8 @@ class Joystick:
             # exactly under the mouse as soon as it re-enters the arc
             self.theta = _clamp(self._m_unwrapped,
                                 -JOY_THETA_MAX, JOY_THETA_MAX)
-        # distance: centre = 0, rim = 1
-        self.d = _clamp(r / self.radius, 0.0, 1.0)
+        # distance: inner ring (JOY_INNER_R) = 0 (full retraction), rim = 1
+        self.d = _clamp((r - JOY_INNER_R) / (self.radius - JOY_INNER_R), 0.0, 1.0)
 
     # --- hit testing / interaction -------------------------------------------
     def hit(self, mx: int, my: int) -> bool:
@@ -154,6 +157,7 @@ class Joystick:
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
         pygame.draw.circle(screen, JOY_FILL_C, (self.cx, self.cy), self.radius)
         pygame.draw.circle(screen, JOY_RING_C, (self.cx, self.cy), self.radius, 2)
+        pygame.draw.circle(screen, JOY_CROSS_C, (self.cx, self.cy), JOY_INNER_R, 1)
         # crosshair
         pygame.draw.line(screen, JOY_CROSS_C,
                          (self.cx - self.radius, self.cy),

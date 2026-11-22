@@ -113,14 +113,17 @@ class Proprio:
         torque_tail = skel.tail_spring.impulse / sdt if sdt > 0 else 0.0
 
         # Egocentric torso tilt: + = leaning forward.
-        # Expressed in [-15°, 345°] (matching the 15° facing switch limit)
+        # Expressed in [-15°, +195°] (matching the ±15° facing-flip hysteresis
+        # around upright 0° and upside-down 180° in body.apply_consignes).
         raw_angle = -facing * torso.angle
         two_pi = 2.0 * math.pi
-        t_min = -math.radians(15.0)
-        t_max = math.radians(345.0)
+        t_min = -B.FACING_DEADZONE
+        t_max = math.pi + B.FACING_DEADZONE
         tronc_angle = (raw_angle - t_min) % two_pi + t_min
-        if tronc_angle > t_max - math.radians(5.0) and (raw_angle - t_min) < 0 and (raw_angle - t_min) > -math.radians(30.0):
-            tronc_angle = t_min
+        if tronc_angle > t_max:
+            # Outside [t_min, t_max] (only reachable if sampled before a flip):
+            # clamp to the nearest boundary along the circle (midpoint 270°).
+            tronc_angle = t_min if tronc_angle > 1.5 * math.pi else t_max
         return {
             "tronc_angle": tronc_angle,
             "membre_angle_avant": th_f_ego * th_f,

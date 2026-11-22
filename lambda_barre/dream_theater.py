@@ -102,36 +102,45 @@ def run(pol_steps: int = 32,
             try:
                 label, value = next(sleep_gen)
                 if label == "prune":
-                    d_intra = value.get('dedup_intra', 0)
-                    d_core = value.get('dedup_coreset', 0)
-                    status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
+                    d_intra = value.get("dedup_intra", 0)
+                    d_core = value.get("dedup_coreset", 0)
+                    d_mode = value.get("dedup_mode", "geom")
+                    status = (f"dedup ({d_mode}): -{d_intra} intra, -{d_core} coreset refreshed "
+                              f"(coreset {value['coreset']})")
                     dream_theater.set_sleep_progress("prune", 1, 1)
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
-                    phase = "wm"
-                    if label == "wm_addendum":
-                        status = f"learning addendum {wm_step}/{wm_total} (loss {value:.3g})"
-                        phase = "wm"
-                    elif label == "wm_coreset":
-                        status = f"learning coreset {wm_step}/{wm_total} (loss {value:.3g})"
-                        phase = "wm"
+                    wb = getattr(brain, "sleep_wm_batch", 0)
+                    wB = getattr(brain, "sleep_wm_batches", 0)
+                    wn = getattr(brain, "sleep_wm_n", 0)
+                    overtime = wm_step - wm_total
+                    sling = getattr(brain, "sleep_wm_slingshot", False)
+                    if overtime > 0:
+                        ot_str = f" (+{overtime} overtime, slingshot)" if sling else f" (+{overtime} overtime)"
+                    elif sling:
+                        ot_str = " (slingshot)"
                     else:
-                        status = f"learning wm {wm_step}/{wm_total} (loss {value:.3g})"
-                        phase = "wm"
-                    dream_theater.set_sleep_progress(phase, wm_step, wm_total)
-                elif label == "filter":
-                    status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
-                    dream_theater.set_sleep_progress("filter", 1, 1)
+                        ot_str = ""
+                    g_total = wm_total * max(1, wB)
+                    g_step = (wm_step - 1) * max(1, wB) + wb
+                    name = {"wm_addendum": "addendum (50/50 replay)",
+                            "wm_coreset": "coreset"}.get(label, "wm")
+                    status = (f"learning {name} epoch {wm_step}/{wm_total}{ot_str} "
+                              f"batch {wb}/{wB} ({wn} seq, mse {value:.4f})")
+                    dream_theater.set_sleep_progress(label, g_step, g_total)
                 elif label == "pol":
                     pol_stats = getattr(brain, "last_pol_stats", None)
                     pol_step = getattr(brain, "sleep_pol_step", 0)
                     pol_total = getattr(brain, "sleep_pol_steps", 0)
                     if pol_stats is not None:
-                        status = (f"sleeping: pol {value:.2f} "
-                                  f"(hindsight {pol_stats['accepted']}/{pol_stats['total']} accepted)")
+                        obs_n = pol_stats.get("obs", 0)
+                        wm_n = pol_stats.get("wm", 0)
+                        status = (f"sleeping: pol {value:.4f} "
+                                  f"(AWR {pol_stats['accepted']}/{pol_stats['total']} active | "
+                                  f"{obs_n} obs, {wm_n} wm)")
                     else:
-                        status = f"sleeping: pol {value:.2f}"
+                        status = f"sleeping: pol {value:.4f}"
                     dream_theater.set_sleep_progress("pol", pol_step, pol_total)
                     if brain.last_dream_record is not None:
                         dream_theater.update(brain.last_dream_record)
@@ -143,10 +152,10 @@ def run(pol_steps: int = 32,
                     if save:
                         brain.save_checkpoint(wm_path, pol_path, buf_path)
                     print("[sleep]", stats)
-                    f_stats = getattr(brain, "last_filter_stats", None)
-                    drop_info = f" [dropped: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
-                    status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{drop_info} "
-                              f"wm {stats['wm_loss']:.3g} pol {stats['pol_loss']:.2f}")
+                    evicted = stats.get("cycle", {}).get("evicted", 0)
+                    evict_info = f" [evicted: -{evicted}]" if evicted > 0 else ""
+                    status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{evict_info} "
+                              f"wm {stats['wm_loss']:.4f} pol {stats['pol_loss']:.4f}")
             except StopIteration:
                 sleep_gen = None
                 dream_theater.sleep_active = False

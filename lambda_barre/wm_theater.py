@@ -43,7 +43,9 @@ from .dream import (
     step_popover_lines,
     draw_popover,
 )
-from .tokenize import SALVE_TOKENS, SIG_OFFSET, STATE_TOKENS, salve_cost
+from .tokenize import (
+    _COST_IDX, _REWARD_IDX, SALVE_TOKENS, SIG_OFFSET, STATE_TOKENS, salve_cost,
+)
 
 COST_COLORS = [
     (245, 140, 50),   # EF
@@ -123,7 +125,8 @@ def _cos(a, b) -> float:
 
 
 def _salve_costs(s_toks) -> list[float]:
-    return [float(c) for c in s_toks[10][SIG_OFFSET:SIG_OFFSET + 5]]
+    return ([float(c) for c in s_toks[_COST_IDX][SIG_OFFSET:SIG_OFFSET + 5]]
+            + [float(s_toks[_REWARD_IDX][SIG_OFFSET])])
 
 
 def _eos_vignette(eos_slots, label: str) -> DreamStep:
@@ -619,9 +622,11 @@ def run_theater(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             brain.load_checkpoint(wm_path=wm_path, pol_path=pol_path)
         else:
             wm = torch.load(wm_path, weights_only=False)
-            brain.world.load_state_dict(wm["world"])
-            if "opt_wm" in wm:
+            exact = brain.load_world_state(wm["world"])
+            if exact and "opt_wm" in wm:
                 brain.opt_wm.load_state_dict(wm["opt_wm"])
+            if exact and "last_wm_loss" in wm:
+                brain.last_wm_loss = float(wm["last_wm_loss"])
         print(f"Loaded World Model from {wm_path}")
     else:
         print("Warning: WM checkpoint not found, using initialized weights.")

@@ -53,13 +53,22 @@ La loss combine :
   (prompt, non appris), **poids 1/3 par groupe** (dénouement, trajectoire,
   action de décision), pondérée par token ;
 - une tête **MDN** (*Mixture Density Network*, `eos_n_modes` = 8 composantes
-  gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) lue à la
-  row `eos_pos - 1`, entraînée par **NLL exacte** pondérée uniquement par
+  gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) précédée
+  d'un **goulot de situation discret (VQ)** (`eos_vq_codes` = 32 codes de
+  dimension `eos_vq_dim` = 8 normalisés par
+  `LayerNorm`, expansion non linéaire `eos_mdn_mlp`, mise à jour EMA
+  `eos_vq_decay` = 0.99, engagement `eos_vq_beta` = 0.25 ; `0` désactive le
+  goulot) sur la row `eos_pos - 1` — les séquences projetées sur un même code
+  de situation partagent une seule distribution `P(EOS | situation)`, et une
+  tête auxiliaire `(code VQ, EOS) → a_{n_ctx}` (poids `eos_vq_act_w` = 1.0)
+  force le VQ à séparer les situations physiquement distinctes même quand
+  `EOS = 0.5` ; entraînée par **NLL exacte** pondérée uniquement par
   `log1p(count)` (jamais par l'impact — reflète la multiplicité des séquences
   dédupliquées sans qu'un point immobile écrase le batch ; décalée par son
   minimum théorique en `sigma_min` et normalisée par slot, donc toujours
-  $\ge 0$, poids `eos_nll_w`) — une vraie distribution **jointe continue et
-  multimodale** sur les 6 slots, sans codebook ni k-means.
+  $\ge 0$, poids `eos_nll_w`). `_train_wm_batch` rétropropage la loss totale
+  mais retourne la MSE masquée pure pour `wm_target_loss`, le plateau et la
+  déduplication latente.
 
 Dans le même forward, le dénouement est prédit depuis le contexte, et la
 conséquence inversée puis l'action de décision sont prédites conditionnellement
@@ -88,8 +97,13 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
     `[mean(contexte), mean(eos..action)]`, 50/50 entre contexte et conséquence
     + action) — ignore les distracteurs exogènes (ex. balle) sans jamais
     fusionner deux séquences à conséquence ou dénouement différent.
-  - Un doublon rafraîchit `vivacity = 1.0` et incrémente `count` du
-    représentant conservé.
+  - **Garde-fou action / dénouement** : deux séquences ne sont jamais
+    fusionnées si leur action de décision `a_dec` diffère de plus de `0.05` sur
+    un actionneur ou si leur `relief` diffère de plus de `0.08` (protège les
+    ticks critiques de déclenchement d'un geste et les paires contrefactuelles).
+  - Parmi de vrais doublons intra-addendum, le représentant au **meilleur
+    `relief`** est conservé ; chaque doublon rafraîchit `vivacity = 1.0` et
+    incrémente `count`.
 - **Pas de filtrage destructif par surprise** ni de remise en jeu d'un tiers du
   coreset (préserve les souvenirs sains maîtrisés et les paires
   contrefactuelles).
@@ -116,8 +130,9 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
   `p_elu = probs[elu]`.
   `relief_score(slots) = tanh(Σ (W_j / W_max) · (2·slot_j - 1))` (additif,
   symétrique autour de `0.5 = 0`, non dilué sur un canal isolé).
-- Règle de l'observé : si `eos_observed` est fourni, il remplace l'élu
-  uniquement quand son relief dépasse strictement celui de l'élu (`p_elu = 1`).
+- Règle de l'observé : si `eos_observed` est fourni, il remplace l'élu dès que
+  son relief est à moins de `obs_margin` (`0.10`) du mode élu
+  (`rel_obs >= rel_elu - 0.10`, avec `p_elu = 1`).
 - `generate_from_denouement(ctx, eos_elu)` : génération auto-régressive
   depuis `[contexte, dénouement élu]` (masque causal, KV-cache, positions
   explicites), déroule la conséquence inversée jusqu'à l'action de décision
@@ -128,7 +143,10 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
 - Latent d'entrée = couche médiane du WM sur la **partie contexte** seule,
   normalisé par `F.layer_norm` sans paramètres (identique en éveil et en
   sommeil).
-- Cible = **action de décision générée** par le WM sous le dénouement élu.
+- Cible = **action réelle enregistrée** (`a_real`) lorsque la séquence satisfait
+  la règle de l'observé (`use_obs = True`), ou **action de décision générée**
+  par le WM sous le dénouement élu lorsque le WM a trouvé un mode franchement
+  meilleur (`use_obs = False`).
 - Pondération par confiance et **avantage** (façon AWR) :
   `V_ctx = Σ_k π_k · relief(μ_k)`, `A = relief(élu) − V_ctx`,
   `w = p_elu.detach() · relu(max(A, relief_elu))`,

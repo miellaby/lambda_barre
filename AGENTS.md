@@ -58,6 +58,8 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 - **No Premature Tests**: The baseline is that the tests run well. **No need to test suites before code changes.**
 - **No Unsolicited Numbers**: Unless ordering of information is crucial, **Avoid Numbered Lists**, **Chapter Numbers Are Bad**. Numbers are a mental burden with a maintenance cost. Avoid numbering as much as possible.
 - **Source Filename is enough when documenting** (Avoid Pathes and file:// Links)
+- **Self-Sufficient Code & Docs**: Never reference temporary documents (reviews, session logs, proposals, scratch notes) from code comments, docstrings, or permanent docs — explain the rationale inline.
+- **Document the Present Only**: Never document removed features or reference past/legacy designs in code comments or docs — describe how the system works now (git history is for the past).
 
 # Reads
 

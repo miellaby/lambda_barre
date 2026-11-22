@@ -99,6 +99,8 @@ from .tokenize import (_COST_IDX, _REWARD_IDX, DENSE_DIM, N_SIGNAL, STATE_TOKENS
 EOS_NSLOTS = 6      # cost-aggregate slots of the dénouement (EOS) token
 EOS_N_MODES = 8     # number of Gaussian mixture components in the MDN EOS head
 EOS_SIGMA_MIN = 0.02  # std floor for MDN components (prevents Dirac NLL blow-up)
+EOS_VQ_CODES = 16   # situation codebook size (0 = no VQ bottleneck, MDN reads the row)
+EOS_VQ_DIM = 8      # situation code dimension
 
 
 # --- actuator consigne ranges (mirror body.py) -------------------------------
@@ -185,13 +187,23 @@ class WorldModel(nn.Module):
     def __init__(self, d_model: int = 64, nhead: int = 4, layers: int = 3,
                  dim_ff: int = 384, dropout: float = 0.0,
                  eos_n_modes: int = EOS_N_MODES,
-                 eos_sigma_min: float = EOS_SIGMA_MIN):
+                 eos_sigma_min: float = EOS_SIGMA_MIN,
+                 eos_vq_codes: int = EOS_VQ_CODES,
+                 eos_vq_dim: int = EOS_VQ_DIM,
+                 eos_vq_decay: float = 0.99):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.dropout_p = dropout
         self.eos_n_modes = eos_n_modes
         self.eos_sigma_min = eos_sigma_min
+        self.eos_vq_codes = int(eos_vq_codes)
+        self.eos_vq_dim = int(eos_vq_dim)
+        self.eos_vq_decay = float(eos_vq_decay)
+        # Last situation encoding of forward_with_eos (z_e with grad, code idx,
+        # straight-through z_q), read by Brain for commitment/action losses and
+        # the EMA codebook update.
+        self.last_vq: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self.in_proj = nn.Linear(DENSE_DIM, d_model)
         enc_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_ff, dropout=dropout,
@@ -202,6 +214,36 @@ class WorldModel(nn.Module):
         # predicts a multimodal joint distribution over the 6 continuous EOS
         # slots as a mixture of K diagonal Gaussians conditioned on context.
         # Inter-slot correlations are carried by the mixture components.
+        #
+        # Situation bottleneck (VQ): the MDN does not read the
+        # transformer row directly (precise enough to identify every sequence
+        # -> one Dirac EOS per sequence) but a discrete situation code:
+        #   row eos_pos-1 -> re-encoder MLP -> z_e [D] -> nearest code e_k [D]
+        # so all sequences mapped to the same code share P(EOS | situation).
+        # Codebook updated by EMA (buffers, not parameters); gradient passes
+        # through the rounding by straight-through.
+        if self.eos_vq_codes > 0:
+            self.eos_vq_enc = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(),
+                nn.Linear(d_model, self.eos_vq_dim))
+            # nonlinear expansion from code z_q to d_model so N > D codes can
+            # have independent MDN distributions (no linear-dependence leakage)
+            self.eos_mdn_mlp = nn.Sequential(
+                nn.Linear(self.eos_vq_dim, d_model), nn.GELU())
+            # auxiliary training head: (z_q, EOS) -> 5 normalized decision
+            # action scalars [0,1]. Forces VQ codes to separate physical
+            # situations that require different actions even when EOS == 0.5.
+            self.eos_vq_act_head = nn.Sequential(
+                nn.Linear(self.eos_vq_dim + EOS_NSLOTS, d_model), nn.GELU(),
+                nn.Linear(d_model, 5))
+            # random until the first training batch re-initializes it from data
+            # (a zero codebook would make the untrained MDN input constant)
+            self.register_buffer("eos_vq_codebook",
+                                 torch.randn(self.eos_vq_codes, self.eos_vq_dim))
+            self.register_buffer("eos_vq_ema_count", torch.zeros(self.eos_vq_codes))
+            self.register_buffer("eos_vq_ema_sum",
+                                 torch.zeros(self.eos_vq_codes, self.eos_vq_dim))
+            self.register_buffer("eos_vq_ready", torch.zeros((), dtype=torch.bool))
         self.eos_pi = nn.Linear(d_model, eos_n_modes)
         self.eos_mu = nn.Linear(d_model, eos_n_modes * EOS_NSLOTS)
         self.eos_sigma = nn.Linear(d_model, eos_n_modes * EOS_NSLOTS)
@@ -321,14 +363,82 @@ class WorldModel(nn.Module):
         # torch.compile) inside nn.TransformerEncoder
         return self.transformer(h, mask=attn_mask, is_causal=causal)
 
+    def _eos_situation(self, h_row: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Situation bottleneck: row [B, d_model] -> (z_q [B, D] straight-through
+        quantized, z_e [B, D] continuous encoding, idx [B] situation code).
+        The codebook is lazily initialized from the first training batch.
+        Parameter-free LayerNorm bounds z_e to unit variance so commitment loss
+        cannot drift in scale."""
+        z_e = F.layer_norm(self.eos_vq_enc(h_row), (self.eos_vq_dim,))          # [B, D]
+        if self.training and not bool(self.eos_vq_ready):
+            with torch.no_grad():
+                pick = torch.randint(0, z_e.shape[0], (self.eos_vq_codes,),
+                                     device=z_e.device)
+                init = z_e.detach()[pick]
+                init = init + 1e-2 * init.std(unbiased=False).clamp(min=1e-3) * torch.randn_like(init)
+                self.eos_vq_codebook.copy_(init)
+                self.eos_vq_ema_sum.copy_(init)
+                self.eos_vq_ema_count.fill_(1.0)
+                self.eos_vq_ready.fill_(True)
+        dist = torch.cdist(z_e.detach(), self.eos_vq_codebook)                  # [B, N]
+        idx = dist.argmin(dim=1)                                                # [B]
+        e = self.eos_vq_codebook[idx]                                           # [B, D]
+        z_q = z_e + (e - z_e).detach()      # straight-through: value e, gradient to z_e
+        return z_q, z_e, idx
+
+    @torch.no_grad()
+    def vq_ema_update(self, z_e: torch.Tensor, idx: torch.Tensor,
+                      dead_ratio: float = 1e-2) -> None:
+        """EMA codebook update (VQ-VAE v2 style, Laplace-smoothed counts) and
+        reset of dead codes (EMA usage < ``dead_ratio`` x mean usage) onto
+        random encodings of the batch. Call once per optimizer step."""
+        if self.eos_vq_codes <= 0:
+            return
+        N = self.eos_vq_codes
+        z = z_e.detach().float()
+        onehot = F.one_hot(idx, N).to(z.dtype)                                  # [B, N]
+        d = self.eos_vq_decay
+        self.eos_vq_ema_count.mul_(d).add_(onehot.sum(0), alpha=1.0 - d)
+        self.eos_vq_ema_sum.mul_(d).add_(onehot.t() @ z, alpha=1.0 - d)
+        n = self.eos_vq_ema_count.sum()
+        eps = 1e-5
+        smoothed = (self.eos_vq_ema_count + eps) / (n + N * eps) * n
+        self.eos_vq_codebook.copy_(self.eos_vq_ema_sum / smoothed.unsqueeze(1))
+        dead = self.eos_vq_ema_count < dead_ratio * self.eos_vq_ema_count.mean()
+        n_dead = int(dead.sum())
+        if n_dead > 0:
+            pick = torch.randint(0, z.shape[0], (n_dead,), device=z.device)
+            fresh = z[pick] + 1e-2 * z.std(unbiased=False).clamp(min=1e-3) * torch.randn(
+                n_dead, z.shape[1], device=z.device)
+            c_init = self.eos_vq_ema_count.mean().clamp(min=1e-2)
+            self.eos_vq_codebook[dead] = fresh
+            self.eos_vq_ema_sum[dead] = fresh * c_init
+            self.eos_vq_ema_count[dead] = c_init
+
+    def predict_vq_action(self, z_q: torch.Tensor, eos: torch.Tensor) -> torch.Tensor:
+        """Auxiliary training head: (situation code z_q [B, D], EOS [B, 6]) ->
+        predicted 5 normalized decision action scalars in [0, 1]."""
+        return torch.sigmoid(self.eos_vq_act_head(torch.cat([z_q, eos], dim=-1)))
+
     def _eos_mdn(self, h_row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project a single transformer row ``h_row`` [B, d_model] to MDN
-        parameters: (logits_pi [B, K], mu [B, K, 6], sigma [B, K, 6])."""
+        parameters: (logits_pi [B, K], mu [B, K, 6], sigma [B, K, 6]).
+        With the VQ bottleneck, the MDN only sees the situation code through
+        ``eos_mdn_mlp``, and ``self.last_vq = (z_e, idx, z_q)`` is stashed for
+        the commitment/action losses and EMA update."""
         B = h_row.shape[0]
         K = self.eos_n_modes
-        logits_pi = self.eos_pi(h_row)                                          # [B, K]
-        mu = torch.sigmoid(self.eos_mu(h_row)).view(B, K, EOS_NSLOTS)           # [B, K, 6]
-        sigma = (self.eos_sigma_min + F.softplus(self.eos_sigma(h_row))).view(
+        if self.eos_vq_codes > 0:
+            z_q, z_e, idx = self._eos_situation(h_row)
+            self.last_vq = (z_e, idx, z_q)
+            x = self.eos_mdn_mlp(z_q)
+        else:
+            x = h_row
+            self.last_vq = None
+        logits_pi = self.eos_pi(x)                                              # [B, K]
+        mu = torch.sigmoid(self.eos_mu(x)).view(B, K, EOS_NSLOTS)               # [B, K, 6]
+        sigma = (self.eos_sigma_min + F.softplus(self.eos_sigma(x))).view(
             B, K, EOS_NSLOTS)                                                   # [B, K, 6]
         return logits_pi, mu, sigma
 
@@ -562,9 +672,9 @@ class Policy(nn.Module):
     @staticmethod
     def _squash(raw: torch.Tensor) -> torch.Tensor:
         theta_front = torch.tanh(raw[:, 0])
-        d_front = torch.sigmoid(raw[:, 1])
+        d_front = 0.5 * (torch.tanh(raw[:, 1]) + 1.0)
         theta_back = torch.tanh(raw[:, 2])
-        d_back = torch.sigmoid(raw[:, 3])
+        d_back = 0.5 * (torch.tanh(raw[:, 3]) + 1.0)
         tail = torch.tanh(raw[:, 4])
         return torch.stack([theta_front, d_front, theta_back, d_back, tail], dim=1)
 

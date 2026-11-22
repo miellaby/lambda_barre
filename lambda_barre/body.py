@@ -110,9 +110,10 @@ FOOT_TYPE = 1
 GROUND_TYPE = 2
 TORSO_TYPE = 3
 
-# facing direction hysteresis (thermostat): the animat only "turns around" when
-# its torso tilt exceeds ±15°, so small oscillations near upright don't flip
-# the tail/head/ears back and forth.
+# facing direction hysteresis (thermostat): the animat only flips when its
+# wrapped torso tilt crosses ±15° away from upright (0°) or upside-down (180°),
+# so small oscillations near 0° or 180° don't chatter while somersaults always
+# re-orient facing on the new side.
 FACING_DEADZONE = math.radians(15.0)
 
 # --- consigne convergence (motor smoothing) ----------------------------------
@@ -453,12 +454,13 @@ def apply_consignes(skel: Skeleton, dt: float = 0.0) -> None:
         ty = hip_local[1] + act.d_eff * -math.cos(act.theta_eff)
         spring.anchor_a = (tx, ty)
         spring.rest_length = 0.0
-    # facing direction: thermostat hysteresis on ±15°. Only flip when the torso
-    # tilt crosses the deadzone in the opposite direction; within ±15° the
-    # previous facing persists, preventing chatter near upright.
-    if skel.facing == 1 and skel.torso.angle > FACING_DEADZONE:
+    # facing direction: thermostat hysteresis on ±FACING_DEADZONE around both
+    # upright (0°) and upside-down (180°). Wrap torso.angle into [-pi, pi) so
+    # full somersaults never lock facing on the wrong side.
+    a = (skel.torso.angle + math.pi) % (2.0 * math.pi) - math.pi
+    if skel.facing == 1 and FACING_DEADZONE < a < math.pi - FACING_DEADZONE:
         skel.facing = -1
-    elif skel.facing == -1 and skel.torso.angle < -FACING_DEADZONE:
+    elif skel.facing == -1 and -math.pi + FACING_DEADZONE < a < -FACING_DEADZONE:
         skel.facing = 1
     sgn = -skel.facing
     skel.tail_spring.rest_angle = -sgn * (math.pi / 2) + skel.facing * skel.tail_act.theta_eff

@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 
@@ -108,8 +109,12 @@ class WMManager(WMTheater):
             g["lr"] = min(1e-2, max(1e-7, g["lr"] * factor))
 
     def save_wm(self) -> None:
+        wm_loss = (self.brain.last_batch_mse
+                   if not math.isnan(self.brain.last_batch_mse)
+                   else self.brain.last_wm_loss)
         torch.save({"world": self.brain.world.state_dict(),
-                    "opt_wm": self.brain.opt_wm.state_dict()}, self.wm_path)
+                    "opt_wm": self.brain.opt_wm.state_dict(),
+                    "last_wm_loss": wm_loss}, self.wm_path)
         self.saved_flash = time.time()
         print(f"Saved World Model to {self.wm_path}")
 
@@ -203,7 +208,10 @@ class WMManager(WMTheater):
             (x, y0 + 22))
         if self.losses:
             _, loss = self.losses[-1]
-            screen.blit(font_tiny.render(f"loss {loss:.5f}", FONT_AA, (110, 200, 255)),
+            nll = getattr(self.brain, "last_batch_nll", float("nan"))
+            txt = (f"mse {loss:.5f}   nll {nll:.3f}" if not math.isnan(nll)
+                   else f"mse {loss:.5f}")
+            screen.blit(font_tiny.render(txt, FONT_AA, (110, 200, 255)),
                         (x, y0 + 38))
         if self.saved_flash is not None and time.time() - self.saved_flash < 2.0:
             screen.blit(font_tiny.render(f"WM saved -> {self.wm_path}", FONT_AA, (255, 220, 90)),
@@ -253,9 +261,11 @@ def run_manager(buffer_path: str = "buf_ckpt.pt", wm_path: str = "wm_ckpt.pt",
             brain.load_checkpoint(wm_path=wm_path, pol_path=pol_path)
         else:
             wm = torch.load(wm_path, weights_only=False)
-            brain.world.load_state_dict(wm["world"])
-            if "opt_wm" in wm:
+            exact = brain.load_world_state(wm["world"])
+            if exact and "opt_wm" in wm:
                 brain.opt_wm.load_state_dict(wm["opt_wm"])
+            if exact and "last_wm_loss" in wm:
+                brain.last_wm_loss = float(wm["last_wm_loss"])
         print(f"Loaded World Model from {wm_path}")
     else:
         print("Warning: WM checkpoint not found, using initialized weights.")

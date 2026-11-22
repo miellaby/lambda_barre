@@ -45,7 +45,12 @@ eos_sigma_min    = 0.02     # std floor for MDN components
 eos_nll_w        = 0.1      # weight of shifted per-slot MDN NLL (>= 0) in WM loss
 eos_temperature  = 1.0      # softmax temperature on MDN mixture logits at election
 eos_top_p        = 0.9      # nucleus cumulative mass on MDN modes
-eos_min_p        = 1.0e-3   # minimum probability floor for an eligible mode
+eos_min_p        = 0.10     # minimum probability floor for an eligible mode (filters phantom modes)
+eos_vq_codes     = 32       # situation bottleneck: learned codes in front of the MDN (0 = off; aim for ~30-60 seqs/code)
+eos_vq_dim       = 8        # situation code dimension
+eos_vq_beta      = 0.25     # VQ commitment loss weight
+eos_vq_decay     = 0.99     # EMA decay of the situation codebook
+eos_vq_act_w     = 1.0      # weight of auxiliary (VQ code, EOS) -> decision action loss
 wm_impact_floor  = 0.10     # additive floor on per-sequence impact |relief|
 wm_input_noise   = 0.015    # light Gaussian noise on valid signal slots during training (prefix/padding/intero/EOS intact)
 
@@ -56,7 +61,7 @@ wm_input_noise   = 0.015    # light Gaussian noise on valid signal slots during 
 capacity        = 1000   # session journal: max extractable sequences during wake
 pool_capacity   = 1000   # coreset: max long-term consolidated sequences
 dedup_eps        = 0.02   # cold-start fallback: per-token RMSE over full sequence (0 = off)
-dedup_latent_eps = 0.02   # converged WM: cosine distance on full-sequence latent [ctx, conseq+act] (0 = off)
+dedup_latent_eps = 0.01   # converged WM: cosine distance on full-sequence latent [ctx, conseq+act] (0 = off)
 vivacity_decay   = 0.95   # per-sleep multiplicative decay of coreset vivacity (1.0 = no decay)
 
 # ---------------------------------------------------------------------------

@@ -586,6 +586,19 @@ class ExperienceBuffer:
         w = self._sig_weights.to(t.device)                          # [D]
         return t[:, :, SIG_OFFSET:][:, mask] * w                    # [N, D]
 
+    def _action_and_relief(self, seqs: list) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract normalized decision actions [N, 5] in [0, 1] and relief
+        scores [N] from recorded sequences (CPU tensors)."""
+        ap = self._layout["action_pos"]
+        ep = self._layout["eos_pos"]
+        acts = [[s[ap][SIG_OFFSET], s[ap][SIG_OFFSET + 1],
+                 s[ap + 1][SIG_OFFSET], s[ap + 1][SIG_OFFSET + 1],
+                 s[ap + 2][SIG_OFFSET]] for s in seqs]
+        eos = [s[ep][SIG_OFFSET:SIG_OFFSET + _EOS_NSLOTS] for s in seqs]
+        a_t = torch.tensor(acts, dtype=torch.float32)
+        r_t = relief_score(torch.tensor(eos, dtype=torch.float32))
+        return a_t, r_t
+
     def _pairwise_dists(self, seqs_a: list, seqs_b: list | None = None,
                         embed_fn=None, device=None) -> torch.Tensor:
         """Pairwise distance matrix [Na, Nb] between full recorded sequences:
@@ -602,23 +615,38 @@ class ExperienceBuffer:
         return torch.cdist(a, b)
 
     def deduplicate_addendum(self, eps: float | None = None,
-                             embed_fn=None, device=None) -> int:
+                             embed_fn=None, device=None,
+                             act_eps: float = 0.05,
+                             relief_eps: float = 0.08) -> int:
         """Drop near-duplicate sequences within the Addendum using full-sequence
         distance (WM latent cosine distance when ``embed_fn`` is provided,
-        otherwise per-token weighted RMSE over context + dénouement +
-        consequence + decision action). Refreshes count/vivacity on the kept
-        representative. Returns the number dropped."""
+        otherwise per-token weighted RMSE). Two sequences are never merged if
+        their decision action differs by more than ``act_eps`` on any actuator
+        or if their relief differs by more than ``relief_eps`` (protects
+        action-initiation frames and counterfactual pairs). Among true
+        duplicates, keeps the representative with highest relief and refreshes
+        its count/vivacity. Returns the number dropped."""
         thr = self.dedup_eps if eps is None else eps
         n = len(self._addendum)
         if thr <= 0.0 or n <= 1:
             return 0
         dists = self._pairwise_dists(self._addendum, embed_fn=embed_fn, device=device).cpu()
+        acts, rels = self._action_and_relief(self._addendum)
+        act_d = (acts.unsqueeze(1) - acts.unsqueeze(0)).abs().amax(dim=-1)   # [n, n]
+        rel_d = (rels.unsqueeze(1) - rels.unsqueeze(0)).abs()                # [n, n]
+        # Parcourir du meilleur relief au moins bon : entre vrais doublons, le
+        # représentant au meilleur dénouement est toujours conservé.
+        order = sorted(range(n), key=lambda idx: float(rels[idx]), reverse=True)
         kept_idx: list[int] = []
-        for i in range(n):
+        for i in order:
             dup_of = -1
             best_d = thr
             row = dists[i]
+            arow = act_d[i]
+            rrow = rel_d[i]
             for j in kept_idx:
+                if float(arow[j]) > act_eps or float(rrow[j]) > relief_eps:
+                    continue
                 d = float(row[j])
                 if d < best_d:
                     best_d = d
@@ -626,25 +654,35 @@ class ExperienceBuffer:
             if dup_of >= 0:
                 m = self._addendum_meta[dup_of]
                 m["vivacity"] = 1.0
-                m["count"] = m.get("count", 1) + 1
+                m["count"] = m.get("count", 1) + self._addendum_meta[i].get("count", 1)
             else:
                 kept_idx.append(i)
         dropped = n - len(kept_idx)
         if dropped > 0:
+            kept_idx.sort()
             self._addendum = [self._addendum[i] for i in kept_idx]
             self._addendum_meta = [self._addendum_meta[i] for i in kept_idx]
         return dropped
 
     def deduplicate_against_coreset(self, eps: float | None = None,
-                                    embed_fn=None, device=None) -> int:
+                                    embed_fn=None, device=None,
+                                    act_eps: float = 0.05,
+                                    relief_eps: float = 0.08) -> int:
         """Drop Addendum sequences within ``eps`` (full-sequence latent cosine
-        or per-token RMSE) of an existing Coreset memory. Refreshes the matching
-        Coreset memory's vivacity and count. Returns number dropped."""
+        or per-token RMSE) of an existing Coreset memory whose decision action
+        and relief also match within ``act_eps`` / ``relief_eps``. Refreshes
+        the matching Coreset memory's vivacity and count. Returns number dropped."""
         thr = self.dedup_eps if eps is None else eps
         if thr <= 0.0 or not self._addendum or not self._coreset:
             return 0
         dists = self._pairwise_dists(
-            self._addendum, self._coreset, embed_fn=embed_fn, device=device)
+            self._addendum, self._coreset, embed_fn=embed_fn, device=device).cpu()
+        acts_a, rels_a = self._action_and_relief(self._addendum)
+        acts_c, rels_c = self._action_and_relief(self._coreset)
+        act_d = (acts_a.unsqueeze(1) - acts_c.unsqueeze(0)).abs().amax(dim=-1)
+        rel_d = (rels_a.unsqueeze(1) - rels_c.unsqueeze(0)).abs()
+        incompat = (act_d > act_eps) | (rel_d > relief_eps)
+        dists = dists.masked_fill(incompat, float("inf"))
         min_d, nearest = dists.min(dim=1)
         min_d_list = min_d.tolist()
         nearest_list = nearest.tolist()
@@ -803,17 +841,25 @@ class ExperienceBuffer:
 
     def sample(self, batch: int) -> list:
         """Uniform sample over Coreset + Addendum, falling back to journal windows."""
+        n_core = len(self._coreset)
         pool = list(self._coreset) + self._addendum
         if pool:
-            return self._rng.sample(pool, min(batch, len(pool)))
+            idxs = self._rng.sample(range(len(pool)), min(batch, len(pool)))
+            self.last_sample_tags = [
+                f"#{i}" if i < n_core else f"add #{i - n_core}" for i in idxs
+            ]
+            return [pool[i] for i in idxs]
         valid_segs = self._valid_segments
         if not valid_segs:
+            self.last_sample_tags = []
             return []
         counts = [self._n_windows(s) for s in valid_segs]
         total = sum(counts)
         if total <= 0:
+            self.last_sample_tags = []
             return []
         indices = self._rng.sample(range(total), min(batch, total))
+        self.last_sample_tags = [f"j#{idx}" for idx in indices]
         cum = list(itertools.accumulate(counts))
         out = []
         for idx in indices:
@@ -857,7 +903,13 @@ class Brain:
                  eos_temperature: float = 1.0,
                  eos_top_n: int | None = None,
                  eos_top_p: float = 0.9,
-                 eos_min_p: float = 1e-3,
+                 eos_min_p: float = 0.10,
+                 # goulot de situation (VQ) devant la tête MDN
+                 eos_vq_codes: int = M.EOS_VQ_CODES,
+                 eos_vq_dim: int = M.EOS_VQ_DIM,
+                 eos_vq_beta: float = 0.25,
+                 eos_vq_decay: float = 0.99,
+                 eos_vq_act_w: float = 1.0,
                  wm_input_noise: float = 0.015,
                  wm_impact_floor: float = 0.10,
                  act_conseq_shift: int = 0):
@@ -881,7 +933,10 @@ class Brain:
         self.world = M.WorldModel(d_model=d_model, nhead=nhead, layers=layers,
                                   dim_ff=dim_ff, dropout=dropout,
                                   eos_n_modes=eos_n_modes,
-                                  eos_sigma_min=eos_sigma_min).to(self.device)
+                                  eos_sigma_min=eos_sigma_min,
+                                  eos_vq_codes=eos_vq_codes,
+                                  eos_vq_dim=eos_vq_dim,
+                                  eos_vq_decay=eos_vq_decay).to(self.device)
         self.policy = M.Policy(n_state=N_POLICY_STATE + d_model,
                                hidden=pol_hidden).to(self.device)
         self.opt_wm = torch.optim.Adam(self.world.parameters(), lr=lr_wm)
@@ -926,6 +981,8 @@ class Brain:
         self.eos_n_modes = eos_n_modes
         self.eos_sigma_min = eos_sigma_min
         self.eos_nll_w = eos_nll_w
+        self.eos_vq_beta = eos_vq_beta
+        self.eos_vq_act_w = eos_vq_act_w
         self.eos_temperature = eos_temperature
         self.eos_top_n = eos_top_n
         self.eos_top_p = eos_top_p
@@ -945,6 +1002,11 @@ class Brain:
         self._wake_history: list[tuple[list, list]] = []
         # last sleep stats, for the HUD
         self.last_wm_loss = float("nan")
+        self.last_batch_mse = float("nan")
+        self.last_batch_nll = float("nan")
+        self.last_batch_commit = float("nan")
+        self.last_batch_vq_act = float("nan")
+        self._last_use_obs: torch.Tensor | None = None
         self.last_wm_coreset_loss = float("nan")
         self.last_wm_addendum_loss = float("nan")
         self.wm_loss_before_sleep = float("nan")
@@ -1155,7 +1217,8 @@ class Brain:
 
     def _wm_loss_impl(self, vals: torch.Tensor,
                       seq_weights: torch.Tensor | None = None,
-                      nll_weights: torch.Tensor | None = None) -> torch.Tensor:
+                      nll_weights: torch.Tensor | None = None
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """One forward, two losses over the whole recorded sequence (causal
         mask + salve positions):
         - MSE on all tokens from the dénouement on (signal slots, weighted by
@@ -1164,6 +1227,10 @@ class Brain:
           dénouement slots predicted at row ``eos_pos - 1`` (weighted only by
           ``nll_weights`` = log1p(count), never by impact, to preserve
           calibrated frequencies P(EOS | ctx)).
+        Returns ``(total, mse, nll, commit)``: optimization backprops ``total``,
+        while convergence checks (``wm_target_loss``, plateau, latent dedup)
+        track ``mse`` so the irreducible multimodal NLL entropy floor cannot
+        pin the phase in overtime.
         Le token dénouement reste inconditionnellement dans l'entrée (teacher
         forcing) : la conséquence est conditionnée par contexte ET dénouement."""
         # data augmentation : bruit léger sur les seuls slots signaux valides
@@ -1192,7 +1259,28 @@ class Brain:
         else:
             nw = nll_weights.to(nll.device)
             nll_loss = (nll * nw).sum() / nw.sum().clamp(min=1e-8)
-        return mse + self.eos_nll_w * nll_loss
+        # Goulot de situation (VQ) :
+        # - perte d'engagement : z_e reste proche de son code (codebook EMA) ;
+        # - critère d'action de décision : (z_q, EOS) -> a_{n_ctx} (5 scalaires
+        #   normalisés [0,1]), force le VQ à séparer les situations qui appellent
+        #   des actions différentes même quand EOS == 0.5 (debout vs couché).
+        vq = self.world.last_vq
+        if vq is not None:
+            z_e, idx, z_q = vq
+            commit = ((z_e - self.world.eos_vq_codebook[idx].detach()) ** 2).mean()
+            act_flat = vals[:, self.action_pos:self.action_pos + ACTION_TOKENS,
+                            SIG_OFFSET:SIG_OFFSET + N_SIGNAL].reshape(
+                vals.shape[0], ACTION_TOKENS * N_SIGNAL)
+            act_tgt = act_flat.index_select(1, self._act_tok * N_SIGNAL + self._act_slot)
+            act_pred = self.world.predict_vq_action(z_q, tgt)
+            vq_act = ((act_pred - act_tgt) ** 2).mean()
+        else:
+            commit = torch.zeros((), dtype=mse.dtype, device=mse.device)
+            vq_act = torch.zeros((), dtype=mse.dtype, device=mse.device)
+        total = (mse
+                 + self.eos_nll_w * (nll_loss + self.eos_vq_beta * commit)
+                 + self.eos_vq_act_w * vq_act)
+        return total, mse, nll_loss, commit, vq_act
 
     def _seq_impact(self, seq: list) -> float:
         """Impact d'une séquence enregistrée (ADR-0001) : |relief|, plancher
@@ -1205,19 +1293,30 @@ class Brain:
         - MSE is weighted by ``_seq_impact`` (impact-proportional training);
         - MDN NLL is weighted by ``log1p(count)`` when ``counts`` are given
           (reflects deduplicated multiplicity without letting one static point
-          dominate a batch)."""
+          dominate a batch).
+        Backpropagates ``total = mse + eos_nll_w * (nll + beta * commit)`` and
+        returns the masked ``mse`` (comparable to ``wm_target_loss`` without the
+        irreducible multimodal NLL entropy floor)."""
         vals = self._batch_tensors(sequences)
         impacts = [self._seq_impact(s) for s in sequences]
         seq_w = torch.tensor(impacts, dtype=torch.float32, device=self.device)
         nll_w = (torch.tensor([math.log1p(max(1, int(c))) for c in counts],
                               dtype=torch.float32, device=self.device)
                  if counts is not None else None)
-        loss = self._wm_loss(vals, seq_w, nll_w)
+        total, mse, nll, commit, vq_act = self._wm_loss(vals, seq_w, nll_w)
         self.opt_wm.zero_grad()
-        loss.backward()
+        total.backward()
         torch.nn.utils.clip_grad_norm_(self.world.parameters(), 1.0)
         self.opt_wm.step()
-        return loss.item()
+        vq = self.world.last_vq
+        if vq is not None:
+            self.world.vq_ema_update(vq[0], vq[1])
+        self.world.last_vq = None
+        self.last_batch_mse = float(mse.item())
+        self.last_batch_nll = float(nll.item())
+        self.last_batch_commit = float(commit.item())
+        self.last_batch_vq_act = float(vq_act.item())
+        return self.last_batch_mse
 
     def train_wm_phase(self, epochs: int, batch: int,
                        target_loss: float | None = None,
@@ -1418,10 +1517,11 @@ class Brain:
         B = action.shape[0]
         norm = torch.where(self._act_signed, (action + 1.0) / 2.0, action)
         toks = self._act_tmpl.unsqueeze(0).expand(B, -1, -1).clone()
-        flat = toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL]
+        flat = toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL].reshape(
+            B, ACTION_TOKENS * N_SIGNAL)
         flat = flat.scatter(1, (self._act_tok * N_SIGNAL + self._act_slot).unsqueeze(0).expand(B, -1),
                             norm)
-        toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = flat
+        toks[:, :, SIG_OFFSET:SIG_OFFSET + N_SIGNAL] = flat.view(B, ACTION_TOKENS, N_SIGNAL)
         return toks
 
     def _decode_action_batch(self, act_toks: torch.Tensor) -> torch.Tensor:
@@ -1468,6 +1568,7 @@ class Brain:
                            top_p: float | None = None,
                            min_p: float | None = None,
                            eos_observed: torch.Tensor | None = None,
+                           obs_margin: float = 0.10,
                            return_value: bool = False):
         """Exact election over the K continuous MDN modes predicted from context:
 
@@ -1481,8 +1582,11 @@ class Brain:
         - among eligible modes, elects the one with highest ``relief_score``;
         - ``p_elu`` is the exact learned probability ``probs[b, elu]``;
         - observed rule: if ``eos_observed`` is given, it replaces the elected
-          mode only when its relief strictly exceeds the elected mode's relief
-          (with ``p_elu = 1.0``).
+          mode whenever its relief is within ``obs_margin`` of (or exceeds) the
+          elected mode's relief (``rel_obs >= rel_elu - obs_margin``, with
+          ``p_elu = 1.0``), and sets ``self._last_use_obs`` [B] bool so policy
+          training can imitate the recorded action directly instead of a drifted
+          WM rollout.
 
         Returns ``(eos_elu [B, 6], p_elu [B])``, or ``(eos_elu, p_elu, v_ctx [B])``
         when ``return_value=True``, where ``v_ctx = sum_k probs_k * relief(mu_k)``
@@ -1523,12 +1627,52 @@ class Brain:
         p_elu = probs[b_idx, elu]                                         # [B]
         if eos_observed is not None:
             rel_obs = relief_score(eos_observed)
-            use_obs = rel_obs > relief[b_idx, elu]
+            use_obs = rel_obs >= (relief[b_idx, elu] - float(obs_margin))
             eos_elu = torch.where(use_obs.unsqueeze(1), eos_observed, eos_elu)
             p_elu = torch.where(use_obs, torch.ones_like(p_elu), p_elu)
+            self._last_use_obs = use_obs
+        else:
+            self._last_use_obs = torch.zeros(B, dtype=torch.bool, device=device)
         if return_value:
             return eos_elu, p_elu, v_ctx
         return eos_elu, p_elu
+
+    @torch.inference_mode()
+    def eos_situation_stats(self, sequences=None, chunk: int = 128) -> dict:
+        """Diagnostic du goulot de situation sur des séquences enregistrées
+        (coreset par défaut) : code de situation de chaque séquence, nombre de
+        codes utilisés, perplexité de leur usage, entropie moyenne des poids π
+        du MDN, et fraction de séquences où l'élu == µ (mode le plus probable).
+        Returns a dict (``codes`` = liste par séquence, -1 sans VQ)."""
+        seqs = list(self.buffer._coreset if sequences is None else sequences)
+        out = {"n": len(seqs), "codes": [], "codes_used": 0, "perplexity": 0.0,
+               "pi_entropy": 0.0, "elu_eq_mu": 0.0}
+        if not seqs:
+            return out
+        codes, ent, same = [], [], []
+        for start in range(0, len(seqs), chunk):
+            vals = self._batch_tensors(seqs[start:start + chunk])
+            ctx = vals[:, :self.ctx_len]
+            logits_pi, mu, _ = self._denouement_dist(ctx)
+            vq = self.world.last_vq
+            codes.append(vq[1].clone() if vq is not None
+                         else torch.full((ctx.shape[0],), -1, device=ctx.device))
+            p = torch.softmax(logits_pi, dim=-1)
+            ent.append(-(p * torch.log(p.clamp(min=1e-12))).sum(dim=-1))
+            elu, _ = self.sample_denouements(ctx)
+            mu_best = self.predict_denouement(ctx)
+            same.append(((elu - mu_best).abs().max(dim=1).values < 1e-6).float())
+        self.world.last_vq = None
+        c = torch.cat(codes)
+        out["codes"] = c.tolist()
+        out["pi_entropy"] = float(torch.cat(ent).mean())
+        out["elu_eq_mu"] = float(torch.cat(same).mean())
+        if self.world.eos_vq_codes > 0:
+            hist = torch.bincount(c, minlength=self.world.eos_vq_codes).float()
+            q = hist / hist.sum()
+            out["codes_used"] = int((hist > 0).sum())
+            out["perplexity"] = float(torch.exp(-(q * torch.log(q.clamp(min=1e-12))).sum()))
+        return out
 
     @torch.inference_mode()
     def generate_from_denouement(self, ctx: torch.Tensor,
@@ -1640,7 +1784,9 @@ class Brain:
             seqs = self.buffer.sample(batch)
             if not seqs:
                 break
-            loss = self._policy_step(seqs, step, steps)
+            tags = getattr(self.buffer, "last_sample_tags", [])
+            seq_tag = tags[0] if tags else ""
+            loss = self._policy_step(seqs, step, steps, seq_tag=seq_tag)
             losses.append(loss)
             yield "pol", loss
             if self._skip_phase:
@@ -1648,7 +1794,8 @@ class Brain:
                 break
         self.last_pol_loss = sum(losses) / len(losses) if losses else float("nan")
 
-    def _policy_step(self, sequences, step_idx: int, total_steps: int) -> float:
+    def _policy_step(self, sequences, step_idx: int, total_steps: int,
+                     seq_tag: str = "") -> float:
         B = len(sequences)
         device = self.device
         vals = self._batch_tensors(sequences)
@@ -1662,19 +1809,40 @@ class Brain:
             scalars_inf = self._policy_scalars_batch(ctx[:, -STATE_TOKENS:])
             pol_in_inf = torch.cat([scalars_inf, latent_inf], dim=1)
             pol_action = self.policy(pol_in_inf)                 # [B, 5]
+            self._last_use_obs = None
             eos_elu_inf, p_elu_inf, v_ctx_inf = self.sample_denouements(
                 ctx, eos_observed=eos_obs, return_value=True)
-            gen_inf = self.generate_from_denouement(ctx, eos_elu_inf)
-            gen_action_inf = gen_inf["action"]
-            gen_full_0 = gen_inf["full"][0].tolist()
+            use_obs = (self._last_use_obs if self._last_use_obs is not None
+                       else torch.zeros(B, dtype=torch.bool, device=device))
+            a_real_inf = self._decode_action_batch(
+                vals[:, self.action_pos:self.action_pos + ACTION_TOKENS])  # [B, 5]
+            # Rollout WM uniquement sur les séquences où un meilleur dénouement
+            # a été élu (~use_obs), plus l'index 0 pour la vignette Dream Theater.
+            need_gen = ~use_obs
+            need_gen_ui = need_gen.clone()
+            need_gen_ui[0] = True
+            gen_idx = need_gen_ui.nonzero(as_tuple=True)[0]
+            gen_sub = self.generate_from_denouement(ctx[gen_idx], eos_elu_inf[gen_idx])
+            a_wm_sub = self._decode_action_batch(gen_sub["action"])
+            a_star_inf = a_real_inf.clone()
+            # Remplacer par l'action imaginée WM uniquement là où ~use_obs
+            wm_mask_in_sub = need_gen[gen_idx]
+            if wm_mask_in_sub.any():
+                a_star_inf[gen_idx[wm_mask_in_sub]] = a_wm_sub[wm_mask_in_sub]
+            gen_full_0 = gen_sub["full"][0].tolist()
         # clone hors du bloc inference_mode : tensors normaux, utilisables en autograd
         latent = latent_inf.clone()
         scalars = scalars_inf.clone()
         pol_in = torch.cat([scalars, latent], dim=1)
         eos_elu = eos_elu_inf.clone()
-        a_star = self._decode_action_batch(gen_action_inf.clone())   # [B, 5]
+        a_star = a_star_inf.clone()                               # [B, 5]
         pred = self.policy(pol_in)
-        per_seq = ((pred - a_star) ** 2).mean(dim=1)             # [B]
+        # MSE en espace [0, 1] uniforme sur les 5 actionneurs : angles ([-1,1]
+        # -> [0,1]) et longueurs ([0,1]) ont exactement la même échelle et la
+        # même pente de gradient (évite le facteur 8x en défaveur de d_f/d_b).
+        pred_u = torch.where(self._act_signed, 0.5 * (pred + 1.0), pred)
+        star_u = torch.where(self._act_signed, 0.5 * (a_star + 1.0), a_star)
+        per_seq = ((pred_u - star_u) ** 2).mean(dim=1)           # [B]
         # RL offline par régression pondérée par l'avantage (AWR) :
         #   A = relief(élu) - V_MDN(ctx)
         # Permet d'apprendre aussi le maintien debout et l'évitement de chute
@@ -1689,15 +1857,21 @@ class Brain:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.opt_pol.step()
-        self.last_pol_stats = {"accepted": B, "total": B}
+        n_obs = int(use_obs.sum().item())
+        n_active = int((w > 0).sum().item())
+        self.last_pol_stats = {"accepted": n_active, "total": B, "obs": n_obs, "wm": B - n_obs}
         self.last_dream_record = self._build_dream_record(
-            sequences[0], ctx[:1], pol_action[:1], a_star[:1],
+            sequences[0], ctx[:1], pol_action[:1], a_wm_sub[:1],
             eos_obs[:1], eos_elu[:1], gen_full_0, float(p_elu_inf[0]), loss.item(),
-            step_idx, total_steps)
+            step_idx, total_steps,
+            used_obs=bool(use_obs[0].item()), awr_weight=float(w[0].item()),
+            seq_tag=seq_tag)
         return loss.item()
 
-    def _build_dream_record(self, seq, ctx, pol_action, a_star, eos_obs, eos_elu,
-                            gen_full_0, p_elu, loss_val, step_idx, total_steps) -> DreamRecord:
+    def _build_dream_record(self, seq, ctx, pol_action, a_wm, eos_obs, eos_elu,
+                            gen_full_0, p_elu, loss_val, step_idx, total_steps,
+                            used_obs: bool = False, awr_weight: float = 1.0,
+                            seq_tag: str = "") -> DreamRecord:
         """Dream Theater record for the refonte policy step: lived sequence
         (rebuilt temporal window), context steps, and the WM-generated
         consequence + decision action under the elected dénouement."""
@@ -1728,37 +1902,46 @@ class Brain:
             [seq[self.action_pos:self.action_pos + ACTION_TOKENS]],
             dtype=torch.float32, device=device))[0].tolist()
         gen_window = sequence_to_window(gen_full_0, n_ctx=n_ctx, seq_steps=self.seq_steps)
-        predicted_steps = context_steps[:n_ctx] + [
-            DreamStep(state_tokens=[list(t) for t in salve[:STATE_TOKENS]],
-                      action=None, step_cost=salve_cost(salve), label=f"s{k} (imagined)")
-            for k, salve in enumerate(gen_window[n_ctx + 1:], start=n_ctx + 1)]
-        predicted_steps.append(DreamStep(
-            state_tokens=context_steps[-1].state_tokens,
-            action=a_star[0].tolist(), label="a* (generated)"))
+        # Même alignement colonne-à-colonne que lived_steps : s0..s{n_ctx-1},
+        # s{n_ctx}+a_wm (à l'emplacement n_ctx), puis s{n_ctx+1}..s{seq_steps} (imaginés).
+        predicted_steps = (
+            context_steps[:n_ctx]
+            + [DreamStep(state_tokens=context_steps[-1].state_tokens,
+                         action=a_wm[0].tolist(), label=f"s{n_ctx}+a*")]
+            + [DreamStep(state_tokens=[list(t) for t in salve[:STATE_TOKENS]],
+                         action=None, step_cost=salve_cost(salve), label=f"s{k} (imagined)")
+               for k, salve in enumerate(gen_window[n_ctx + 1:], start=n_ctx + 1)]
+        )
+        is_active = awr_weight > 0.0
+        wm_won = is_active and not used_obs
         return DreamRecord(
             step_idx=step_idx,
             total_steps=total_steps,
             loss=loss_val,
             facing=1,
             context_steps=context_steps,
-            candidate_actions=[pol_action[0].tolist(), a_star[0].tolist()],
+            candidate_actions=[pol_action[0].tolist(), a_wm[0].tolist()],
             real_action=real_action,
             trajectories=[
                 DreamTrajectory(candidate_idx=0, regime_idx=0, regime_name="Policy",
                                 steps=[], is_best_future=False, is_winner=False,
                                 eos_pred=None),
-                DreamTrajectory(candidate_idx=1, regime_idx=0, regime_name="Elected outcome",
-                                steps=predicted_steps[n_ctx:], is_best_future=True,
-                                is_winner=True,
+                DreamTrajectory(candidate_idx=1, regime_idx=0,
+                                regime_name="Elected outcome",
+                                steps=predicted_steps[n_ctx + 1:], is_best_future=wm_won,
+                                is_winner=wm_won,
                                 eos_pred=eos_elu[0].tolist()),
             ],
-            best_candidate_idx=1,
+            best_candidate_idx=1 if wm_won else -1,
             best_future_indices=[0, 0],
-            candidate_names=["0: POLICY", "1: ELECTED"],
+            candidate_names=["0: POLICY", "1: WM HINDSIGHT"],
             eos_forced=eos_elu[0].tolist(),
             lived_steps=lived_steps,
             predicted_steps=predicted_steps,
             eos_realized=eos_obs[0].tolist(),
+            used_obs=used_obs,
+            awr_weight=awr_weight,
+            seq_tag=seq_tag,
         )
 
     # --- sleep cycle -------------------------------------------------------------
@@ -1789,21 +1972,27 @@ class Brain:
             eps=dedup_eps, embed_fn=dedup_embed, device=self.device)
         d_core = self.buffer.deduplicate_against_coreset(
             eps=dedup_eps, embed_fn=dedup_embed, device=self.device)
+        add_kept = len(self.buffer._addendum)
+        total_after = coreset_before + add_kept
+        evicted_est = max(0, total_after - self.buffer.pool_capacity)
+        coreset_after_est = total_after - evicted_est
         self.sleep_cycle_stats = {
             "coreset_before": coreset_before,
             "wake": n_wake,
             "dedup_mode": "latent" if wm_converged else "geom",
             "dedup_intra": d_intra,
             "dedup_coreset": d_core,
-            "addendum_kept": len(self.buffer._addendum),
-            "evicted": 0,
-            "coreset_after": None,
+            "addendum_kept": add_kept,
+            "evicted": evicted_est,
+            "coreset_after": coreset_after_est,
         }
         yield "prune", {
             "pruned": 0,
             "coreset": self.buffer.coreset_size,
+            "dedup_mode": self.sleep_cycle_stats["dedup_mode"],
             "dedup_intra": d_intra,
             "dedup_coreset": d_core,
+            "addendum_kept": len(self.buffer._addendum),
         }
 
         has_coreset = self.buffer.coreset_size > 0
@@ -1874,12 +2063,30 @@ class Brain:
         }
 
     def load_state_dict(self, sd):
-        self.world.load_state_dict(sd["world"])
+        self.load_world_state(sd["world"])
         self.policy.load_state_dict(sd["policy"])
+
+    def load_world_state(self, sd: dict) -> bool:
+        """Charge les poids du WM en tolérant un changement de la tête EOS
+        (goulot de situation VQ ajouté/retiré, dimensions MDN) : les clés
+        absentes ou de forme différente gardent leur initialisation, le reste
+        (tronc transformer, head des tokens) est restauré. Returns True si le
+        checkpoint correspond exactement (l'état Adam est alors réutilisable)."""
+        own = self.world.state_dict()
+        keep = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+        skipped = sorted(set(sd) - set(keep))
+        missing = sorted(set(own) - set(keep))
+        self.world.load_state_dict(keep, strict=False)
+        if skipped or missing:
+            print(f"[warning] WM checkpoint: EOS head re-initialized "
+                  f"({len(missing)} params missing/reshaped) — retrain the WM")
+            return False
+        return True
 
     def save_checkpoint(self, wm_path: str, pol_path: str, buf_path: str | None = None) -> None:
         torch.save({"world": self.world.state_dict(),
-                    "opt_wm": self.opt_wm.state_dict()}, wm_path)
+                    "opt_wm": self.opt_wm.state_dict(),
+                    "last_wm_loss": self.last_wm_loss}, wm_path)
         torch.save({"policy": self.policy.state_dict(),
                     "opt_pol": self.opt_pol.state_dict()}, pol_path)
         if buf_path is not None:
@@ -1889,9 +2096,13 @@ class Brain:
         if not os.path.exists(wm_path) or not os.path.exists(pol_path):
             raise FileNotFoundError("missing WM or policy checkpoint — run with --reset")
         wm = torch.load(wm_path, weights_only=False)
-        self.world.load_state_dict(wm["world"])
-        if "opt_wm" in wm:
+        exact = self.load_world_state(wm["world"])
+        if exact and "opt_wm" in wm:
             self.opt_wm.load_state_dict(wm["opt_wm"])
+        if exact and "last_wm_loss" in wm:
+            self.last_wm_loss = float(wm["last_wm_loss"])
+        else:
+            self.last_wm_loss = float("nan")
         pol = torch.load(pol_path, weights_only=False)
         self.policy.load_state_dict(pol["policy"])
         if "opt_pol" in pol:

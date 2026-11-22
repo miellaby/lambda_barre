@@ -1,11 +1,13 @@
-# Revue critique — Gemini (`Revue_gemini.md`)
+# Revue AGY
+
+## Revue critique — Gemini
 
 Journal de revue des problèmes signalés lors de l'audit du projet.
 Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis la décision retenue est consignée ici.
 
-## Todolist de revue
+### Todolist de revue
 
-### Apprentissage, mathématiques et signal de renforcement
+#### Apprentissage, mathématiques et signal de renforcement
 
 - [x] Signe du canal `confort` inversé dans le token dénouement (`brain.py:240`)
 - [x] Asymétrie de `relief_score` (max flou $L_8$ vers `1.0`) (`brain.py:330-344`)
@@ -15,7 +17,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 - [x] Codebook EOS réinitialisé/permuté à chaque phase WM et lignes `M..31` aléatoires (`brain.py:1031-1070`)
 - [x] `build_ctx_input_scale` neutralisé en attention par `norm_first=True` mais présent dans le flux résiduel (`models.py:136-161`)
 
-### Outils, buffer d'expérience et configuration
+#### Outils, buffer d'expérience et configuration
 
 - [x] `wm_manager.py` : `brain.buffer` reste vide (`[S]` ne fait rien, `[W]` ignore le coreset) (`wm_manager.py:268-281`)
 - [x] `wm_theater.py` : `rollout_record` n'appelle pas `brain.world.eval()` avant `cache_forward` (`wm_theater.py:181-212`)
@@ -25,9 +27,9 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-## Détail des points et journal des décisions
+### Détail des points et journal des décisions
 
-### Signe du canal `confort` inversé dans le token dénouement
+#### Signe du canal `confort` inversé dans le token dénouement
 
 - **Références** : `proprio.py:266-269`, `tokenize.py:116`, `tokenize.py:169-172`, `brain.py:239-249`
 - **Constat avancé** :
@@ -45,7 +47,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Asymétrie de `relief_score` (max flou $L_8$)
+#### Asymétrie de `relief_score` (max flou $L_8$)
 
 - **Références** : `brain.py:330-344`, `brain.py:1269-1279`, `brain.py:1428-1429`
 - **Constat avancé** :
@@ -62,7 +64,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Mismatch éveil vs entraînement dans `Brain._wm_forward`
+#### Mismatch éveil vs entraînement dans `Brain._wm_forward`
 
 - **Références** : `brain.py:810-818` vs `brain.py:1407-1411`
 - **Constat avancé** :
@@ -78,7 +80,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### `latent_norm` exécuté sous `torch.inference_mode()` et jamais entraîné
+#### `latent_norm` exécuté sous `torch.inference_mode()` et jamais entraîné
 
 - **Références** : `brain.py:714-718`, `brain.py:1406-1420`
 - **Constat avancé** :
@@ -93,7 +95,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Probabilités faussées dans `sample_denouements`
+#### Probabilités faussées dans `sample_denouements`
 
 - **Références** : `brain.py:1240-1282`, `test_brain.py:246-258`
 - **Constat avancé** :
@@ -110,7 +112,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Codebook EOS réinitialisé/permuté à chaque phase WM et lignes aléatoires
+#### Codebook EOS réinitialisé/permuté à chaque phase WM et lignes aléatoires
 
 - **Références** : `models.py:242-244`, `brain.py:998-1002`, `brain.py:1031-1054`, `brain.py:1070`, `brain.py:1541-1555`
 - **Constat avancé** :
@@ -130,7 +132,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### `build_ctx_input_scale` dans un Transformer `norm_first=True`
+#### `build_ctx_input_scale` dans un Transformer `norm_first=True`
 
 - **Références** : `models.py:136-161`, `models.py:231`, `models.py:317-326`, `models.py:428-441`
 - **Constat avancé** :
@@ -146,7 +148,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### `wm_manager.py` : `brain.buffer` vide (`[S]` et `[W]`)
+#### `wm_manager.py` : `brain.buffer` vide (`[S]` et `[W]`)
 
 - **Références** : `wm_manager.py:75-85`, `wm_manager.py:268-281`, `brain.py:1064-1070`
 - **Constat avancé** :
@@ -162,7 +164,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### `rollout_record` sans `brain.world.eval()` avant `cache_forward`
+#### `rollout_record` sans `brain.world.eval()` avant `cache_forward`
 
 - **Références** : `wm_theater.py:181-212`, `wm_manager.py:67`, `models.py:420-421`
 - **Constat avancé** :
@@ -177,7 +179,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Longueur de fenêtre `lookahead` incohérente dans `ExperienceBuffer` et `Brain.record`
+#### Longueur de fenêtre `lookahead` incohérente dans `ExperienceBuffer` et `Brain.record`
 
 - **Références** : `brain.py:445-507`, `brain.py:604-650`, `brain.py:891`
 - **Constat avancé** :
@@ -194,7 +196,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### Paramètres désynchronisés entre `config.toml`, `config.py`, `dataset.py` et `dream_theater.py`
+#### Paramètres désynchronisés entre `config.toml`, `config.py`, `dataset.py` et `dream_theater.py`
 
 - **Références** : `config.toml:22-48`, `config.py:41-95`, `dataset.py:205-212`, `dream_theater.py:84-102`, `dream_theater.py:137-140`
 - **Constat avancé** :
@@ -213,7 +215,7 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 
 ---
 
-### `_build_dream_record` affiche la fenêtre réelle sous le label `(imaginé)`
+#### `_build_dream_record` affiche la fenêtre réelle sous le label `(imaginé)`
 
 - **Références** : `brain.py:1416`, `brain.py:1436-1439`, `brain.py:1473-1476`
 - **Constat avancé** :
@@ -224,3 +226,127 @@ Chaque point doit être discuté pour confirmer ou infirmer le diagnostic, puis 
 - **Discussion** : la génération est déjà calculée dans `_policy_step`, il suffit d'utiliser `gen["full"][0]` via `sequence_to_window` à coût nul.
 - **Décision** :
   - Passer `gen["full"][:1]` de `_policy_step` à `_build_dream_record` et construire `predicted_steps` à partir de `sequence_to_window(...)` (vrais états imaginés par le WM), avec labels UI en anglais.
+
+---
+
+## Revue Claude — goulot de situation (VQ) devant la tête EOS
+
+### Constat
+
+Dans le WM Manager, le **dénouement le plus probable (µ)** et le **dénouement
+élu** sont identiques dans 99.9 % des séquences.
+
+La tête EOS de type MDN (*Mixture Density Network* : trois couches linéaires
+`eos_pi`, `eos_mu`, `eos_sigma` posées sur la row `eos_pos - 1` du
+transformer, entraînées par NLL) lit l'état caché complet du contexte. Cet état
+est assez précis pour reconnaître chaque séquence individuellement. Or chaque
+contexte réel est continu et quasiment unique dans le coreset, donc la NLL est
+minimale pour un **Dirac par séquence** : un seul mode prend π ≈ 1 et σ descend
+au plancher `eos_sigma_min`. Le noyau top-p ne contient alors que l'argmax, et
+l'élu égale µ.
+
+Effet secondaire sur la policy : `V_ctx ≈ relief(élu)`, donc l'avantage AWR est
+quasi nul.
+
+Le test 75/25 de la session du 2026-11-16 réussissait parce que les contextes
+y étaient **exactement** identiques. Sur données réelles, deux contextes de même
+situation diffèrent toujours un peu, et le transformer s'en sert.
+
+### Pistes écartées
+
+- **Cibles EOS par voisinage de contexte** (kNN, Nadaraya-Watson) : efficace mais
+  revient à un regroupement non neuronal, défini par une distance faite à la
+  main.
+- **Quantification des entrées brutes** : le contexte compte de l'ordre du
+  millier de valeurs ; deux contextes ne deviennent identiques que si toutes
+  tombent dans la même case. Seules les phases immobiles fusionneraient, et le
+  regroupement serait arbitraire près des seuils.
+- **Plancher σ plus haut, pénalité d'entropie sur π** : masquent le symptôme sans
+  regrouper.
+- **Bruit fort sur le contexte** : regroupement flou et non contrôlé.
+
+### Décision : goulot de situation discret (VQ)
+
+La tête MDN ne lit plus l'état caché, mais un **code de situation** choisi parmi
+N codes appris :
+
+```
+row eos_pos-1 (d_model) → réencodeur MLP → z_e (D) → code le plus proche e_k → tête MDN → (π, µ, σ)
+```
+
+- **réencodeur** : `Linear(d_model, d_model) → GELU → Linear(d_model, D) → LayerNorm`
+  (variance unitaire, empêche la dérive d'échelle de `commit`) ;
+- **VQ** (*Vector Quantization*, façon VQ-VAE) : `k = argmin ‖z_e − e_k‖`, valeur
+  transmise `e_k`, gradient transmis à `z_e` par straight-through
+  (`z_q = z_e + (e_k − z_e).detach()`) ;
+- **tête MDN non linéaire** : `eos_mdn_mlp : Linear(D, d_model) → GELU` avant
+  `eos_pi`, `eos_mu`, `eos_sigma` (évite la dépendance linéaire entre `N > D`
+  codes qui créait des modes fantômes d'un code à l'autre) ;
+- **critère auxiliaire d'action de décision** : `eos_vq_act_head : MLP(e_k, EOS) → a_{n_ctx}`
+  (MSE sur les 5 scalaires normalisés, poids `eos_vq_act_w`). Deux contextes de
+  même EOS (`0.5`) mais d'actions différentes (debout immobile vs couché
+  immobile) sont forcés dans des codes distincts ; à l'inférence, aucune action
+  n'est requise en entrée ;
+- **codebook** mis à jour par moyenne mobile (EMA, comptes lissés de Laplace),
+  initialisé paresseusement sur le premier batch d'entraînement ; un code mort
+  (usage EMA < 1 % de l'usage moyen) est réinitialisé sur un encodage du batch ;
+- **perte d'engagement** `eos_vq_beta · ‖z_e − sg[e_k]‖²`, ajoutée à la NLL sous
+  le même poids `eos_nll_w`. L'optimiseur rétropropage la loss totale, tandis
+  que `_train_wm_batch` renvoie la **MSE masquée pure** (`wm_target_loss`,
+  plateau et déduplication latente ne sont plus bloqués par le plancher
+  entropique du MDN).
+
+Garantie structurelle : la tête MDN ne peut produire que **N distributions
+distinctes**. Toutes les séquences d'un même code partagent une seule
+distribution P(EOS | situation), qui devient multimodale si leurs dénouements
+divergent. Le réencodeur apprend lui-même quelles différences de contexte
+ignorer : le critère de regroupement est « même avenir », pas « même
+apparence ».
+
+Hors périmètre, inchangés : la prédiction de la conséquence inversée et de
+l'action de décision (contexte complet + infusion `eos_cond_proj`), le token
+dénouement, le layout, l'élection (top-p, `eos_min_p`, relief), la policy.
+
+### Réglages (`[training]` de config.toml)
+
+| Clé | Défaut | Rôle |
+| :--- | :--- | :--- |
+| `eos_vq_codes` | 32 | Nombre de situations N (~30–60 séquences/code). **0 = goulot désactivé**. |
+| `eos_vq_dim` | 8 | Dimension D d'un code. |
+| `eos_vq_beta` | 0.25 | Poids de la perte d'engagement. |
+| `eos_vq_decay` | 0.99 | Décroissance EMA du codebook. |
+| `eos_vq_act_w` | 1.0 | Poids de la loss auxiliaire `(code VQ, EOS) → a_{n_ctx}`. |
+| `eos_min_p` | 0.10 | Plancher de probabilité d'un mode éligible (élimine les modes fantômes à 3–6 %). |
+
+Avec le coreset actuel (1815 séquences), N = 16 donne en moyenne ~110
+séquences par situation. Monter N affine les situations ; le baisser élargit
+les groupes.
+
+### Implémentation
+
+- `models.py` : `WorldModel(eos_vq_codes, eos_vq_dim, eos_vq_decay)`,
+  `_eos_situation` (réencodeur + quantification), `vq_ema_update`, `_eos_mdn`
+  lit le code et dépose `last_vq = (z_e, idx)`.
+- `brain.py` : perte d'engagement dans `_wm_loss_impl`, mise à jour EMA après
+  chaque pas d'optimiseur dans `_train_wm_batch`, diagnostic
+  `eos_situation_stats(seqs)` (code par séquence, codes utilisés, perplexité,
+  entropie moyenne de π, fraction élu == µ), chargement tolérant
+  `load_world_state` (tronc restauré, tête EOS réinitialisée si sa forme a
+  changé, état Adam ignoré dans ce cas).
+- `wm_manager.py`, `wm_theater.py` : chargement via `load_world_state`.
+- `config.py`, `config.toml`, `config.example.toml` : quatre clés `eos_vq_*`.
+
+### Conséquences
+
+- `wm_ckpt.pt` : le tronc est conservé, la tête EOS repart de zéro → réentraîner
+  le WM (touche [S] du WM Manager).
+- `buf_ckpt.pt` et `pol_ckpt.pt` inchangés.
+
+### Suites possibles
+
+- Afficher l'identifiant de situation de chaque séquence dans le WM Manager.
+- NLL EOS sur des séquences mises de côté (non entraînées) pour mesurer le
+  surapprentissage restant.
+- Si l'on veut conditionner la conséquence par la situation : infuser `e_k`
+  comme `eos_cond_proj` (sans nouveau token), ou token de situation dédié avec
+  ligne de masque isolée (sinon fuite du contexte par l'attention).

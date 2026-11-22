@@ -21,7 +21,7 @@ from .tokenize import (_BY_KEY, _denormalize, SIG_OFFSET, _EOS_CHANNEL_W,
 
 def _eos_scalar(vals: list[float]) -> float:
     """Scalarize an EOS slot list as the channel-hierarchy-weighted deviation
-    from neutral (0.5): negative = recovery, positive = worsening."""
+    from neutral (0.5): positive = recovery/improvement, negative = worsening."""
     w = _EOS_CHANNEL_W[:len(vals)]
     return sum(a * b for a, b in zip(w, vals)) / sum(w) - 0.5
 
@@ -87,6 +87,9 @@ class DreamRecord:
     predicted_steps: list[DreamStep] | None = None     # real s0..s{n_ctx-1} + hindsight a_dec + imagined futur
     eos_realized: list[float] | None = None           # realized denouement delta of the lived sequence
     real_action: list[float] | None = None            # recorded a_{n_ctx} of the lived sequence (decision row)
+    used_obs: bool = False                            # True when observed rule (rel_obs >= rel_elu - margin) kept a_real
+    awr_weight: float = 1.0                           # AWR training weight of this sequence (0 = skipped)
+    seq_tag: str = ""                                 # Coreset/addendum sequence identifier (e.g. "#211", "add #3")
 
 
 def decode_state_tokens(st_toks: list[list[float]], facing: int = 1) -> dict:
@@ -575,7 +578,7 @@ class DreamTheater:
 
         # Hindsight forcing target of the selected step (EOS-lookahead policy training)
         if rec.eos_forced is not None:
-            eos_txt = (f"Hindsight EOS forced (delta, - = recovery): "
+            eos_txt = (f"Hindsight EOS forced (delta, + = recovery): "
                        f"{_eos_scalar(rec.eos_forced):+.2f}")
             s_eos = font_small.render(eos_txt, FONT_AA, TEXT_ACCENT)
             screen.blit(s_eos, (16 + s_title.get_width() + 24, 9))
@@ -656,21 +659,19 @@ class DreamTheater:
 
         # --- Sleep actif : barre de progression + stats ---
         phase_labels = {
-            "meta":   "Sequence metadata",
-            "prune":  "Pruning & deduplication",
-            "filter": "Surprise filter",
-            "wm":     "World Model training",
+            "prune":       "Dataset deduplication",
+            "wm":          "World Model training",
             "wm_coreset":  "WM training — Coreset",
-            "wm_addendum": "WM training — Addendum",
-            "pol":    "Policy training (hindsight)",
-            "done":   "Sleep cycle complete",
+            "wm_addendum": "WM training — Addendum (50/50 replay)",
+            "pol":         "Policy training (AWR advantage)",
+            "done":        "Sleep cycle complete",
         }
         phase_label = phase_labels.get(self.sleep_phase, self.sleep_phase or "Sleep cycle")
         title_str = f"Sleep Cycle — {phase_label}"
         s_title = font.render(title_str, FONT_AA, TEXT_WHITE)
         screen.blit(s_title, (16, 16))
 
-        cw, ch = 560, 260
+        cw, ch = 580, 286
         cx = (self.width - cw) // 2
         cy = (self.height - ch) // 2
         card_rect = pygame.Rect(cx, cy, cw, ch)
@@ -707,32 +708,42 @@ class DreamTheater:
         if brain is not None:
             cycle = getattr(brain, "sleep_cycle_stats", {})
             c_before = cycle.get("coreset_before", getattr(brain.buffer, "coreset_size", 0))
+            pool_cap = getattr(brain.buffer, "pool_capacity", 0)
             n_wake = cycle.get("wake", 0)
-            n_prune = cycle.get("pruned", 0)
-            add_raw = cycle.get("addendum_initial", n_wake + n_prune)
+            dedup_mode = cycle.get("dedup_mode", "geom")
+            mode_label = ("full-sequence latent" if dedup_mode == "latent"
+                          else "full-sequence geometric")
             d_intra = cycle.get("dedup_intra", 0)
             d_cross = cycle.get("dedup_coreset", 0)
-            n_refresh = cycle.get("refreshed", 0)
-            f_dropped = cycle.get("filter_dropped", None)
+            add_kept = cycle.get("addendum_kept", max(0, n_wake - d_intra - d_cross))
+            evicted = cycle.get("evicted", 0)
             c_after = cycle.get("coreset_after", None)
 
-            c_after_str = str(c_after) if c_after is not None else f"{brain.buffer.coreset_size} (in progress)"
-            f_drop_str = f"-{f_dropped}" if f_dropped is not None else "-- (in progress)"
+            cap_str = f" / {pool_cap}" if pool_cap else ""
+            evict_str = f"-{evicted}" if evicted > 0 else "0"
+            c_after_str = (f"{c_after}{cap_str}" if c_after is not None
+                           else f"{brain.buffer.coreset_size}{cap_str}")
 
-            print_lines.append((f"  - Coreset before sleep           : {c_before}", TEXT_WHITE))
-            print_lines.append((f"  - New experiences                : +{n_wake}", TEXT_ACCENT))
-            print_lines.append((f"  - Memories revisited (forgetting): +{n_prune}", TEXT_ACCENT))
-            print_lines.append((f"  - Raw addendum                   : {add_raw}", TEXT_WHITE))
-            print_lines.append((f"  - Intra-addendum duplicates      : -{d_intra}", TEXT_MUTED))
-            print_lines.append((f"  - Addendum/coreset duplicates    : -{d_cross} ({n_refresh} refreshed)", TEXT_MUTED))
-            print_lines.append((f"  - Familiar sequences dropped     : {f_drop_str}", TEXT_MUTED))
-            print_lines.append((f"  - Coreset after sleep            : {c_after_str}", WINNER_BORDER if c_after is not None else TEXT_WHITE))
+            print_lines.append((f"  - Coreset before sleep         : {c_before}{cap_str}", TEXT_WHITE))
+            print_lines.append((f"  - New wake experiences         : +{n_wake}", TEXT_ACCENT))
+            print_lines.append((f"  - Deduplication mode           : {mode_label}", TEXT_WHITE))
+            print_lines.append((f"  - Intra-addendum duplicates    : -{d_intra}", TEXT_MUTED))
+            print_lines.append((f"  - Coreset duplicates refreshed : -{d_cross}", TEXT_MUTED))
+            print_lines.append((f"  - Addendum kept for training   : {add_kept}", TEXT_WHITE))
+            print_lines.append((f"  - Density eviction (commit)    : {evict_str}", TEXT_MUTED))
+            print_lines.append((f"  - Coreset after sleep          : {c_after_str}", WINNER_BORDER if c_after is not None else TEXT_WHITE))
+
+            wm_mse = getattr(brain, "last_batch_mse", float("nan"))
+            wm_nll = getattr(brain, "last_batch_nll", float("nan"))
+            if not math.isnan(wm_mse):
+                nll_part = f"   nll {wm_nll:.3f}" if not math.isnan(wm_nll) else ""
+                print_lines.append((f"  - Last WM batch                : mse {wm_mse:.5f}{nll_part}", TEXT_ACCENT))
         else:
             print_lines.append(("  - Waiting for sleep cycle to start...", TEXT_MUTED))
 
         for idx, (s_line, s_col) in enumerate(print_lines):
             s_rend = font_small.render(s_line, FONT_AA, s_col)
-            screen.blit(s_rend, (cx + 36, cy + 76 + idx * 21))
+            screen.blit(s_rend, (cx + 30, cy + 74 + idx * 21))
 
         # Hint pause
         pause_hint = " [PAUSED — N: next step]" if self.is_paused else " [Running — Space: pause]"
@@ -873,7 +884,7 @@ class DreamTheater:
         y = self.header_h + 10
 
         # --- LIVED SEQUENCE row: the ground truth s0 -> s10 ---
-        label = "SEQ"
+        label = f"SEQ {rec.seq_tag}" if rec.seq_tag else "SEQ"
         if rec.eos_realized is not None:
             label += f"  EOS delta {_eos_scalar(rec.eos_realized):+.2f}"
         y = self._draw_seq_row(screen, rec, rec.lived_steps, label, y, font_small,
@@ -914,10 +925,14 @@ class DreamTheater:
         s_idx = font_small.render(f"step {self.hist_idx + 1}/{n}", FONT_AA, TEXT_WHITE)
         screen.blit(s_idx, (x + 4, 31))
 
-        # Acceptance of the selected step (hindsight supervision metric)
-        acc = f"accepted: {'yes' if traj_accepted(rec) else 'no'}"
-        s_acc = font_small.render(acc, FONT_AA,
-                                  BEST_BORDER if traj_accepted(rec) else TEXT_MUTED)
+        # Supervision target for the displayed step (observed a_real vs WM a*, or skipped when w=0)
+        if rec.awr_weight <= 0.0:
+            tgt_txt, tgt_col = "target: skipped (w=0)", TEXT_MUTED
+        elif rec.used_obs:
+            tgt_txt, tgt_col = f"target: REAL action (obs, w={rec.awr_weight:.2f})", BEST_BORDER
+        else:
+            tgt_txt, tgt_col = f"target: WM action (elected, w={rec.awr_weight:.2f})", WINNER_BORDER
+        s_acc = font_small.render(tgt_txt, FONT_AA, tgt_col)
         screen.blit(s_acc, (x + 4 + s_idx.get_width() + 24, 31))
 
         # Help hint on top-right
@@ -962,18 +977,26 @@ class DreamTheater:
         n_ctx = len(rec.context_steps) - 1
         s_dec = rec.context_steps[-1]
         x = 16
-        # 1. Real recorded a_dec
+        # 1. Real recorded a_dec (highlighted when observed rule kept a_real)
         if rec.real_action is not None:
+            real_won = (rec.awr_weight > 0.0) and rec.used_obs
             step = DreamStep(state_tokens=s_dec.state_tokens,
-                             action=rec.real_action, label=f"s{n_ctx}+a_dec reel")
+                             action=rec.real_action, label=f"s{n_ctx}+a_dec real")
             rect = pygame.Rect(x, y, self.thumb_w, self.thumb_h)
             draw_thumbnail(screen, rect, step, font_small, facing=rec.facing,
-                           cand_color=(200, 200, 210))
+                           cand_color=(200, 200, 210), is_winner=real_won)
             self._thumbs.append((rect, step))
             ax = x + self.thumb_w + 10
-            screen.blit(font_small.render("REAL a_dec", FONT_AA, TEXT_WHITE), (ax, y + 4))
+            r_lines = ["REAL a_dec"]
+            if rec.eos_realized is not None:
+                r_lines.append(f"Outcome {_eos_scalar(rec.eos_realized):+.2f}")
+            if real_won:
+                r_lines.append(f"TARGET (w={rec.awr_weight:.2f})")
+            for i, txt in enumerate(r_lines):
+                col = WINNER_BORDER if (i == 0 and real_won) else (TEXT_WHITE if i == 0 else TEXT_MUTED)
+                screen.blit(font_small.render(txt, FONT_AA, col), (ax, y + 4 + i * 16))
             x = ax + 150
-        # 2. WM hindsight suggestion, then policy (order: real, WM, policy)
+        # 2. WM hindsight suggestion (always the WM-generated action), then policy
         order = [1, 0] if len(rec.candidate_actions) >= 2 else [0]
         names = {0: "POLICY", 1: "WM HINDSIGHT"}
         for c_idx in order:
@@ -994,7 +1017,12 @@ class DreamTheater:
             if traj.eos_pred is not None:
                 lines.append(f"Outcome {_eos_scalar(traj.eos_pred):+.2f}")
             if is_hindsight:
-                lines.append("ACCEPTED" if traj.is_winner else "REJECTED")
+                if rec.awr_weight <= 0.0:
+                    lines.append("SKIPPED (w=0)")
+                elif rec.used_obs:
+                    lines.append("NOT USED (obs kept)")
+                else:
+                    lines.append(f"TARGET (w={rec.awr_weight:.2f})")
             col = WINNER_BORDER if traj.is_winner else CAND_COLORS[c_idx]
             for i, txt in enumerate(lines):
                 s = font_small.render(txt, FONT_AA, col if i == 0 else TEXT_MUTED)
@@ -1004,5 +1032,5 @@ class DreamTheater:
 
 
 def traj_accepted(rec: DreamRecord) -> bool:
-    """Whether the WM's hindsight action was accepted for learning in this step."""
-    return bool(rec.trajectories) and rec.trajectories[-1].is_winner
+    """Whether the displayed sequence contributed a non-zero AWR training weight."""
+    return rec.awr_weight > 0.0 and bool(rec.trajectories) and rec.trajectories[-1].is_winner

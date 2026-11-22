@@ -68,9 +68,9 @@ def hud(font, skel, fps, brain=None, auto=False, status=None, speed=1.0,
         ratio = getattr(brain, "wm_loss_ratio", float("nan"))
         if not math.isnan(ratio):
             pct = (ratio - 1.0) * 100.0
-            wm_str = f"{wm:.3f} ({pct:+.0f}%)"
+            wm_str = f"{wm:.4f} ({pct:+.0f}%)"
         else:
-            wm_str = f"{wm:.2f}"
+            wm_str = f"{wm:.4f}"
         dev = getattr(brain, "device_desc", str(brain.device))
         lines.append(f"dev {dev}")
         lines.append(
@@ -404,13 +404,12 @@ def run(headless: bool = False, steps: int = 0,
             try:
                 label, value = next(sleep_gen)
                 if label == "prune":
-                    d_intra = value.get('dedup_intra', 0)
-                    d_core = value.get('dedup_coreset', 0)
-                    status = f"pruned {value['pruned']} (coreset {value['coreset']} | duplicates: -{d_intra} intra, -{d_core} coreset)"
+                    d_intra = value.get("dedup_intra", 0)
+                    d_core = value.get("dedup_coreset", 0)
+                    d_mode = value.get("dedup_mode", "geom")
+                    status = (f"dedup ({d_mode}): -{d_intra} intra, -{d_core} coreset refreshed "
+                              f"(coreset {value['coreset']})")
                     dream_theater.set_sleep_progress("prune", 1, 1)
-                elif label == "meta":
-                    status = f"sequence metadata {value['done']}/{value['total']}"
-                    dream_theater.set_sleep_progress("meta", value['done'], value['total'])
                 elif label in ("wm", "wm_coreset", "wm_addendum"):
                     wm_step = getattr(brain, "sleep_wm_step", 0)
                     wm_total = getattr(brain, "sleep_wm_epochs", 0)
@@ -431,27 +430,29 @@ def run(headless: bool = False, steps: int = 0,
                     # refait tous les batchs, la progression continue au-delà du quota
                     g_total = wm_total * wB
                     g_step = (wm_step - 1) * wB + wb
-                    name = {"wm_addendum": "addendum", "wm_coreset": "coreset"}.get(label, "wm")
+                    name = {"wm_addendum": "addendum (50/50 replay)",
+                            "wm_coreset": "coreset"}.get(label, "wm")
                     status = (f"learning {name} epoch {ep_disp}/{wm_total}{ot_str} "
-                              f"batch {wb}/{wB} ({wn} seq, loss {value:.2f})")
+                              f"batch {wb}/{wB} ({wn} seq, mse {value:.4f})")
                     print(f"[modale] phase={label} ep={wm_step} quota={wm_total} batch={wb}/{wB} n={wn} "
-                          f"g_step={g_step} g_total={g_total} loss={value:.5f} "
+                          f"g_step={g_step} g_total={g_total} mse={value:.5f} "
+                          f"nll={getattr(brain, 'last_batch_nll', float('nan')):.3f} "
                           f"target={wm_target_loss} last_wm_loss={brain.last_wm_loss:.5f} "
                           f"ratio={getattr(brain, 'wm_loss_ratio', float('nan')):.3f} "
                           f"plateau={getattr(brain, 'wm_plateau', False)}")
                     dream_theater.set_sleep_progress(label if label != "wm" else "wm", g_step, g_total)
-                elif label == "filter":
-                    status = f"surprise filter: -{value['dropped']} known, {value['kept']} kept"
-                    dream_theater.set_sleep_progress("filter", 1, 1)
                 elif label == "pol":
                     pol_stats = getattr(brain, "last_pol_stats", None)
                     pol_step = getattr(brain, "sleep_pol_step", 0)
                     pol_total = getattr(brain, "sleep_pol_steps", 0)
                     if pol_stats is not None:
-                        status = (f"sleeping: pol {value:.2f} "
-                                  f"(hindsight {pol_stats['accepted']}/{pol_stats['total']} accepted)")
+                        obs_n = pol_stats.get("obs", 0)
+                        wm_n = pol_stats.get("wm", 0)
+                        status = (f"sleeping: pol {value:.4f} "
+                                  f"(AWR {pol_stats['accepted']}/{pol_stats['total']} active | "
+                                  f"{obs_n} obs, {wm_n} wm)")
                     else:
-                        status = f"sleeping: pol {value:.2f}"
+                        status = f"sleeping: pol {value:.4f}"
                     dream_theater.set_sleep_progress("pol", pol_step, pol_total)
                     if brain.last_dream_record is not None:
                         dream_theater.update(brain.last_dream_record)
@@ -462,10 +463,10 @@ def run(headless: bool = False, steps: int = 0,
                     dream_theater.set_sleep_progress("done", 1, 1)
                     brain.save_checkpoint(_WM_CKPT, _POL_CKPT, _BUF_CKPT)
                     print("[sleep]", stats)
-                    f_stats = getattr(brain, "last_filter_stats", None)
-                    drop_info = f" [dropped: {f_stats['dropped']}]" if f_stats and f_stats.get("dropped", 0) > 0 else ""
-                    status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{drop_info} "
-                              f"wm {stats['wm_loss']:.2f} pol {stats['pol_loss']:.2f}")
+                    evicted = stats.get("cycle", {}).get("evicted", 0)
+                    evict_info = f" [evicted: -{evicted}]" if evicted > 0 else ""
+                    status = (f"slept: coreset {stats.get('coreset_size', brain.buffer.coreset_size)}{evict_info} "
+                              f"wm {stats['wm_loss']:.4f} pol {stats['pol_loss']:.4f}")
             except StopIteration:
                 sleep_gen = None
                 dream_theater.sleep_active = False

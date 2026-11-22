@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from lambda_barre.body import LIMB_MAX, LIMB_MIN
+from lambda_barre.body import FACING_DEADZONE, LIMB_MAX, LIMB_MIN
 
 
 # --- dense token geometry -----------------------------------------------------
@@ -59,7 +59,7 @@ def _build_specs() -> dict[str, TokenSpec]:
         specs[key] = TokenSpec(key, code, first_val, last_val)
 
     # Proprioception (11)
-    add("tronc_angle",              "TA", -math.radians(15.0), math.radians(345.0))
+    add("tronc_angle",              "TA", -FACING_DEADZONE, math.pi + FACING_DEADZONE)
     add("membre_angle_avant",       "AA", -math.pi,            math.pi)
     add("membre_distance_avant",    "DA", 0.0,                 LIMB_MAX)
     add("force_actuateur_avant",    "FA", -2000.0,             2000.0)
