@@ -1,31 +1,22 @@
-# IDEAS.md — Idées implémentées dans λ̄
+# DECISIONS.md — Décisisions implémentées dans λ̄
 
-Une phrase simple par idée, organisées par domaine. Sources : historique des commits et sessions `session_*.md`.
+Une phrase simple par décision.
 
-## Architecture
-
-- Créature 2D dans environnement simulé
-- IA à 2 modèles : Un Transformer "Word Model" et un MLP "Politique".
+- λ̄  est un Animat apprenant dans un environnement 2D simulé.
+- 2D Vue de coté. Orientation de l'animat (sens de la marche et du regard) à droite ou à gauche. C'est le `facing`.
+- Simulation Pymunk avec ressorts, friction au sol et gravité. Des plateformes statiques et une balle rebondissante. Tick de simulation physique stable: 60 Hz.
+- Un actuateur pour chaque jambe (consignes d'angle et de longueur) et pour la queue (angle uniquement).
+- Les actuateurs suivent des valeurs effectives de consignes après lissage (50 % de l'écart résiduel par période policy).
+- Référentiel égocentré des angles de membres : positif vers l'extérieur, orienté vers la marche.
+- Retournement de l'orientation de l'animat: `facing` **flip**. Réorientation du référentiel. Réinitialisation du lisseur. Purge de l'historique WM. Reconstruction immédiate de la salve courante.
+- Une IA à 2 modèles : Un Transformer "Word Model" et un MLP "Politique".
 - Le World Model prédit soit le futur, soit la conséquence d'une action, soit une action par anticipation du dénouement.
 - La Politique décide la prochaine action
-- La politique est reliée au latent intermédiaire du WM.
-- Apprentissage continu obtenu par alternance entre éveil (inférence et enrichissement du dataset) et sommeil (apprentissage).
-- Mode auto : inférence des consignes par l'IA.
-- Mode manuel : pilotage manuel des consignes enregistrées comme données d'entraînement.
-- Boucle principale linéaire : physics step → smoother → facing-flip → sleep check → brain_tick → record_tick.
-
-## Corps & simulation physique
-
-- Animat 2D. Vue de coté orientée vers le sens de la marche et du regard, à droite ou à gauche (`facing`).
-- Simulation Pymunk avec ressorts, friction au sol et gravité. Des plateformes statiques et une balle rebondissante. Tick de simulation physique stable: 60 Hz.
-- Un Actuateur pour les jambes (consignes d'angle et de longueur) et un pour la queue (angle).
-- Lissage des consignes : la physique suit des valeurs effectives de consignes après lissage (50 % de l'écart résiduel par période policy).
-- Référentiel égocentré des angles de membres : positif vers l'extérieur, orienté vers la marche.
-- Retournement (`facing` **flip**) : Nouvelle orientation du référentiel. Réinitialisation du lisseur. Purge de l'historique WM. Reconstruction immédiate de la salve courante.
-- Accélération du temps réel de 0,25x à 8x.
-
-## Capteurs & signaux
-
+- La Politique prend en entrée le latent intermédiaire du WM.
+- Apprentissage continu obtenu par un cycle d'éveil (inférence et enrichissement du dataset) et de sommeil (apprentissage).
+- 2 Modes d'éveil. Mode auto / autonome : inférence des consignes par l'IA vs. Mode manuel / supervisé : L'utilisateur pilote manuellement les consignes de l'animat (l'enregistrement produit de nouvelles données d'entraînement).
+- Boucle principale de l'éveil : physics step → smoother → facing-flip → sleep check → brain_tick → record_tick.
+- L'animat perçoit par Proprioception, Extéroception, Intéroception.
 - Proprioception : angles, extensions, vitesses, forces d'actuateurs et contacts au sol.
 - Extéroception : vision en cône rétinien, flux optique sur les solides mobiles, toucher, audition et suivi de la balle.
 - Intéroception : la fatigue accumule l'effort. La souffrance accumule la douleur. Intégrateurs lents avec Récupération encore plus lente.
@@ -42,10 +33,6 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Enroulement continu de l'angle du tronc sur [-15°, 345°].
 - Actions encodées sans échelle physique, toujours dans l'intervalle [0,1] ; sigmoid en sortie de policy.
 - Normalisation de signaux (instabilité, vertige...) dans l'intervalle [0, 1) par saturation (raw / (raw + 1)) 
-
-
-## Tokenisation & mémoire vive
-
 - Salve dense de 16 tokens (13 états + 3 actions) produite à chaque tick du World Model. L'action répond à l'état.
 - Token dense de 29 flottants : type(1) + modalité one-hot(6, bit 6 dédié au dénouement EOS) + canal one-hot(6, ids réutilisés entre modalités) + 16 signaux. Le préfixe structurel n'est jamais prédit en rollout (copié des templates) ni appris (loss sur les 16 signaux seuls).
 - PE sinusoïdal non appris keyed by indice de salve (tous les tokens d'une salve partagent la position) ; le token EOS a un PE dédié `seq_steps+1` (hors fenêtre, token de synthèse). Dans la conséquence rétro-causale, les positions temporelles restent décroissantes (26→14).
@@ -54,18 +41,14 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Agencement causal dans la salve : perception → coûts → confort → intéroception, coupant tout raccourci intra-salve.
 - Séquence = fenêtre glissante de salves consécutives
 - `seq_steps` 26 salves par séquence, paramétrable. Les n_ctx premières salves de la séquence (hors décision) forment le contexte de décision. L'action à n_ctx est la décision. Les salves suivantes forment la fenêtre de conséquence.
-- Le token EOS siège à `eos_pos` (premier token après le contexte, remplaçant le token 12 de la dernière salve), modalité dédiée. Il porte le dénouement : intégrale par canal de l'écart au coût de la décision `r[j] = Σ_{k>d} eos_decay^(k−d)·(c[k][j]−c[d][j])·p_k`, dernier état `p_k = L−d` (prolongation fictive du coût final), `slot = 0.5 − 0.5·tanh(r)`.
+- Le token EOS siège à `eos_pos` (premier token après le contexte), modalité dédiée. Il porte le dénouement : intégrale par canal de l'écart au coût de la décision `r[j] = Σ_{k>d} eos_decay^(k−d)·(c[k][j]−c[d][j])·p_k`, dernier état `p_k = L−d` (prolongation fictive du coût final), `slot = 0.5 − 0.5·tanh(r)`.
 - Le taux de soulagement `sequence_relief` est un score basé sur le dénouement. >0 amélioration; <0 détérioration.
 - Journalisation linéaire des salves. Journal segmenté sur les discontinuités physiques (retournement, reset).
-
-## World Model
-
-- Transformer causal prédisant l'état et l'action suivants.
+- Le WM est un transformer causal prédisant l'état et l'action suivants.
 - Prédiction conjointe de la salve complète état + action (`predict_next_salve`).
 - Latent intermédiaire capturé par hook sur la couche médiane, normalisé par LayerNorm apprenable, et fourni à la policy.
-- Dans la phase d'éveil. Inférence WM basé sur un historique des 4 dernières salves vécues (taille du contexte pour l'apprentissage de la policy). L'historique est purgé quand nécessaire (`clear_history`).
+- Dans la phase d'éveil. Inférence WM basé sur un historique des dernières salves vécues (taille du contexte pour l'apprentissage de la policy). L'historique est purgé quand nécessaire (`clear_history`).
 - KV-cache incrémental pour l'inférence, invalidé à chaque mise à jour des poids.
-- Compilation optionnelle `torch.compile` du pas d'entraînement WM (graphe fusionné, passe arrière incluse).
 - Pondération de l'entraînement WM par l'impact de la séquence, c'est à dire abs(sequence_relief) + plancher: contraste recherché impact/neutre x3.
 - Boost ×16 du gradient sur les canaux de récompense et les slots EOS terminaux.
 - Passes d'entraînement WM par batch : chaque batch subit une passe causale ET une passe lookahead (plus d'alternance 1:1 par epoch).
@@ -78,11 +61,8 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - 5 epochs WM par sommeil = tout le dataset parcouru en batchs. Coreset trié. Addendum shufflé à chaque epoch.
 - Trois profils matériels configurables : CUDA accéléré, CPU portable, CPU rapide (MKL-DNN).
 - Masquage strict à zéro des slots de padding invalides dans les prédictions.
-
-## Policy
-
-- Policy MLP recevant les scalaires bruts et le latent du World Model.
-- Scalaires et latent recalculé à chaque tick policy plutôt qu'au dernier tick WM
+- La Policy est un MLP recevant les scalaires bruts et le latent du World Model.
+- Scalaires et latent Policy recalculé à chaque tick policy plutôt qu'au dernier tick WM
 - Espace de sortie normalisé (angles dans [-1, 1], extensions dans [0, 1]) séparé de la conversion physique.
 - MLP "moderne" : 256 neurones internes, activations ReLU, sortie tanh/sigmoid.
 - Entraînement par imitation : la policy apprend à reproduire une action obtenue par inférence du World Model
@@ -93,9 +73,6 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Bruit `act_std` sur la sortie policy
 - Synthèse des consignes par extremum entre deux ticks WM pour capturer l'intention réelle.
 - Politique gelée pendant le sommeil ; au réveil, le premier `brain_tick` produit un latent frais.
-
-## Mémoire à deux niveaux & cycle de sommeil
-
 - Coreset (mémoire long terme consolidée) + Addendum (mémoire court terme) + Journal (veille linéaire).
 - Chaque séquence porte des métadonnées : origin, vivacity, relief_score, learn_count, causal_score, lookahead_score, dissonance, surprise, latent (vecteur EOS), pol_relief_score.
 - Métadonnées calculées en début de sommeil: passes causale et lookahead ; passe politique ; passe causale post contexte+action politique.
@@ -121,13 +98,11 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - Éviction O(1) des salves les plus anciennes à saturation de capacité.
 - Extraction des fenêtres avec stride (actuellement 1)
 - En mode brain-off, décalage action/conséquence à l'enregistrement : paire (a_n ; s_{n-k}), k paramétrable (défaut 2) ; brain-on = k forcé à 0.
-
-## Interface
-
 - En mode supervisé: Pilotage manuel par manettes
 - Bascule du mode supervisé sans à-coup par synchronisation des manettes avec la policy.
 - Reset de la simulation sur commande
 - Sortie de la manette: continuité polaire avec saturation à ±(π − 10°) au lieu d'un wrap ±π.
+- Mode accélération du temps réel de 0,25x à 8x.
 - Mode headless (`SDL_VIDEODRIVER=dummy`) pour tests et génération de dataset.
 - Dream Theater : visualiseur des rollouts d'imagination pendant l'entraînement de la policy, avec storyboard hindsight et navigation PREV/NEXT/LIVE.
 - Dream Theater standalone : entry point `dream-theater` indépendant de la boucle principale.
@@ -139,16 +114,8 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - GUI standardisée : pas d'antialiasing, police monospace, fenêtre redimensionnable avec ratio, plein écran Alt+Entrée.
 - Enregistrement automatique en pause pendant le sommeil.
 - Mesure honnête des temps d'inférence : synchronisation device, EMA, cap à 2 threads CPU.
-
-## Configuration & outillage
-
-- Configuration TOML centralisée (`config.toml`) pour toutes les options structurelles (architecture, séquence, buffer, cadences).
-- Paramétrage de la longueur de séquence (`seq_steps`, `n_ctx`) et des cadences (`wm_hz`, `pol_hz`) via `compute_seq_layout` et fonctions dédiées.
-- Architecture du Brain entièrement paramétrable (d_model, nhead, layers, dim_ff, dropout, pol_hidden, capacités mémoire).
-- Suite de tests pytest end-to-end couvrant le pipeline complet.
+- Configuration TOML centralisée (`config.toml`) pour toutes les options structurelles
 - Dossier `.tmp/` gitignoré pour les scripts temporaires.
-- README en anglais, original français conservé dans `LISEZMOI.md`.
-- DESIGN.md avec les détails d'implémentation
 
 ## Idées abandonnées / en cours d'abandon
 
@@ -160,3 +127,5 @@ Une phrase simple par idée, organisées par domaine. Sources : historique des c
 - NON: quantification des signaux de token.
 - NON: entraînement REINFORCE de l'action inférée à partir du gain prédit par le WM
 - NON: Générateur de dataset d'amorçage headless (`--bootstrap-dataset`) avec auto-reset sur chute. Câblé dans le code (`main.py`, `dataset.py`) mais jamais testé et non voulu.
+- NON: Compilation optionnelle `torch.compile` du pas d'entraînement WM (graphe fusionné, passe arrière incluse).
+- Avant, le token EOS était le dernier token de la dernière salve. C'était un token terminal qui se subtituait au token 12 de salve.

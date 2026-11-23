@@ -8,13 +8,7 @@
 
 ## Contexte
 
-L'ancien WM apprenait deux choses en parallèle : la dynamique causale
-P(s(t+1)|s(t),a(t)) et l'inversion lookahead P(a4 | contexte, EOS). Le masque
-lookahead était un deuxième masque, la passe lookahead un deuxième forward, et
-le dénouement (EOS) était un token terminal calculé au batch time. Le diagnostic
-de la session 2026-11-13 montrait que la loss causale descendait sans refléter
-la logique du monde. La spec REFONTE.md acte un entraînement rétrotemporel
-unique.
+L'ancien WM apprenait deux choses en parallèle : la dynamique causale P(s(t+1)|s(t),a(t)) et l'inversion lookahead P(a4 | contexte, EOS). Le masque lookahead était un deuxième masque, la passe lookahead un deuxième forward, et le dénouement (EOS) était un token terminal calculé au batch time. Le diagnostic montrait que la loss causale descendait sans refléter la logique du monde.
 
 ## Décision
 
@@ -23,7 +17,7 @@ unique.
 Une séquence enregistrée est une **liste plate de `seq_len` tokens** dans
 l'ordre : `contexte | conséquence rétro-causale | action de décision`.
 
-- **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]` (`ctx_len` tokens,
+- **contexte** : `[s_0,a_0, ..., a_{n_ctx-1}, s_{n_ctx}]` (`ctx_len` tokens,
   ordre normal ; `s_{n_ctx}` seul, sans action) ;
 - **conséquence rétro-causale** (à partir de `conseq_start = eos_pos =
   ctx_len`) : unités de 16 tokens pour `k = seq_steps .. n_ctx+1`, du plus

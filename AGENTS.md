@@ -22,9 +22,9 @@ Internal concepts (not for GUI)
 
 ## Sleep Cycle & Policy Training
 
-Offline training (`Brain.sleep`): dataset optimization first, then World Model training, then Policy training. The Policy improves by imitating the World Model's hindsight (EOS-lookahead) action; a stochastic-candidate machinery survives as its fallback (`--no-eos-lookahead`).
+Offline training (`Brain.sleep`): dataset optimization first, then World Model training, then Policy training. The Policy improves by imitating the World Model's hindsight (EOS-lookahead) action.
 
-Full mechanics — active forgetting, geometric deduplication, impact-proportional World Model training with EOS-lookahead passes, surprise filtering, hindsight supervision, candidate fallback, Dream Theater playback — are documented in `DESIGN.md`.
+Full mechanics are documented in `docs/DESIGN.md`.
 
 ## UI standards
 
@@ -54,7 +54,7 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 
 ## Rules for AI Agents
 
-- **Reload Intro Docs Before Coding**: Before any code change, re-read `README.md`, `DESIGN.md`, the latest `session_YYYY_MM_DD.md`, and **every entry in `ADL/`** (architecture decisions — currently ADR-0001 nomenclature; use its canonical terms). Never assert layout geometry (token positions, masks, who-predicts-what) from memory — cite the defining lines in `tokenize.py` / `brain.py` (`compute_seq_layout`, mask builders, `_wm_masked_mse`) and state whether an index is a row or a token position.
+- **Reload Intro Docs Before Coding**: Before any code change, re-read `README.md`, `docs/DESIGN.md`, the latest `session_YYYY_MM_DD.md`, and **every entry in `ADL/`** (architecture decisions — currently ADR-0001 nomenclature; use its canonical terms). Never assert layout geometry (token positions, masks, who-predicts-what) from memory — cite the defining lines in `tokenize.py` / `brain.py` (`compute_seq_layout`, mask builders, `_wm_masked_mse`) and state whether an index is a row or a token position.
 - **No Premature Tests**: The baseline is that the tests run well. **No need to test suites before code changes.**
 - **No Unsolicited Numbers**: Unless ordering of information is crucial, **Avoid Numbered Lists**, **Chapter Numbers Are Bad**. Numbers are a mental burden with a maintenance cost. Avoid numbering as much as possible.
 - **Source Filename is enough when documenting** (Avoid Pathes and file:// Links)
@@ -64,5 +64,5 @@ No **Font Antialiasing**, clean **Font Family**, **Window Resizing** with **Aspe
 # Reads
 
 - `README.md`
-- `DESIGN.md` (implementation details: sleep cycle pipeline, policy training)
+- `docs/DESIGN.md` (implementation details: sleep cycle pipeline, policy training)
 - Last session: `session_{date}.md` (chronological logs `session_YYYY_MM_DD.md` document daily decisions, invariant changes, and recent diagnoses)

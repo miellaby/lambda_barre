@@ -139,7 +139,7 @@ def build_target_tables(seq_steps: int = DEFAULT_SEQ_STEPS,
     """Tables (valid, weight) de la loss WM, une par ligne prédictrice p
     (la ligne p prédit le token p+1) :
 
-    - poids 0 sur le contexte (tokens 0..ctx_len-1) : prompt, pas appris ;
+    - poids 0 sur le contexte (tokens 0..ctx_len-1) : donc pas appris ;
     - dénouement (EOS) : poids total ``ctx_len`` — autant que tout le contexte
       en langage naturel (un poids par token de prompt) ;
     - trajectoire (conséquence) et décision (``action_pos..+3``) : poids total

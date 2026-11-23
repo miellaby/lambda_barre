@@ -1,7 +1,12 @@
-# λ̄ Design — Refonte WM à dénouement (branche `refonte`)
+# λ̄ Design
 
-Référence de conception de la refonte (ADR-0002, spec REFONTE.md). L'ancien
-pipeline à deux passes causale/lookahead est archivé sous le tag `LEGACY-AI`.
+## Cadences temporelles
+
+3 cadences:
+
+- La **Physique Pymunk** avance à **60 Hz** (découpée en 3 sous-pas de $1/180\text{ s}$ pour la stabilité numérique).
+- La **Politique** est cadencée à **10 Hz** (toutes les 6 frames de physique) : Un forward du world model produit un latent à jour avant inférence des consignes $(\theta^*, d^*)$ transmises aux actuateurs.
+- Le **World Model** est cadencé à **5 Hz** (toutes les 12 frames de physique) pour encoder et enregistrer la salve de tokens.
 
 ## Séquence enregistrée
 
@@ -11,13 +16,15 @@ Une séquence est une **liste plate de `seq_len` tokens** ordonnés :
 contexte | dénouement | conséquence inversée | action de décision
 ```
 
+---
+
 La **fenêtre temporelle** extraite du journal fait `seq_steps+1` salves avec un
 **saut** (`lookahead`) : `seq_steps` salves consécutives `s0..s_{seq_steps-1}`,
 puis la dernière salve à `+lookahead` ticks de la décision
 (`s_{n_ctx+lookahead}`) — on apprend le futur proche, le dénouement est lointain.
 
 - **contexte** : `[s0,a0, ..., a_{n_ctx-1}, s_{n_ctx}]` — `ctx_len` tokens ;
-- **dénouement** : 1 token EOS à `eos_pos = ctx_len`, ground truth calculé à
+- **dénouement** : 1 token EOS à `eos_pos = ctx_len`, calculé à
   l'extraction (`_eos_slots_of_window`) : intégrale par canal de l'écart au
   coût de la décision pondérée par la vraie position temporelle,
   `r[j] = Σ_{k>d} eos_decay^(pos_k−d)·(c[k][j]−c[d][j])·p_k` avec `pos_k = k`
@@ -41,34 +48,37 @@ de salves temporelles ; `build_sequence` réordonne une fenêtre de
 
 ## Entraînement du WM (`Brain._train_wm_batch`)
 
-Un seul masque (strictement causal bool sur `seq_len`), un seul forward par
-batch — sans scale multiplicatif d'entrée (`ctx_attn_boost` supprimé), remplacé
-par une **infusion directe du dénouement** (`eos_cond_proj : Linear(6, d_model)`)
-additionnée à l'embedding de chaque token `q >= eos_pos` (conséquence inversée
-et action de décision) sans jamais toucher au contexte `0..eos_pos-1` (zéro
-fuite sur le MDN et cohérence stricte avec l'éveil / KV-cache).
+- Un seul masque (strictement causal bool sur `seq_len`),
+- un seul forward par batch.
+- Pas de boost sur les entrées.
+- Une **infusion directe du dénouement** (`eos_cond_proj : Linear(6, d_model)`)
+  additionnée à l'embedding de chaque token post-dénouement `q >= eos_pos`,
+  infuse dans la conséquence inversée et l'action de décision mais
+  pas le contexte `0..eos_pos-1` sinon fuite sur le MDN et incohérence
+  avec l'éveil.
+
 La loss combine :
 
 - une MSE masquée (`build_target_tables`) : **poids 0 sur le contexte**
   (prompt, non appris), **poids 1/3 par groupe** (dénouement, trajectoire,
   action de décision), pondérée par token ;
 - une tête **MDN** (*Mixture Density Network*, `eos_n_modes` = 8 composantes
-  gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) précédée
-  d'un **goulot de situation discret (VQ)** (`eos_vq_codes` = 32 codes de
-  dimension `eos_vq_dim` = 8 normalisés par
-  `LayerNorm`, expansion non linéaire `eos_mdn_mlp`, mise à jour EMA
-  `eos_vq_decay` = 0.99, engagement `eos_vq_beta` = 0.25 ; `0` désactive le
-  goulot) sur la row `eos_pos - 1` — les séquences projetées sur un même code
-  de situation partagent une seule distribution `P(EOS | situation)`, et une
-  tête auxiliaire `(code VQ, EOS) → a_{n_ctx}` (poids `eos_vq_act_w` = 1.0)
+  gaussiennes diagonales par mode, plancher `eos_sigma_min` = 0.02) précédée par ...
+- Un **goulot de situation discret (VQ)** (`eos_vq_codes` = 32 codes de
+  dimension `eos_vq_dim` = 8 normalisés par  `LayerNorm`, expansion non linéaire
+  `eos_mdn_mlp`, mise à jour EMA `eos_vq_decay` = 0.99, engagement `eos_vq_beta` = 0.25 ;
+  `0` désactive le goulot) sur la row `eos_pos - 1`. Les séquences projetées sur le
+  même code de situation partagent une seule distribution `P(EOS | situation)`
+- Une tête auxiliaire `(code VQ, EOS) → a_{n_ctx}` (poids `eos_vq_act_w` = 1.0)
   force le VQ à séparer les situations physiquement distinctes même quand
-  `EOS = 0.5` ; entraînée par **NLL exacte** pondérée uniquement par
+  `EOS = 0.5`
+- Tête MDN entraînée par **NLL exacte** pondérée uniquement par
   `log1p(count)` (jamais par l'impact — reflète la multiplicité des séquences
   dédupliquées sans qu'un point immobile écrase le batch ; décalée par son
   minimum théorique en `sigma_min` et normalisée par slot, donc toujours
-  $\ge 0$, poids `eos_nll_w`). `_train_wm_batch` rétropropage la loss totale
-  mais retourne la MSE masquée pure pour `wm_target_loss`, le plateau et la
-  déduplication latente.
+  $\ge 0$, poids `eos_nll_w`). 
+- `_train_wm_batch` rétropropage la loss totale  mais retourne la MSE masquée
+  pure pour `wm_target_loss`, le plateau et la déduplication latente.
 
 Dans le même forward, le dénouement est prédit depuis le contexte, et la
 conséquence inversée puis l'action de décision sont prédites conditionnellement
@@ -104,9 +114,9 @@ addendum, moitié tirée du coreset) pour éviter l'oubli catastrophique avant
   - Parmi de vrais doublons intra-addendum, le représentant au **meilleur
     `relief`** est conservé ; chaque doublon rafraîchit `vivacity = 1.0` et
     incrémente `count`.
-- **Pas de filtrage destructif par surprise** ni de remise en jeu d'un tiers du
-  coreset (préserve les souvenirs sains maîtrisés et les paires
-  contrefactuelles).
+- **Abandon du filtrage destructif par surprise** et de la remise en jeu
+  du coreset pour ne plus supprimer les souvenirs sains maîtrisés et
+  les paires contrefactuelles.
 - **Éviction à capacité par densité** (`commit_addendum`) : décroissance douce
   de la vivacité (`vivacity_decay = 0.95` par cycle), puis si `coreset >
   pool_capacity`, éviction dans les **paires les plus proches** (même distance
@@ -167,9 +177,3 @@ Générateur consommé frame par frame par l'UI :
 - `yield "done", stats`.
 
 `wm_loss_ratio = loss_après / loss_avant` ; `wm_plateau = ratio > 0.95` (HUD).
-
-## Checkpoints
-
-`wm_ckpt.pt` / `pol_ckpt.pt` / `buf_ckpt.pt`. Le changement de layout de
-séquence invalide les buffers legacy : `ExperienceBuffer.load` les rejette ;
-lancer avec `--reset`.
